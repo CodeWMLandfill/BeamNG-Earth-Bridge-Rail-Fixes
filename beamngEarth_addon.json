@@ -1,0 +1,35 @@
+{
+  "options": [
+    {
+      "key": "applyBridgeRailFixes",
+      "label": "Apply Bridge & Rail fixes",
+      "type": "bool",
+      "default": true,
+      "help": "Fixes bridges, piers, ramps, divided highways, railway crossings, and lane transitions. Click Save, click Start, then restart BeamNG.Earth."
+    },
+    {
+      "key": "enableOneHotkeyReport",
+      "label": "Enable 1-hotkey spot reporter (Ctrl+Shift+B)",
+      "type": "bool",
+      "default": true,
+      "help": "Press Ctrl+Shift+B while driving to send a quick screenshot and map location without pausing."
+    },
+    {
+      "key": "reportCategory",
+      "label": "Spot report category",
+      "type": "choice",
+      "default": "bridge",
+      "choices": ["bridge", "rail", "road", "other"],
+      "help": "Default category used when pressing Ctrl+Shift+B (takes effect right away without restarting)."
+    },
+    {
+      "key": "serverAction",
+      "label": "Setup action",
+      "type": "choice",
+      "default": "Apply fixes",
+      "choices": ["Apply fixes", "Restore original app"],
+      "help": "Choose Restore original app, click Save, click Start, and restart BeamNG.Earth to uninstall."
+    }
+  ],
+  "run": {"args": []}
+}

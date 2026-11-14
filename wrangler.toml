@@ -1,0 +1,22 @@
+name = "beamng-earth-bridge-rail-fixes"
+main = "worker/worker.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[vars]
+# Target GitHub repository slug ("owner/repo") where reports and issues are published.
+GITHUB_REPO = "CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes"
+# Dedicated orphan branch used to archive report JSON and screenshot blobs.
+REPORTS_BRANCH = "reports"
+# Fallback in-isolate sliding window limits (used when RATE_LIMITER binding is unset).
+RATE_LIMIT_MAX = "6"
+RATE_LIMIT_WINDOW_SEC = "60"
+
+# Store GITHUB_TOKEN as an encrypted Worker secret (never in wrangler.toml):
+#   npx wrangler secret put GITHUB_TOKEN
+#
+# Optional Cloudflare Rate Limiting binding (Workers Paid):
+# [[ratelimits]]
+# name = "RATE_LIMITER"
+# namespace_id = "1001"
+# simple = { limit = 6, period = 60 }
