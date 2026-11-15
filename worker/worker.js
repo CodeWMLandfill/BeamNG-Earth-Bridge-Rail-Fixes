@@ -6,6 +6,7 @@
  */
 
 const SERVICE_NAME = "bnge-bridge-report-worker";
+const DEFAULT_WORKER_NAME = "beamng-earth-bridge-rail-fixes";
 const DEFAULT_REPORTS_BRANCH = "reports";
 const GITHUB_API_BASE = "https://api.github.com";
 
@@ -42,10 +43,13 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
   "camera",
   "nearest",
   "screenshot",
+  "loading_incomplete",
+  "loading_reason",
 ]);
 const FORBIDDEN_OBJECT_KEYS = new Set(["__proto__", "constructor", "prototype"]);
 
 const REPO_SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const WORKER_NAME_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const BRANCH_NAME_RE = /^(?!\/|.*\/\/|.*\.\.|.*@\{|.*[\\~^:?*[\]\x00-\x20\x7f])[A-Za-z0-9._/-]{1,120}(?<!\/|\.lock|\.)$/;
 const BASE64_RE = /^[A-Za-z0-9+/]+={0,2}$/;
 
@@ -559,6 +563,16 @@ function validateAndSanitizeReport(raw) {
       "nearest"
     );
   }
+  if (raw.loading_incomplete !== undefined && raw.loading_incomplete !== null) {
+    if (typeof raw.loading_incomplete !== "boolean") {
+      throw new ValidationError("loading_incomplete must be a boolean");
+    }
+    report.loading_incomplete = raw.loading_incomplete;
+  }
+  if (raw.loading_reason !== undefined && raw.loading_reason !== null) {
+    const reason = sanitizeText(raw.loading_reason, MAX_SHORT_TEXT_CHARS, "loading_reason", false);
+    if (reason) report.loading_reason = reason;
+  }
 
   let screenshot = null;
   if (raw.screenshot !== undefined && raw.screenshot !== null) {
@@ -718,15 +732,23 @@ function resolveBranch(env) {
   return branch;
 }
 
+function resolveWorkerName(env) {
+  const raw = typeof env?.WORKER_NAME === "string" ? env.WORKER_NAME.trim() : "";
+  const candidate = raw || DEFAULT_WORKER_NAME;
+  return WORKER_NAME_RE.test(candidate) ? candidate : DEFAULT_WORKER_NAME;
+}
+
 function resolveGitHubConfig(env) {
   const repo = typeof env?.GITHUB_REPO === "string" ? env.GITHUB_REPO.trim() : "";
   const token = typeof env?.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
   const branch = resolveBranch(env);
+  const workerName = resolveWorkerName(env);
   const repoValid = REPO_SLUG_RE.test(repo);
   return {
     repo,
     token,
     branch,
+    workerName,
     repoConfigured: Boolean(repoValid && token.length > 0),
   };
 }
@@ -793,6 +815,28 @@ async function commitArchiveToGitHub(config, reportPath, reportJsonText, shotPat
     screenshotBlobSha = blobRes.data.sha;
   }
 
+  // Minimal non-production Wrangler config + 404 preview stub on the orphan archive branch so
+  // Cloudflare Workers Builds (when non-production Preview Builds are enabled) succeeds cleanly
+  // instead of failing in 0s with a missing wrangler.toml check-run error.
+  const archiveWranglerToml = [
+    `name = "${config.workerName || DEFAULT_WORKER_NAME}"`,
+    'main = "worker/worker.js"',
+    'compatibility_date = "2025-01-01"',
+    "workers_dev = true",
+    "",
+  ].join("\n");
+  const archiveWorkerStub = [
+    "export default {",
+    "  async fetch() {",
+    '    return new Response("Archive branch preview disabled.\\n", {',
+    "      status: 404,",
+    '      headers: { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" },',
+    "    });",
+    "  },",
+    "};",
+    "",
+  ].join("\n");
+
   const buildTreeEntries = () => {
     const entries = [
       {
@@ -810,6 +854,20 @@ async function commitArchiveToGitHub(config, reportPath, reportJsonText, shotPat
         sha: screenshotBlobSha,
       });
     }
+    entries.push(
+      {
+        path: "wrangler.toml",
+        mode: "100644",
+        type: "blob",
+        content: archiveWranglerToml,
+      },
+      {
+        path: "worker/worker.js",
+        mode: "100644",
+        type: "blob",
+        content: archiveWorkerStub,
+      }
+    );
     return entries;
   };
 
@@ -830,7 +888,7 @@ async function commitArchiveToGitHub(config, reportPath, reportJsonText, shotPat
       }
 
       const rootCommitRes = await githubRequest(config, "POST", `${repoApiPrefix}/git/commits`, {
-        message: `chore(reports): bootstrap ${config.branch} with ${reportPath}`,
+        message: `[skip ci] chore(reports): bootstrap ${config.branch} with ${reportPath}`,
         tree: rootTreeRes.data.sha,
         parents: [],
         author: botIdentity,
@@ -877,7 +935,7 @@ async function commitArchiveToGitHub(config, reportPath, reportJsonText, shotPat
     }
 
     const commitRes = await githubRequest(config, "POST", `${repoApiPrefix}/git/commits`, {
-      message: `chore(reports): add ${reportPath}`,
+      message: `[skip ci] chore(reports): add ${reportPath}`,
       tree: treeRes.data.sha,
       parents: [parentCommitSha],
       author: botIdentity,
@@ -914,8 +972,16 @@ function escapeTableCell(value) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/\|/g, "\\|")
+    .replace(/`/g, "'")
     .replace(/\r?\n/g, " ")
-    .replace(/@/g, "@\u200b");
+    .replace(/@(?=\S)/g, "&#64;");
+}
+
+function escapeCodeCell(value) {
+  return String(value)
+    .replace(/\|/g, "\\|")
+    .replace(/`/g, "'")
+    .replace(/\r?\n/g, " ");
 }
 
 function buildFencedBlock(text, lang = "text") {
@@ -933,31 +999,36 @@ function buildFencedBlock(text, lang = "text") {
 function formatIssuePayload(config, id, createdAt, report, reportPath, shotPath) {
   const lat5 = report.lat.toFixed(5);
   const lon5 = report.lon.toFixed(5);
-  const rawTitleSummary = report.summary || "User report";
+  const rawTitleSummary = typeof report.summary === "string" ? report.summary : "";
   const safeTitleSummary = rawTitleSummary.replace(/[\r\n]+/g, " ").trim();
-  const title = `[Report][${report.kind}] ${lat5}, ${lon5} \u2014 ${safeTitleSummary}`;
+  const autoPrefix = `In-game ${report.kind} report @ ${lat5}, ${lon5}`;
+  const customSuffix = safeTitleSummary.startsWith(autoPrefix)
+    ? safeTitleSummary.slice(autoPrefix.length).replace(/^[\s\-:]+/, "").trim()
+    : safeTitleSummary;
+  const baseTitle = `[Report][${report.kind}] ${lat5}, ${lon5}`;
+  const title = customSuffix ? `${baseTitle} - ${customSuffix}` : baseTitle;
 
   const osmUrl = `https://www.openstreetmap.org/?mlat=${lat5}&mlon=${lon5}#map=17/${lat5}/${lon5}`;
   const branchUrlPath = encodeBranchPath(config.branch);
   const jsonArchiveUrl = `https://github.com/${config.repo}/blob/${branchUrlPath}/${reportPath}`;
 
   const rows = [
-    ["Report ID", `\`${escapeTableCell(id)}\``],
-    ["Created (UTC)", `\`${escapeTableCell(createdAt)}\``],
-    ["Kind", `\`${escapeTableCell(report.kind)}\``],
+    ["Report ID", `\`${escapeCodeCell(id)}\``],
+    ["Created (UTC)", `\`${escapeCodeCell(createdAt)}\``],
+    ["Kind", `\`${escapeCodeCell(report.kind)}\``],
     ["Coordinates", `\`${lat5}, ${lon5}\``],
     ["OpenStreetMap", `[View on OSM](${osmUrl})`],
     ["Archive JSON", `[\`${reportPath}\`](${jsonArchiveUrl})`],
   ];
 
   if (report.earthVersion !== undefined) {
-    rows.push(["Earth Version", `\`${escapeTableCell(report.earthVersion)}\``]);
+    rows.push(["Earth Version", `\`${escapeCodeCell(report.earthVersion)}\``]);
   }
   if (report.addonVersion !== undefined) {
-    rows.push(["Addon Version", `\`${escapeTableCell(report.addonVersion)}\``]);
+    rows.push(["Addon Version", `\`${escapeCodeCell(report.addonVersion)}\``]);
   }
   if (report.anchorId !== undefined) {
-    rows.push(["Anchor ID", `\`${escapeTableCell(report.anchorId)}\``]);
+    rows.push(["Anchor ID", `\`${escapeCodeCell(report.anchorId)}\``]);
   }
   if (report.headingDeg !== undefined) {
     rows.push(["Heading (deg)", `\`${report.headingDeg}\``]);
@@ -969,7 +1040,15 @@ function formatIssuePayload(config, id, createdAt, report, reportPath, shotPath)
     rows.push(["Speed (m/s)", `\`${report.speedMs}\``]);
   }
   if (typeof report.camera === "string") {
-    rows.push(["Camera", `\`${escapeTableCell(report.camera)}\``]);
+    rows.push(["Camera", `\`${escapeCodeCell(report.camera)}\``]);
+  }
+  if (report.loading_incomplete !== undefined) {
+    const incVal = report.loading_incomplete
+      ? report.loading_reason
+        ? `\`true\` (\`${escapeCodeCell(report.loading_reason)}\`)`
+        : "`true`"
+      : "`false`";
+    rows.push(["Loading Incomplete", incVal]);
   }
 
   const lines = [

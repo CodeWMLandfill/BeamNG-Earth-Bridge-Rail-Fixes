@@ -2482,7 +2482,9 @@ def tunnel_profiles(aid, frame, elev, g=None):
         sea = getattr(_s, "sea", None)
         t.wet = sea.depth if sea is not None else None
         t.water = sea.water if sea is not None else None
-        t.raw = lambda la, lo: ground(None, la, lo, _s.dem.sample(la, lo, gradingmod.PROFILE_ZOOM))  # noqa: E731
+        t.raw = ((lambda la, lo: g.deck_ground_raw(la, lo, ground(None, la, lo, _s.dem.sample(la, lo, gradingmod.PROFILE_ZOOM))))
+                 if g is not None and hasattr(g, "deck_ground_raw") else
+                 (lambda la, lo: ground(None, la, lo, _s.dem.sample(la, lo, gradingmod.PROFILE_ZOOM))))  # noqa: E731
         if g is not None:
             t.ends = lambda la, lo: g.apply(la, lo, t.raw(la, lo), gradingmod.ROAD_LIFT, roads_only=True)    # noqa: E731
     return roadsmod.ChainView(_chain_store("tunnels", roadsmod.TunnelProfiles, elev, setup), frame)

@@ -21,8 +21,8 @@ import tempfile
 import uuid
 import zlib
 
-VERSION = "0.1.0"
-MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_1_0"
+VERSION = "0.2.0"
+MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_2_0"
 TAG = "earthBridgeRailFixes"
 COOKIE = struct.Struct("!8sIIII64s")
 ENTRY = struct.Struct("!IIIIBc")
@@ -36,16 +36,19 @@ SERVER_MODULES = (
     "carriageways",
     "earthd",
     "footbridges",
-    "grading",
-    "roadmesh",
-    "roads",
     "furniture",
+    "grading",
+    "guardrails",
     "mappedpoles",
     "plancache",
     "powerlines",
+    "railprofile",
     "rails",
     "railways",
     "roadlanes",
+    "roadmesh",
+    "roads",
+    "tunnellids",
 )
 
 # Upstream helper modules introduced in the 1.9.1-beta.dev.* cycle (verified
@@ -76,7 +79,6 @@ REQUIRED_UPSTREAM_MODULES = (
     "plazas",
     "pools",
     "radars",
-    "railprofile",
     "railstations",
     "railunderpass",
     "railxing",
@@ -90,7 +92,6 @@ REQUIRED_UPSTREAM_MODULES = (
     "streetfront",
     "surface",
     "terraintex",
-    "tunnellids",
 )
 
 MIN_SUPPORTED_EARTH_VERSION = "v1.9.1-beta.dev.424"
@@ -176,6 +177,212 @@ def patch_modscript_bytes(raw_bytes):
     return (text + sep + REPORT_MODSCRIPT_LINE + "\n").encode("utf-8")
 
 
+def _patch_lua_section(text, start_marker, end_marker, already_markers, old, new, label):
+    start_idx = text.find(start_marker)
+    if start_idx < 0:
+        raise PatchError(f"Unsupported roads.lua layout (missing section {label})")
+    end_idx = text.find(end_marker, start_idx + len(start_marker))
+    if end_idx < 0:
+        raise PatchError(f"Unsupported roads.lua layout (missing end of {label})")
+    section = text[start_idx:end_idx]
+    if any(
+        all(marker in section for marker in (group if isinstance(group, (tuple, list)) else (group,)))
+        for group in already_markers
+    ):
+        return text
+    if old not in section:
+        raise PatchError(f"Unsupported roads.lua layout (missing anchor in {label})")
+    return text[:start_idx] + section.replace(old, new, 1) + text[end_idx:]
+
+
+def patch_roads_lua_bytes(raw_bytes, fallback_bytes=None):
+    """Surgically apply bridge/rail client fixes onto any compatible upstream roads.lua."""
+    if b"function M.collideNear" not in raw_bytes:
+        if fallback_bytes is not None and len(raw_bytes) < 2048:
+            return fallback_bytes
+        raise PatchError("Unsupported roads.lua layout (missing collideNear)")
+    text = raw_bytes.decode("utf-8-sig")
+    crlf = "\r\n" in text
+    norm = text.replace("\r\n", "\n")
+
+    norm = _patch_lua_section(
+        norm,
+        "M.TILE_M = 256",
+        "M.UNCOLLIDE_M = ",
+        ("M.COLLIDE_LEAD_S = 22",),
+        "M.COLLIDE_LEAD_S = 14\n",
+        "M.COLLIDE_LEAD_S = 22\n",
+        "COLLIDE_LEAD_S",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "local function isRailDrawn",
+        "local unitStats",
+        ("local function hasRailCol",),
+        "local function isRailDrawn(what) return what == 'rail' or what == 'rail2' or what == 'rail3' end\n",
+        (
+            "local function isRailDrawn(what) return what == 'rail' or what == 'rail2' or what == 'rail3' end\n"
+            "local function hasRailCol(tbl, raw)\n"
+            "  if not tbl then return false end\n"
+            "  for _, k in ipairs({ 'railcol', 'railcol2', 'railcol3' }) do\n"
+            "    local v = tbl[k]\n"
+            "    if raw then\n"
+            "      if type(v) == 'table' and v.shape ~= nil then return true end\n"
+            "    elseif v ~= nil then\n"
+            "      return true\n"
+            "    end\n"
+            "  end\n"
+            "  return false\n"
+            "end\n"
+        ),
+        "railcol_helpers",
+    )
+    norm = norm.replace(
+        "-- Once per frame (core onUpdate): deletions, then creations, within the governor's budget.\n"
+        "local viewAt = nil  -- core.viewAway(): the camera's { x, y } when it is away from the car, else nil (M.nextWalk)\n",
+        "-- Once per frame (core onUpdate): deletions, then creations, within the governor's budget.\n",
+        1,
+    )
+    norm = _patch_lua_section(
+        norm,
+        "local holdActive = false",
+        "function M.radiusToward(",
+        ("local viewAt = nil",),
+        "local lastDir = nil         -- unit { x, y } of the player's motion at FAST_MS or more, else nil\n",
+        (
+            "local lastDir = nil         -- unit { x, y } of the player's motion at FAST_MS or more, else nil\n"
+            "local viewAt = nil          -- core.viewAway(): the camera's { x, y } when it is away from the car, else nil\n"
+        ),
+        "hoist_viewAt",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.collideNear(t, extra)",
+        "function M.setFoci(f)",
+        ("viewAt and viewAt.x and viewAt.y",),
+        "  -- or near another vehicle's collision island (collisionfoci.lua: other players' cars, traffic)\n",
+        (
+            "  if viewAt and viewAt.x and viewAt.y then\n"
+            "    local dx, dy = t.cx - viewAt.x, t.cy - viewAt.y\n"
+            "    local rv = M.COLLIDE_M[1] + (extra or 0) + M.TILE_M * 0.71\n"
+            "    if dx * dx + dy * dy <= rv * rv then return true end\n"
+            "  end\n"
+            "  -- or near another vehicle's collision island (collisionfoci.lua: other players' cars, traffic)\n"
+        ),
+        "collideNear_viewAt",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "local function queueGeoParts(key, t, data)",
+        "local function partShape(t, what)",
+        ("hasRailCol(t.parts)",),
+        "  local leanRail = t.parts.railcol ~= nil\n",
+        "  local leanRail = hasRailCol(t.parts)\n",
+        "queueGeoParts_leanRail",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "local function queueGeoParts(key, t, data)",
+        "local function partShape(t, what)",
+        ("q.what == 'deck'",),
+        "      if q.renderOnly or M.collideNear(t) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end\n",
+        "      if q.renderOnly or q.what == 'deck' or M.collideNear(t) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end\n",
+        "queueGeoParts_deck",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.onExact(",
+        "function M.onTile(",
+        ("hasRailCol(t.parts)",),
+        "or (t.parts.railcol ~= nil and isRailDrawn(what)) }",
+        "or (hasRailCol(t.parts) and isRailDrawn(what)) }",
+        "onExact_leanRail",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.onTile(",
+        "M.SKY_UNIT = 4",
+        ("what = 'wire', tile = tiles[key], renderOnly = true",),
+        "    walkQ[#walkQ + 1] = { key = key, walk = data.wire, what = 'wire', tile = tiles[key] }\n",
+        "    walkQ[#walkQ + 1] = { key = key, walk = data.wire, what = 'wire', tile = tiles[key], renderOnly = true }\n",
+        "onTile_wire",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.onTile(",
+        "M.SKY_UNIT = 4",
+        ("hasRailCol(data, true)",),
+        "  local leanRail = type(data.railcol) == 'table' and data.railcol.shape ~= nil\n",
+        "  local leanRail = hasRailCol(data, true)\n",
+        "onTile_leanRail",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.onTile(",
+        "M.SKY_UNIT = 4",
+        ("q.what == 'deck'",),
+        "      if q.renderOnly or M.collideNear(tiles[key]) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end\n",
+        "      if q.renderOnly or q.what == 'deck' or M.collideNear(tiles[key]) then walkQ[#walkQ + 1] = q else parked[#parked + 1] = q end\n",
+        "onTile_deck",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.update(",
+        "function M.nextWalk(",
+        ("q.what == 'railcol2'", "isRailCol(q.what)"),
+        "(q.what == 'bldcol' or q.what == 'walkcol' or q.what == 'railcol' or q.what == 'buscol') and 'Collision Mesh' or not isRoad",
+        "(q.what == 'bldcol' or q.what == 'walkcol' or q.what == 'railcol' or q.what == 'railcol2' or q.what == 'railcol3' or q.what == 'buscol') and 'Collision Mesh' or not isRoad",
+        "createWalk_railcol",
+    )
+    if "M.behindDir()" in norm:
+        norm = _patch_lua_section(
+            norm,
+            "function M.update(",
+            "function M.nextWalk(",
+            ("q.what ~= 'deck' and not q.renderOnly and not staged and M.behindDir()",),
+            "if t and q.what ~= 'road' and q.what ~= 'wire' and not q.renderOnly and not staged and M.behindDir()",
+            "if t and q.what ~= 'road' and q.what ~= 'wire' and q.what ~= 'deck' and not q.renderOnly and not staged and M.behindDir()",
+            "update_behind_deck",
+        )
+    norm = _patch_lua_section(
+        norm,
+        "function M.update(",
+        "function M.nextWalk(",
+        ("q.what ~= 'deck' then t.cq",),
+        "        if not isRoad then t.cq = t.cq or {}; t.cq[q.what] = q end\n",
+        "        if not isRoad and q.what ~= 'deck' then t.cq = t.cq or {}; t.cq[q.what] = q end\n",
+        "update_deck_cq",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.nextWalk(",
+        "function M.reset(",
+        ("if viewAt and viewAt.x and viewAt.y and (e.renderOnly or e.what == 'wire' or not dir) then",),
+        "      if viewAt and (e.renderOnly or e.what == 'wire') then\n",
+        "      if viewAt and viewAt.x and viewAt.y and (e.renderOnly or e.what == 'wire' or not dir) then\n",
+        "nextWalk_viewAt",
+    )
+    norm = _patch_lua_section(
+        norm,
+        "function M.reset()",
+        "function M.setEnabled(",
+        ("viewAt = nil", ", viewAt = "),
+        (
+            "  objSlot, slotLive, slotDropped = {}, {}, {}\n"
+            "  tiles, createQ, deleteQ, walkQ, anchorId, loadedMaterials = {}, {}, {}, {}, nil, false\n"
+        ),
+        (
+            "  objSlot, slotLive, slotDropped = {}, {}, {}\n"
+            "  tiles, createQ, deleteQ, walkQ, anchorId, loadedMaterials = {}, {}, {}, {}, nil, false\n"
+            "  viewAt = nil\n"
+        ),
+        "reset_viewAt",
+    )
+
+    out = norm.replace("\n", "\r\n") if crlf else norm
+    return out.encode("utf-8")
+
+
 def _read_carchive_version(data, start, entry_map):
     entry = entry_map.get("VERSION")
     if not entry:
@@ -232,6 +439,9 @@ def validate_source_compatibility(root):
     for rel in (MOD_ROADS_LUA, MOD_ACTIONS_JSON, MOD_KEYMAP_JSON, MOD_SCRIPT_LUA):
         if not (Path(root) / rel).is_file():
             raise PatchError(f"Expected mod file missing in source tree: {rel}")
+    roads_raw = (Path(root) / MOD_ROADS_LUA).read_bytes()
+    if b"function M.collideNear" in roads_raw:
+        patch_roads_lua_bytes(roads_raw)
 
 
 def _compile_server_payload(payload_dir, existing_filenames, apply_fixes, enable_reporter):
@@ -429,7 +639,8 @@ def patch_executable(data, payload_dir, apply_fixes=True, enable_reporter=True):
         carchive_replacements[pyz_entry[7]] = (new_pz, len(new_pz), 0, b"z")
 
     if apply_fixes:
-        roads_bytes = (payload_root / MOD_ROADS_LUA).read_bytes()
+        fallback_roads = (payload_root / MOD_ROADS_LUA).read_bytes() if (payload_root / MOD_ROADS_LUA).is_file() else None
+        roads_bytes = patch_roads_lua_bytes(_read_entry_raw(entry_map[mod_roads_key]), fallback_bytes=fallback_roads)
         carchive_replacements[mod_roads_key] = (zlib.compress(roads_bytes, 6), len(roads_bytes), 1, b"b")
 
     if enable_reporter:
@@ -606,6 +817,11 @@ def _payload_digest(payload_dir):
     return h.hexdigest()
 
 
+def _read_pristine(root, rel):
+    bpath = Path(root) / f".{TAG}" / "original" / rel
+    return (bpath if bpath.is_file() else Path(root) / rel).read_bytes()
+
+
 def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter):
     """Compute {rel_posix: bytes} desired in a source BeamNG.Earth checkout."""
     root = Path(root)
@@ -615,12 +831,13 @@ def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter):
         for mod in SERVER_MODULES:
             rel = f"server/{mod}.py"
             desired[rel] = (payload_root / rel).read_bytes()
-        desired[MOD_ROADS_LUA] = (payload_root / MOD_ROADS_LUA).read_bytes()
+        fallback_roads = (payload_root / MOD_ROADS_LUA).read_bytes() if (payload_root / MOD_ROADS_LUA).is_file() else None
+        desired[MOD_ROADS_LUA] = patch_roads_lua_bytes(_read_pristine(root, MOD_ROADS_LUA), fallback_bytes=fallback_roads)
     if enable_reporter:
         desired["server/bridge_rail_report.py"] = (payload_root / "server/bridge_rail_report.py").read_bytes()
         if not apply_fixes:
             # Hook ONLY bridge_rail_report into untouched earthd.py cleanly.
-            raw_earthd = (root / "server/earthd.py").read_text(encoding="utf-8")
+            raw_earthd = _read_pristine(root, "server/earthd.py").decode("utf-8")
             anchor = '        elif kind == "terrain_patch":'
             if anchor not in raw_earthd:
                 raise PatchError("Could not locate earthd.dispatch anchor for standalone reporter")
@@ -631,9 +848,9 @@ def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter):
             )
             desired["server/earthd.py"] = raw_earthd.replace(anchor, hook + anchor, 1).encode("utf-8")
         desired[MOD_BUGREPORT_LUA] = (payload_root / MOD_BUGREPORT_LUA).read_bytes()
-        desired[MOD_ACTIONS_JSON] = patch_actions_json_bytes((root / MOD_ACTIONS_JSON).read_bytes())
-        desired[MOD_KEYMAP_JSON] = patch_keymap_json_bytes((root / MOD_KEYMAP_JSON).read_bytes())
-        desired[MOD_SCRIPT_LUA] = patch_modscript_bytes((root / MOD_SCRIPT_LUA).read_bytes())
+        desired[MOD_ACTIONS_JSON] = patch_actions_json_bytes(_read_pristine(root, MOD_ACTIONS_JSON))
+        desired[MOD_KEYMAP_JSON] = patch_keymap_json_bytes(_read_pristine(root, MOD_KEYMAP_JSON))
+        desired[MOD_SCRIPT_LUA] = patch_modscript_bytes(_read_pristine(root, MOD_SCRIPT_LUA))
     return desired
 
 
@@ -925,6 +1142,14 @@ def inspect_target(target):
                 info["reason"] = f"Expected mod file missing in source tree: {rel}"
                 info["state"] = "incompatible"
                 return info
+        try:
+            roads_raw = (resolved / MOD_ROADS_LUA).read_bytes()
+            if b"function M.collideNear" in roads_raw:
+                patch_roads_lua_bytes(roads_raw)
+        except PatchError as exc:
+            info["reason"] = str(exc)
+            info["state"] = "incompatible"
+            return info
         info["compatible"] = True
         return info
 
@@ -981,7 +1206,7 @@ def inspect_target(target):
             k, p_off, p_len = toc["earthd"]
             if k == 0 and 12 <= p_off and p_off + p_len <= offset:
                 code = marshal.loads(zlib.decompress(pz[p_off:p_off + p_len]))
-                patched_in_pyz = MARKER in repr(code.co_consts)
+                patched_in_pyz = "EARTH_BRIDGE_RAIL_FIXES_" in repr(code.co_consts)
         except Exception:
             pass
     info["patched"] = bool(patched_in_pyz or (sidecar and digest == sidecar.get("patchedSha")))
@@ -1008,6 +1233,16 @@ def inspect_target(target):
             info["reason"] = f"Expected bundled mod file missing in archive: {_win_rel(rel)}"
             info["state"] = "incompatible"
             return info
+    try:
+        roads_entry = entry_map[_win_rel(MOD_ROADS_LUA)]
+        roads_blob = data[start + roads_entry[1]:start + roads_entry[1] + roads_entry[2]]
+        roads_raw = zlib.decompress(roads_blob) if roads_entry[4] else roads_blob
+        if b"function M.collideNear" in roads_raw:
+            patch_roads_lua_bytes(roads_raw)
+    except (PatchError, zlib.error, UnicodeDecodeError) as exc:
+        info["reason"] = str(exc)
+        info["state"] = "incompatible"
+        return info
 
     info["compatible"] = True
     return info

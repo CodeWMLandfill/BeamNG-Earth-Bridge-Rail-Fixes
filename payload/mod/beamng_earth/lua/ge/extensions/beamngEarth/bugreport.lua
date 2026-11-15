@@ -5,7 +5,7 @@ local M = {}
 
 M.LEVEL_ID = 'beamng_earth'
 M.ADDON_ID = 'beamng-earth-bridge-rail-fixes'
-M.ADDON_VERSION = '0.1.0'
+M.ADDON_VERSION = '0.2.0'
 M.DIR = 'beamngEarth/bridge_rail_reports/'
 M.POLL_TIMEOUT_S = 22
 
@@ -46,16 +46,43 @@ local function sanitizeCategory(v)
   return 'bridge'
 end
 
-local function loadPairPending(p)
-  if type(p) ~= 'table' then return false end
+local function loadPairCounts(p)
+  if type(p) ~= 'table' then return false, 0, 0 end
   local done, want = tonumber(p[1]) or 0, tonumber(p[2]) or 0
-  return want > 0 and done < want
+  return (want > 0 and done < want), done, want
 end
 
--- Defer 1-hotkey reporting while terrain/roads are provisional or still streaming so a temporary
--- un-graded tile is never filed as a permanent road/bridge bug.
-local function provisionalBlocker(core, stStatus, anchorId)
+-- Guard genuine mid-teleport black frames and unrendered world states
+-- while keeping 0 per-cell cooldowns and allowing rendered 98-99% background streaming reports.
+local function blackFrameBlocker(core, stStatus)
+  if type(stStatus) == 'table' then
+    if stStatus.inOurLevel == false or stStatus.active == false then
+      return 'Wait for world to activate before reporting'
+    end
+    if stStatus.terrainRendered == false then
+      return 'Wait for terrain rendering before reporting'
+    end
+    if stStatus.anchorId == nil then
+      return 'Wait for world anchor before reporting'
+    end
+    if stStatus.groundReady == false or stStatus.loading == true then
+      return 'Wait for terrain to finish loading before reporting'
+    end
+  end
+
   if core then
+    if type(core._loadCover) == 'function' then
+      local okC, cover = pcall(core._loadCover)
+      if okC and cover == true then
+        return 'Wait for teleport loading cover before reporting'
+      end
+    end
+    if type(core.heldReason) == 'function' then
+      local okH, held = pcall(core.heldReason)
+      if okH and (held == 'loading' or held == 'ground') then
+        return 'Wait for teleport terrain before reporting'
+      end
+    end
     if type(core.groundReady) == 'function' then
       local okG, ready = pcall(core.groundReady)
       if okG and ready == false then
@@ -67,26 +94,82 @@ local function provisionalBlocker(core, stStatus, anchorId)
       local okR, r = pcall(core._state)
       if okR and type(r) == 'table' then rawSt = r end
     end
+    if rawSt then
+      if rawSt.inOurLevel == false or rawSt.active == false then
+        return 'Wait for world to activate before reporting'
+      end
+      local pend = (type(rawSt.pending) == 'table' and rawSt.pending.purpose)
+        or (type(stStatus) == 'table' and stStatus.pending)
+      if pend == 'teleport' or pend == 'resync' or rawSt.loadingFault ~= nil then
+        return 'Wait for teleport terrain before reporting'
+      end
+      if rawSt.placeFrames ~= nil or rawSt.teleportRetry ~= nil
+          or rawSt.floorZ ~= nil or rawSt.randomStart ~= nil
+          or rawSt.anchor == nil or rawSt.block == nil then
+        return 'Wait for terrain placement before reporting'
+      end
+      if type(rawSt.clock) == 'number' and type(rawSt.loadingUntil) == 'number'
+          and rawSt.clock < rawSt.loadingUntil then
+        return 'Wait for teleport loading cover before reporting'
+      end
+    elseif type(stStatus) == 'table' and (stStatus.pending == 'teleport' or stStatus.pending == 'resync') then
+      return 'Wait for teleport terrain before reporting'
+    end
+  end
+  return nil
+end
+
+M._blackFrameBlocker = blackFrameBlocker
+
+-- Inspect world/terrain/road streaming state without ever blocking 1-hotkey submissions.
+-- If the world is still provisional or stalled at 98-99% ground/roads, attach structured
+-- loading_incomplete telemetry so triage can separate half-loaded terrain from permanent mesh bugs.
+local function inspectLoadingState(core, stStatus, anchorId)
+  local reasons = {}
+  local details = {}
+
+  if core then
+    if type(core.groundReady) == 'function' then
+      local okG, ready = pcall(core.groundReady)
+      if okG and ready == false then
+        reasons[#reasons + 1] = 'ground_not_ready'
+        details.groundReady = false
+      end
+    end
+    local rawSt = nil
+    if type(core._state) == 'function' then
+      local okR, r = pcall(core._state)
+      if okR and type(r) == 'table' then rawSt = r end
+    end
     local pend = (rawSt and type(rawSt.pending) == 'table' and rawSt.pending.purpose)
       or (type(stStatus) == 'table' and stStatus.pending)
     if pend == 'teleport' or pend == 'resync' then
-      return 'Wait for teleport terrain before reporting'
+      reasons[#reasons + 1] = 'teleport_pending'
+      details.pendingPurpose = tostring(pend)
     end
     if rawSt and (rawSt.placeFrames ~= nil or rawSt.teleportRetry ~= nil
         or (rawSt.anchor ~= nil and rawSt.block == nil)) then
-      return 'Wait for terrain placement before reporting'
+      reasons[#reasons + 1] = 'terrain_placement_pending'
+      details.placementPending = true
     end
     local blk = (rawSt and rawSt.block) or (type(stStatus) == 'table' and stStatus.block)
     if type(blk) == 'table' and blk.provisional == true then
-      return 'Wait for graded terrain block before reporting'
+      reasons[#reasons + 1] = 'provisional_block'
+      details.provisionalBlock = true
     end
     local lp = rawSt and type(rawSt.loadProgress) == 'table' and rawSt.loadProgress or nil
     if lp and (anchorId == nil or lp.anchorId == nil or lp.anchorId == anchorId) then
-      if loadPairPending(lp.ground) then
-        return 'Wait for graded first block before reporting'
+      local gPend, gDone, gWant = loadPairCounts(lp.ground)
+      if gPend then
+        reasons[#reasons + 1] = 'graded_first_block_pending'
+        details.groundDone = gDone
+        details.groundWant = gWant
       end
-      if loadPairPending(lp.roads) then
-        return 'Wait for road and bridge tiles before reporting'
+      local rPend, rDone, rWant = loadPairCounts(lp.roads)
+      if rPend then
+        reasons[#reasons + 1] = 'roads_pending'
+        details.roadsDone = rDone
+        details.roadsWant = rWant
       end
     end
   end
@@ -95,7 +178,8 @@ local function provisionalBlocker(core, stStatus, anchorId)
   if okLp and type(loadprogress) == 'table' and type(loadprogress.active) == 'function' then
     local okAct, active = pcall(loadprogress.active)
     if okAct and active == true then
-      return 'Wait for initial world load to finish before reporting'
+      reasons[#reasons + 1] = 'world_load_active'
+      details.worldLoadActive = true
     end
   end
 
@@ -103,11 +187,20 @@ local function provisionalBlocker(core, stStatus, anchorId)
   if okRd and type(roadsMod) == 'table' and type(roadsMod.queued) == 'function' then
     local okQ, q = pcall(roadsMod.queued)
     if okQ and type(q) == 'number' and q > 0 then
-      return 'Wait for queued road tiles before reporting'
+      reasons[#reasons + 1] = 'queued_road_tiles'
+      details.roadsQueued = q
     end
   end
-  return nil
+
+  if #reasons == 0 then
+    return false, nil, nil
+  end
+  local reason = table.concat(reasons, ',')
+  details.reason = reason
+  return true, reason, details
 end
+
+M._inspectLoadingState = inspectLoadingState
 
 function M.status()
   return {
@@ -160,11 +253,13 @@ function M.captureSilent()
     return false, msg
   end
 
-  local blocker = provisionalBlocker(core, stStatus, anchorId)
-  if blocker then
-    showToast(blocker, 4)
-    return false, blocker
+  local blackFrameMsg = blackFrameBlocker(core, stStatus)
+  if blackFrameMsg then
+    showToast(blackFrameMsg, 3)
+    return false, blackFrameMsg
   end
+
+  local loadingIncomplete, loadingReason, loadingDetails = inspectLoadingState(core, stStatus, anchorId)
 
   local headingDeg, speedMs = nil, nil
   local veh = getPlayerVehicle and getPlayerVehicle(0)
@@ -195,12 +290,17 @@ function M.captureSilent()
     pcall(createScreenshot2, { filename = rel .. 'screenshot', writeJPG = true, superSampling = 1 })
   end
 
+  local noteText = 'Captured with Ctrl+Shift+B silent 1-hotkey reporter.'
+  if loadingIncomplete and loadingReason then
+    noteText = noteText .. ' [loading_incomplete: ' .. loadingReason .. ']'
+  end
+
   local payload = {
     lat = lat,
     lon = lon,
     kind = kind,
     summary = string.format('In-game %s report @ %.5f, %.5f', kind, lat, lon),
-    note = 'Captured with Ctrl+Shift+B silent 1-hotkey reporter.',
+    note = noteText,
     earthVersion = earthVer or (core and core.MOD_VERSION) or nil,
     addonVersion = M.ADDON_VERSION,
     headingDeg = headingDeg,
@@ -208,6 +308,9 @@ function M.captureSilent()
     speedMs = speedMs,
     anchorId = anchorId,
     camera = cam,
+    loading_incomplete = loadingIncomplete and true or nil,
+    loading_reason = loadingIncomplete and loadingReason or nil,
+    nearest = (loadingIncomplete and loadingDetails) and { loading = loadingDetails } or nil,
   }
 
   local okEnc, encoded = pcall(jsonEncode, payload)
@@ -219,7 +322,11 @@ function M.captureSilent()
   if okNet and net and type(net.send) == 'function' and net.isConnected and net.isConnected() then
     net.send({ type = 'bridge_rail_report', id = id, rel = rel, payload = payload })
     pending = { rel = rel, kind = kind, deadline = now() + M.POLL_TIMEOUT_S }
-    delayedToast = 'Uploading ' .. kind .. ' report...'
+    if loadingIncomplete then
+      delayedToast = 'Uploading ' .. kind .. ' report (loading incomplete)...'
+    else
+      delayedToast = 'Uploading ' .. kind .. ' report...'
+    end
     delayedAt = now() + 0.15
   else
     delayedToast = 'Saved report locally (world server disconnected)'

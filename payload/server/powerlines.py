@@ -338,7 +338,7 @@ def _lay(frame, md, elev, subs, lines, group, h, arms, clear_m, wire_r, box, pro
         for x, y, zz, yaw in towers:
             row = [group, round(float(x), 2), round(float(y), 2), round(float(zz), 2), round(float(yaw), 1),
                    1.0, h, 0.0]
-            if clearance is None or clearance.clear(row):
+            if clearance is None or (clearance.clear(row) and not clearance.in_gore(row[1], row[2], row[3])):
                 props.append(row)
         for a, b in zip(wo[:-1], wo[1:]):
             wires.append((np.asarray(wp[a:b]), wire_r))

@@ -619,6 +619,129 @@ def _pad_without_ground(p, t, uv, material, origin, ground, centre):
     return p[used], inverse.reshape(-1, 3), uv[used], material
 
 
+def _ribbon_cutter_batch(L, R, chunk=None, origin=(0.0, 0.0, 0.0), expand=0.002, end_inset=0.001):
+    """Outward-expanded convex triangle pairs covering slab strip `(L, R)` for `_cut_coplanar_tops`."""
+    if len(L) < 2:
+        return None
+    lat = L[:, :2] - R[:, :2]
+    w = np.hypot(lat[:, 0], lat[:, 1])
+    if float(w.max()) <= 1e-3:
+        return None
+    u = lat / np.maximum(w, 1e-9)[:, None]
+    li = L[:, :2] + u * float(expand)
+    ri = R[:, :2] - u * float(expand)
+    zi = 0.5 * (L[:, 2] + R[:, 2])
+    if end_inset > 0.0:
+        for edge in (li, ri):
+            d0 = edge[1] - edge[0]
+            n0 = float(np.hypot(d0[0], d0[1]))
+            if n0 > 4.0 * end_inset:
+                edge[0] = edge[0] + d0 * (float(end_inset) / n0)
+            d1 = edge[-2] - edge[-1]
+            n1 = float(np.hypot(d1[0], d1[1]))
+            if n1 > 4.0 * end_inset:
+                edge[-1] = edge[-1] + d1 * (float(end_inset) / n1)
+    box = None
+    if chunk is not None and chunk.get("deck_seam") and chunk.get("deck_box") is not None:
+        ox, oy = float(origin[0]), float(origin[1])
+        x0, y0, x1, y1 = chunk["deck_box"]
+        box = (x0 - ox, y0 - oy, x1 - ox, y1 - oy)
+    tris, zs = [], []
+    for k in range(len(li) - 1):
+        q = np.array([li[k], ri[k], ri[k + 1], li[k + 1]], np.float64)
+        if box is not None:
+            if q[:, 0].max() < box[0] or q[:, 0].min() > box[2] or q[:, 1].max() < box[1] or q[:, 1].min() > box[3]:
+                continue
+        zc = 0.5 * float(zi[k] + zi[k + 1])
+        for a, b, c in ((0, 1, 2), (0, 2, 3)):
+            tri = q[[a, b, c]]
+            area2 = float((tri[1, 0] - tri[0, 0]) * (tri[2, 1] - tri[0, 1]) -
+                          (tri[1, 1] - tri[0, 1]) * (tri[2, 0] - tri[0, 0]))
+            if abs(area2) >= 1e-4:
+                tris.append(tri)
+                zs.append(zc)
+    if not tris:
+        return None
+    xy = np.asarray(tris, np.float64)
+    lo = xy.min(1)
+    hi = xy.max(1)
+    zs_a = np.asarray(zs, np.float64)
+    return xy, lo, hi, zs_a, lo.min(0), hi.max(0), float(zs_a.min()), float(zs_a.max())
+
+
+def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
+    """Trim `top_mi` triangles out of earlier coplanar `top_mi` slabs/pads within `z_tol` so forks and pads never z-fight."""
+    if not cutters or not len(t):
+        return p, t, uv, material
+    top_mask = material == top_mi
+    if not top_mask.any():
+        return p, t, uv, material
+    tv0 = p[t[top_mask]]
+    b_lo, b_hi = tv0[:, :, :2].min((0, 1)), tv0[:, :, :2].max((0, 1))
+    b_z0, b_z1 = float(tv0[:, :, 2].min()), float(tv0[:, :, 2].max())
+    active = [c for c in cutters if c is not None
+              and not (c[4][0] > b_hi[0] or c[5][0] < b_lo[0] or c[4][1] > b_hi[1] or c[5][1] < b_lo[1]
+                       or c[6] > b_z1 + z_tol or c[7] < b_z0 - z_tol)]
+    if not active:
+        return p, t, uv, material
+    for c_xy, c_lo, c_hi, c_z, _glo, _ghi, _gz0, _gz1 in active:
+        for tri2, qlo, qhi, cz in zip(c_xy, c_lo, c_hi, c_z):
+            if not len(t):
+                return p[:0], t.reshape(0, 3), uv[:0], material[:0]
+            tv = p[t]
+            tz = tv[:, :, 2].mean(1)
+            hit = (material == top_mi) & (tv[:, :, :2].max(1) >= qlo).all(1) & (
+                tv[:, :, :2].min(1) <= qhi).all(1) & (np.abs(tz - cz) < z_tol)
+            if not hit.any():
+                continue
+            edge = np.roll(tri2, -1, axis=0) - tri2
+            area2 = float(np.sum(tri2[:, 0] * np.roll(tri2[:, 1], -1) - np.roll(tri2[:, 0], -1) * tri2[:, 1]))
+            if abs(area2) < 1e-6:
+                continue
+            sign = 1.0 if area2 > 0.0 else -1.0
+            pieces, labels = [], []
+            for indices, mat in zip(t[hit], material[hit]):
+                inside = np.c_[p[indices], uv[indices]]
+                for a, d in zip(tri2, edge):
+                    if len(inside) < 3:
+                        break
+                    distance = sign * (d[0] * (inside[:, 1] - a[1]) - d[1] * (inside[:, 0] - a[0]))
+                    if (distance >= -1e-9).all():
+                        continue
+                    if (distance <= 1e-9).all():
+                        pieces.append(inside)
+                        labels.append(mat)
+                        inside = np.zeros((0, 5))
+                        break
+                    inn, out = [], []
+                    for j in range(len(inside)):
+                        k = (j + 1) % len(inside)
+                        point, nxt, da, db = inside[j], inside[k], distance[j], distance[k]
+                        (inn if da >= 0 else out).append(point)
+                        if (da >= 0) != (db >= 0):
+                            cut = point + (nxt - point) * (da / (da - db))
+                            inn.append(cut)
+                            out.append(cut)
+                    if len(out) >= 3:
+                        pieces.append(np.array(out))
+                        labels.append(mat)
+                    inside = np.array(inn)
+            tt, mm, pp, uu = [t[~hit]], [material[~hit]], [p], [uv]
+            at = len(p)
+            for poly, mat in zip(pieces, labels):
+                pp.append(poly[:, :3])
+                uu.append(poly[:, 3:])
+                fan = np.array([(at, at + i, at + i + 1) for i in range(1, len(poly) - 1)], np.int64)
+                tt.append(fan)
+                mm.append(np.full(len(fan), mat))
+                at += len(poly)
+            p, t, uv, material = np.concatenate(pp), np.concatenate(tt), np.concatenate(uu), np.concatenate(mm)
+    if not len(t):
+        return p[:0], t.reshape(0, 3), uv[:0], material[:0]
+    used, inverse = np.unique(t, return_inverse=True)
+    return p[used], inverse.reshape(-1, 3), uv[used], material
+
+
 def _trim_joined(mid, z, hw, om, oz, ow):
     """Whether two deck ribbons meet at an end (one fork): within the wider half-width, and within TRIM_DZ in height.
     The half-width is how far a lane shift can move the shared node (see TRIM_GAP_M's note)."""
@@ -914,6 +1037,49 @@ def follow_ground(P, UV, T, grid, i0, j0, tol=None, cell=GRID_M):
     a, b, c, d = fast._ef.follow_tris(P, UV, T, float(cell), np.ascontiguousarray(grid, np.float64), int(i0), int(j0),
                                       float(tol), FOLLOW_STEP_M, FOLLOW_MAX_UP)
     return np.asarray(a), np.asarray(b), np.asarray(c), np.asarray(d)
+
+
+def _hold_upper_steps(fP, fT, src, P, T_sub, tl_sub, grid, i0, j0, cell=GRID_M):
+    """Where a lattice cell holds a step (FOLLOW_STEP_M) because the ground drops off a retaining wall or abutment
+    below an upper road (rather than a cutting's wall rising above a low road), keep the upper road's draped points on
+    its upper shelf instead of clamping them down to the cell's bottom."""
+    if not len(fP) or not len(fT):
+        return
+    ny, nx = grid.shape
+    if nx < 2 or ny < 2:
+        return
+    tri_z0 = P[T_sub, 2].min(axis=1) - tl_sub
+    ctr = fP[fT, :2].mean(axis=1)
+    ti = np.clip(np.floor(ctr[:, 0] / cell).astype(np.int64) - i0, 0, nx - 2)
+    tj = np.clip(np.floor(ctr[:, 1] / cell).astype(np.int64) - j0, 0, ny - 2)
+    ta, tb, tc, td = grid[tj, ti], grid[tj, ti + 1], grid[tj + 1, ti], grid[tj + 1, ti + 1]
+    t_min = np.minimum(np.minimum(ta, tb), np.minimum(tc, td))
+    t_max = np.maximum(np.maximum(ta, tb), np.maximum(tc, td))
+    z0_src = tri_z0[src]
+    step_tri = np.isfinite(t_min) & np.isfinite(t_max) & np.isfinite(z0_src) & (
+        (t_max - t_min) > FOLLOW_STEP_M
+    ) & (z0_src > t_min + FOLLOW_STEP_M)
+    if not step_tri.any():
+        return
+    t_floor = np.minimum(t_max[step_tri], z0_src[step_tri]) - FOLLOW_MAX_UP
+    t_ceil = t_max[step_tri]
+    v_floor = np.full(len(fP), -np.inf)
+    v_ceil = np.full(len(fP), np.inf)
+    verts = fT[step_tri]
+    np.maximum.at(v_floor, verts, t_floor[:, None])
+    np.minimum.at(v_ceil, verts, t_ceil[:, None])
+    hit = np.flatnonzero(np.isfinite(v_floor))
+    gx, gy = fP[hit, 0] / cell, fP[hit, 1] / cell
+    vi, vj = np.floor(gx).astype(np.int64), np.floor(gy).astype(np.int64)
+    vi -= (vi - i0 == nx - 1) & (gx == vi)
+    vj -= (vj - j0 == ny - 1) & (gy == vj)
+    li = np.clip(vi - i0, 0, nx - 2)
+    lj = np.clip(vj - j0, 0, ny - 2)
+    au, bu, cu, du = grid[lj, li], grid[lj, li + 1], grid[lj + 1, li], grid[lj + 1, li + 1]
+    fx, fy = gx - vi, gy - vj
+    z_lat = np.where(fy > fx, au + fy * (cu - au) + fx * (du - cu), au + fx * (bu - au) + fy * (du - bu))
+    z_lat = np.where(np.isfinite(z_lat), z_lat, fP[hit, 2])
+    fP[hit, 2] = np.minimum(v_ceil[hit], np.maximum(z_lat, v_floor[hit]))
 
 
 def _shared(P, UV, T):
@@ -1385,6 +1551,7 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
                 if not mask.any():
                     continue
                 fP, fUV, fT, src = follow_ground(P[:, :2], UV, T[mask], grid, i0, j0, tol=tol)
+                _hold_upper_steps(fP, fT, src, P, T[mask], TL[mask], grid, i0, j0)
                 lifts = TL[mask][src]
                 vl = np.zeros(len(fP))              # (a cut piece's points are its fan's: one lift each, set once)
                 for kk in range(3):
@@ -1573,8 +1740,29 @@ def barrier_solid(edge, inward, z, h, v=None, section=JERSEY):
     culled face shows from any side). (positions (k n, 3), triangles, uv). Pure."""
     edge, inward = np.asarray(edge, np.float64), np.asarray(inward, np.float64)
     z, h = np.asarray(z, np.float64), np.asarray(h, np.float64)
-    k, n = len(edge), len(section)
     inward = inward / np.maximum(np.hypot(inward[:, 0], inward[:, 1]), 1e-9)[:, None]
+    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(edge, axis=0).T))] if v is None else np.asarray(v, np.float64)
+    if len(h) > 1 and np.abs(np.diff(h)).max() > 0.08:
+        # Subdivide steep height changes so adjacent cross-sections never span from low nose to tall break on one quad.
+        pe, pi, pz_, ph, ps = [], [], [], [], []
+        for idx in range(len(h) - 1):
+            dh = abs(float(h[idx + 1] - h[idx]))
+            m = max(1, int(math.ceil(dh / 0.08)))
+            t = np.linspace(0.0, 1.0, m, endpoint=False)[:, None]
+            pe.append(edge[idx] + t * (edge[idx + 1] - edge[idx]))
+            pi.append(inward[idx] + t * (inward[idx + 1] - inward[idx]))
+            pz_.append(z[idx] + t[:, 0] * (z[idx + 1] - z[idx]))
+            ph.append(h[idx] + t[:, 0] * (h[idx + 1] - h[idx]))
+            ps.append(s[idx] + t[:, 0] * (s[idx + 1] - s[idx]))
+        pe.append(edge[-1:])
+        pi.append(inward[-1:])
+        pz_.append(z[-1:])
+        ph.append(h[-1:])
+        ps.append(s[-1:])
+        edge, inward = np.concatenate(pe), np.concatenate(pi)
+        inward = inward / np.maximum(np.hypot(inward[:, 0], inward[:, 1]), 1e-9)[:, None]
+        z, h, s = np.concatenate(pz_), np.concatenate(ph), np.concatenate(ps)
+    k, n = len(edge), len(section)
     if section is JERSEY:                           # (m up per station: the section narrowing toward an end)
         secs = np.array([jersey_section(float(hh)) for hh in h], np.float64)        # (k, n, 2)
         off2, up2 = secs[:, :, 0], secs[:, :, 1]
@@ -1585,7 +1773,6 @@ def barrier_solid(edge, inward, z, h, v=None, section=JERSEY):
     xy = edge[:, None, :] + inward[:, None, :] * off2[:, :, None]
     zz = z[:, None] + up2
     R = np.concatenate([xy, zz[..., None]], axis=2)                # (k, n, 3): the section at each station
-    s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(edge, axis=0).T))] if v is None else np.asarray(v, np.float64)
     seg = np.linalg.norm(np.diff(np.concatenate([R, R[:, :1]], axis=1), axis=1), axis=2)    # (k, n) edge lengths
     per = np.concatenate([np.zeros((k, 1)), np.cumsum(seg, axis=1)], axis=1)               # (k, n + 1)
     # each face its own vertices (flat, not one normal smoothed over the barrier's corners: its top read as a soft
@@ -1653,6 +1840,62 @@ def _slabs_from_tops(P, T, UV, M, tops, side):
     return P_, T_, UV_, M_
 
 
+def _match_opposite_parapets(specs, entries):
+    """Align top elevations where back-to-back opposite median parapets sit at different deck heights."""
+    if len(entries) < 2:
+        return
+    orig_tops = [pz + h for _, pz, h in entries]
+    out_hs = [h.copy() for _, _, h in entries]
+    boxes = [(p["edge"][:, 0].min(), p["edge"][:, 0].max(), p["edge"][:, 1].min(), p["edge"][:, 1].max())
+             for p, _, _ in entries]
+    for a_i, (pa, pza, ha) in enumerate(entries):
+        ea, oa = pa["edge"], pa["out"]
+        if len(ea) < 1:
+            continue
+        ax0, ax1, ay0, ay1 = boxes[a_i]
+        target = orig_tops[a_i].copy()
+        for b_i, (pb, pzb, _hb) in enumerate(entries):
+            if b_i == a_i or pb["deck"] == pa["deck"] or len(pb["edge"]) < 2:
+                continue
+            bx0, bx1, by0, by1 = boxes[b_i]
+            if ax1 + 0.9 < bx0 or bx1 + 0.9 < ax0 or ay1 + 0.9 < by0 or by1 + 0.9 < ay0:
+                continue
+            eb, ob = pb["edge"], pb["out"]
+            B0, B1 = eb[:-1], eb[1:]
+            seg = B1 - B0
+            len2 = np.maximum((seg * seg).sum(1), 1e-12)
+            t = np.clip(((ea[:, None, :] - B0[None, :, :]) * seg[None, :, :]).sum(2) / len2[None, :], 0.0, 1.0)
+            q = B0[None, :, :] + t[:, :, None] * seg[None, :, :]
+            diff = q - ea[:, None, :]
+            d2 = (diff * diff).sum(2)
+            out_q = ob[:-1][None, :, :] + t[:, :, None] * (ob[1:] - ob[:-1])[None, :, :]
+            zb = pzb[:-1][None, :] + t * (pzb[1:] - pzb[:-1])[None, :]
+            top_b = (orig_tops[b_i][:-1][None, :]
+                     + t * (orig_tops[b_i][1:] - orig_tops[b_i][:-1])[None, :])
+            is_pad_pair = isinstance(pa["deck"], tuple) != isinstance(pb["deck"], tuple)
+            g_lat = (diff * oa[:, None, :]).sum(2)
+            dot_out = (out_q * oa[:, None, :]).sum(2)
+            opp_ok = (dot_out < -0.5) & (g_lat <= 0.25)
+            pad_ok = is_pad_pair & (dot_out > 0.5) & (np.abs(g_lat) <= 0.45)
+            ok = ((d2 <= 0.85 ** 2)
+                  & (np.abs(pza[:, None] - zb) < PARAPET_COVER_DZ)
+                  & (opp_ok | pad_ok))
+            if not ok.any():
+                continue
+            d2_ok = np.where(ok, d2, np.inf)
+            best = d2_ok.argmin(1)
+            hit = np.isfinite(d2_ok[np.arange(len(ea)), best])
+            if not hit.any():
+                continue
+            d = np.sqrt(d2_ok[hit, best[hit]])
+            w = np.clip((0.75 - d) / 0.35, 0.0, 1.0)
+            top_hit = top_b[hit, best[hit]]
+            target[hit] = np.maximum(target[hit], orig_tops[a_i][hit] + w * np.maximum(top_hit - orig_tops[a_i][hit], 0.0))
+        out_hs[a_i] = target - pza
+    for (p, pz, _), nh in zip(entries, out_hs):
+        specs[id(p)] = (pz, nh)
+
+
 def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=None, parapet_h=PARAPET_H,
          low_parapet_decks=(), pads=()):
     """The bridge decks of a tile as one colliding mesh: per "deck" chunk a slab of opaque concrete
@@ -1673,6 +1916,42 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     parapets_by_deck = {}
     for parapet in parapets:
         parapets_by_deck.setdefault(parapet["deck"], []).append(parapet)
+    parapet_specs = {}
+    parapet_entries = []
+    for n, ((_l, _r, _v, _m, _layer, _z), c) in enumerate(rb):
+        field = junctions.get(c.get("fid"))
+        for parapet in parapets_by_deck.get(n, ()):
+            h = parapet_heights(parapet["mid"], parapet["ends"])
+            if BRIDGE_RAILS and n in low_parapet_decks:
+                nz_mask = np.asarray(parapet.get("nose_mask", parapet.get("nose", False)), bool)
+                cap_h = np.where(nz_mask, parapet_h, BRIDGE_CURB_H)
+            else:
+                cap_h = parapet_h
+            h = np.minimum(h, cap_h)
+            pz = field.at(parapet['edge']) if field is not None else parapet['z']
+            parapet_specs[id(parapet)] = (pz, h)
+            parapet_entries.append((parapet, pz, h))
+    pad_info = []
+    for pi, pad in enumerate(pads):
+        ring, centre = pad[0], pad[1]
+        incident = [(r, c) for r, c in rb if c.get('fid') in junctions and any(
+            np.linalg.norm(np.asarray(c['jn'])[at, :2] - centre[:2]) <= JUNCTION_JOIN_M and
+            abs(c['jn'][at][2] - centre[2]) <= JUNCTION_JOIN_Z_M for at in (0, -1))]
+        field = _PadSurface(ring, centre, incident, junctions) if incident else None
+        rails = []
+        for pts, out in (pad[2] if len(pad) > 2 else ()):
+            pts = np.asarray(pts, np.float64)
+            out = np.asarray(out, np.float64)
+            edge = pts[:, :2] + out * (JERSEY_HALF_W + 0.02)
+            ends = [tuple(edge[0]), tuple(edge[-1])]
+            h = parapet_heights(edge, ends)
+            pz = field.at(edge) if field is not None else pts[:, 2] - PAD_DROP
+            entry = {"deck": ("pad", pi), "edge": edge, "out": out}
+            parapet_specs[id(entry)] = (pz, h)
+            parapet_entries.append((entry, pz, h))
+            rails.append((entry, out))
+        pad_info.append((ring, centre, field, rails))
+    _match_opposite_parapets(parapet_specs, parapet_entries)
     mats, P, UV, T, M = [], [], [], [], []
     nv = 0
     active_field = None
@@ -1716,12 +1995,10 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     if DECK_TOP not in mats:
         mats.append(DECK_TOP)
     top = mats.index(DECK_TOP)
-    cr = [r for r in ribbons(list(context)) if r[5] is not None]
-    cov_ctx = [(r, c) for r, c in zip(cr, context)] + _ground_carriageways(list(chunks) + list(ground))
-    covered = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
-    medians = _median_gaps([(r, c) for r, c in rb],
-                           [(r, c) for r, c in zip(ribbons(list(context)), context) if r[5] is not None])
+    cr_all = [(r, c) for r, c in ribbon_pairs(list(context)) if r[5] is not None]
+    edge_cov, covered, medians, _ = _edge_states(rb, chunks, context, ground)
     tops = {}               # slab depth -> the indices of its pieces' tops in P (_slabs_from_tops)
+    top_cutters = []        # upward DECK_TOP triangle batches already emitted, to trim coplanar fork/pad overlaps
 
     def clip_seam(start_p, start_t, start_uv, start_m, start_nv, chunk):
         """Cut this ribbon back to its tile. Only a centre line that meets the tile edge (roads._cover_seam) is cut:
@@ -1766,14 +2043,12 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         k = len(z)
         lat = left - right
         u = lat / np.maximum(np.hypot(lat[:, 0], lat[:, 1]), 1e-9)[:, None]     # unit left
-        wide = 0.0 if c.get("tunnel") else PARAPET_W
         gl_, gr_, ol_, or_, vl_, vr_ = medians[n]
-        (xl, cl), (xr, cr_) = _opposite(gl_, ol_, *_noses(gl_), vl_), _opposite(gr_, or_, *_noses(gr_), vr_)
-        covered[n] = (covered[n][0] | cl, covered[n][1] | cr_)
+        (xl, wl, _cl), (xr, wr, _cr) = _edge_offsets(edge_cov[n], medians[n], bool(c.get("tunnel")))
         # the slab's edges, past the road's (to the middle of a median beside another deck; to a point at a gore nose),
         # changing no faster than REACH_SLOPE along it
-        el = left + u * _smooth_reach(_reach(wide, xl), left)[:, None]
-        er = right - u * _smooth_reach(_reach(wide, xr), right)[:, None]
+        el = left + u * _edge_reach(wl, xl, gl_, ol_, left, vl_, slab=True)[:, None]
+        er = right - u * _edge_reach(wr, xr, gr_, or_, right, vr_, slab=True)[:, None]
         zl = active_field.at(el) if active_field is not None else z
         zr = active_field.at(er) if active_field is not None else z
         L = np.c_[el, zl] - origin
@@ -1790,13 +2065,41 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         i0, nv0 = len(P), nv
         quads(L, R, 0.0, across, v * DECK_TOP_V, v * DECK_TOP_V, top if not c.get("tunnel") else side,
               np.array([0.0, 0.0, 1.0]))
+        other_cutters = [cb for _fld, cb in top_cutters]
+        if not c.get("tunnel") and not shells.ON and i0 < len(P):
+            if other_cutters:
+                tp, tt_top, tu, tm = _cut_coplanar_tops(P[i0], T[i0] - nv0, UV[i0], M[i0], top, other_cutters)
+                if len(tt_top):
+                    P[i0], T[i0], UV[i0], M[i0] = tp, tt_top + nv0, tu, tm
+                    nv = nv0 + len(tp)
+                else:
+                    del P[i0:], T[i0:], UV[i0:], M[i0:]
+                    nv = nv0
+            if i0 < len(P):
+                cb = _ribbon_cutter_batch(L, R, c, origin)
+                if cb is not None:
+                    top_cutters.append((active_field, cb))
         # the slab a closed solid from its top's own outline (the user, 2026-11-07: watertight): sides straight down
         # `slab` from every edge of the top as drawn (a junction field retriangulates the top: sides built from the
         # chunk's edge rows left 13 cm slivers between them, Pittsburgh 40.44225,-79.99391), the underside under them
         if shells.ON:
             kept = clip_top(i0, c)
             if kept is not None:
-                tops.setdefault(round(slab, 3), []).append(kept)
+                if other_cutters:
+                    tp0_nv = sum(len(a) for a in P[:kept])
+                    tp, tt_top, tu, tm = _cut_coplanar_tops(P[kept], T[kept] - tp0_nv, UV[kept], M[kept], top, other_cutters)
+                    if len(tt_top):
+                        P[kept], T[kept], UV[kept], M[kept] = tp, tt_top + tp0_nv, tu, tm
+                        nv = tp0_nv + len(tp)
+                    else:
+                        del P[kept:], T[kept:], UV[kept:], M[kept:]
+                        nv = tp0_nv
+                        kept = None
+                if kept is not None:
+                    cb = _ribbon_cutter_batch(L, R, c, origin)
+                    if cb is not None:
+                        top_cutters.append((active_field, cb))
+                    tops.setdefault(round(slab, 3), []).append(kept)
             after_top = (len(P), len(T), len(UV), len(M), nv)
         else:               # (BNE_WATERTIGHT off: the slab's sides and underside from the chunk's edge rows, as before)
             quads(L, Lb, 0.0, 0.1, v, v, side, out_l)
@@ -1823,10 +2126,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         # a parapet on each free edge (parapet_runs: not where another deck goes on beside it, a ramp leaving, a
         # carriageway); a low curb under the rail where mapped guard rails put stock rail modules on it (guardrails)
         for parapet in parapets_by_deck.get(n, ()):
-            h = parapet_heights(parapet["mid"], parapet["ends"])
-            h = np.minimum(h, BRIDGE_CURB_H if BRIDGE_RAILS and n in low_parapet_decks and not parapet.get("nose")
-                           else parapet_h)
-            pz = active_field.at(parapet['edge']) if active_field is not None else parapet['z']
+            pz, h = parapet_specs[id(parapet)]
             bp, bt_, buv = barrier_solid(parapet["edge"], -parapet["out"], pz, h, parapet["v"])
             P.append(bp - origin)
             UV.append(buv)
@@ -1840,41 +2140,39 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     if tops:                # (the tops of a deck's pieces closed together: their shared end rows weld, no wall between)
         P, T, UV, M = _slabs_from_tops(P, T, UV, M, tops, side)
         nv = sum(len(a) for a in P)
+    portal_ctx = list(rb) + list(cr_all) + _ground_carriageways(list(chunks) + list(ground)) if piers else ()
     if piers:
         import roads as _roads
-        piers = _roads.pier_portals(piers, list(rb) + list(cr_all))
-    for p in _piers_clear(piers, rb):
+        piers = _roads.pier_portals(piers, portal_ctx)
+    for p in _piers_clear(piers, rb, portal_ctx):
         _pier(p, origin, P, T, UV, M, side)
         nv = sum(len(a) for a in P)
-    for pad in pads:                # (junction pads on bridges: roads.deck_pads; their rim's railings)
+    for ring, centre, field, rails in pad_info:
         start_p, start_t, start_uv, start_m, start_nv = len(P), len(T), len(UV), len(M), nv
-        ring, centre = pad[0], pad[1]
-        incident = [(r, c) for r, c in rb if c.get('fid') in junctions and any(
-            np.linalg.norm(np.asarray(c['jn'])[at, :2] - centre[:2]) <= JUNCTION_JOIN_M and
-            abs(c['jn'][at][2] - centre[2]) <= JUNCTION_JOIN_Z_M for at in (0, -1))]
-        field = _PadSurface(ring, centre, incident, junctions) if incident else None
         _pad(ring, centre, origin, P, T, UV, M, top, side, field)
         nv = sum(len(a) for a in P)
-        for pts, out in (pad[2] if len(pad) > 2 else ()):
-            pts = np.asarray(pts, np.float64)
-            out = np.asarray(out, np.float64)
-            edge = pts[:, :2] + out * (JERSEY_HALF_W + 0.02)
-            ends = [tuple(edge[0]), tuple(edge[-1])]
-            h = parapet_heights(edge, ends)
-            pz = field.at(edge) if field is not None else pts[:, 2] - PAD_DROP
-            bp, bt_, buv = barrier_solid(edge, -out, pz, h)
+        for entry, out in rails:
+            pz, h = parapet_specs[id(entry)]
+            bp, bt_, buv = barrier_solid(entry["edge"], -out, pz, h)
             P.append(bp - origin)
             UV.append(buv)
             T.append(bt_ + nv)
             M.append(np.full(len(bt_), side))
             nv += len(bp)
-        if field is None:
-            continue
-        pp, tt, uu, mm = _pad_without_ground(np.concatenate(P[start_p:]), np.concatenate(T[start_t:]) - start_nv,
-                                             np.concatenate(UV[start_uv:]), np.concatenate(M[start_m:]),
-                                             origin, ground, centre)
-        P[start_p:], T[start_t:], UV[start_uv:], M[start_m:] = [pp], [tt + start_nv], [uu], [mm]
-        nv = start_nv + len(pp)
+        pp = np.concatenate(P[start_p:])
+        tt = np.concatenate(T[start_t:]) - start_nv
+        uu = np.concatenate(UV[start_uv:])
+        mm = np.concatenate(M[start_m:])
+        if field is not None:
+            pp, tt, uu, mm = _pad_without_ground(pp, tt, uu, mm, origin, ground, centre)
+        if top_cutters and len(tt):
+            pp, tt, uu, mm = _cut_coplanar_tops(pp, tt, uu, mm, top, [cb for _fld, cb in top_cutters])
+        if len(tt):
+            P[start_p:], T[start_t:], UV[start_uv:], M[start_m:] = [pp], [tt + start_nv], [uu], [mm]
+            nv = start_nv + len(pp)
+        else:
+            del P[start_p:], T[start_t:], UV[start_uv:], M[start_m:]
+            nv = start_nv
     if len(beams):
         for pt in sorted({b[4] if len(b) > 4 else "grey" for b in beams}):
             mats.append(steel(pt))
@@ -1883,8 +2181,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         return None
     pp, tt, uu = np.concatenate(P), np.concatenate(T), np.concatenate(UV)
     mm = np.concatenate(M)
-    if junctions:
-        pp, uu, tt = _shared(pp, uu, tt)
+    pp, uu, tt = _shared(pp, uu, tt)
     return pp, tt, uu, mats, mm
 
 
@@ -1978,20 +2275,63 @@ def _pad(ring, centre, origin, P, T, UV, M, top, side, field=None):
     M.append(np.full(2 * k, side))
 
 
-def _piers_clear(piers, rb):
-    """The piers that cross no other deck under their top: a pier of the Queensboro Bridge's upper roadway stood on
-    the ground through the lower one, across its lanes (the user, 2026-10-17: "objects blocking the bridge road")."""
-    if not piers or not rb:
+def _portal_columns(p):
+    """Return (z_road, left_c, right_c, cap_bot) for a valid portal-tagged pier, or False if it fails bounds."""
+    portal = p[8] if len(p) > 8 and isinstance(p[8], tuple) and p[8] and p[8][0] == "portal" else None
+    if portal is None:
+        return None
+    zt, width = float(p[4]), float(p[6])
+    z_road, off, hw = float(portal[1]), float(portal[2]), float(portal[3])
+    if zt < z_road + 4.85:
+        return False
+    cap_w = width / 2 + PARAPET_W
+    gap = PIER_COLUMN / 2 + 1.15
+    left_c = min(off - (hw + gap), -cap_w + PIER_COLUMN / 2)
+    right_c = max(off + (hw + gap), cap_w - PIER_COLUMN / 2)
+    if max(-left_c, right_c) > max(2.0 * cap_w, cap_w + 2.5):
+        return False
+    cap_bot = (min(max(zt - PIER_CAP_H, z_road + 6.05), zt - 0.10) if zt >= z_road + 6.10
+               else min(max(zt - 0.55, z_road + 4.55), zt - 0.10))
+    return z_road, left_c, right_c, cap_bot
+
+
+def _piers_clear(piers, rb, context=None):
+    """The piers that cross no other deck under their top, nor place portal columns into lower carriageways."""
+    if not piers:
+        return []
+    src = context if context is not None else rb
+    if not rb and not src:
         return list(piers)
     lines = [(((l + r) / 2), float(np.median(np.hypot(*(l - r).T))) / 2 + PARAPET_W, z) for (l, r, v, m, layer, z), c in rb
              if not c.get("tunnel")]
+    col_lines = [(((l + r) / 2), float(np.median(np.hypot(*(l - r).T))) / 2, z) for (l, r, v, m, layer, z), c in src
+                 if not c.get("tunnel")]
     out = []
     for p in piers:
         tag = p[8][0] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
-        if tag == "portal":
-            out.append(p)
-            continue
         x, y, ux, uy, zt, zb, width = p[:7]
+        pinfo = _portal_columns(p)
+        if pinfo is False:
+            continue
+        if pinfo is not None:
+            _zr, left_c, right_c, _cap_bot = pinfo
+            c_xy = np.array([x, y])
+            nrm = np.array([-uy, ux])
+            col_clear_r = PIER_COLUMN / 2 + 1.0
+            hit = False
+            for lat in (left_c, right_c):
+                cq = c_xy + nrm * lat
+                for mid, hw, z in col_lines:
+                    d = np.hypot(*(mid - cq).T)
+                    k = int(np.argmin(d))
+                    if d[k] < hw + col_clear_r and zb - 0.5 <= z[k] < zt - 1.0:
+                        hit = True
+                        break
+                if hit:
+                    break
+            if not hit:
+                out.append(p)
+            continue
         q = np.array([x, y])
         if tag == "median":
             offs = p[8][3] if len(p[8]) > 3 else (0.0,)
@@ -2090,17 +2430,20 @@ def _median_gaps(rb, context=()):
     carriageways' decks; and whether that deck carries the opposite traffic (both one-way, their chunks' "tdir").
     rb and context: [(ribbon, chunk)]; the context's pieces of the same deck (its fid: the deck going on in the tiles
     around) are not another deck (they had hidden every median at 0 m)."""
-    edges = []                      # (owner, points (k, 3), its traffic's direction (k, 2))
-    for n, ((left, right, v, m, layer, z), c) in enumerate(rb):
-        key = c.get("fid", ("own", n))
-        tv = _travel_vec(left, right, c.get("tdir", 0))
-        edges.append((key, np.c_[left, z], tv, _bl(c)))
-        edges.append((key, np.c_[right, z], tv, _bl(c)))
-    for k, ((left, right, v, m, layer, z), c) in enumerate(context):
-        key = c.get("fid", ("ctx", k))
-        tv = _travel_vec(left, right, c.get("tdir", 0))
-        edges.append((key, np.c_[left, z], tv, _bl(c)))
-        edges.append((key, np.c_[right, z], tv, _bl(c)))
+    edges = []                      # (owner, points (k, 3), travel dir (k, 2), bl, outward unit normal (k, 2))
+
+    def _add_edges(items, tag):
+        for idx, ((left, right, _v, _m, _layer, z), c) in enumerate(items):
+            key = c.get("fid", (tag, idx))
+            tv = _travel_vec(left, right, c.get("tdir", 0))
+            lat = left - right
+            unit = lat / np.maximum(np.hypot(lat[:, 0], lat[:, 1]), 1e-9)[:, None]
+            bl = _bl(c)
+            edges.append((key, np.c_[left, z], tv, bl, unit))
+            edges.append((key, np.c_[right, z], tv, bl, -unit))
+
+    _add_edges(rb, "own")
+    _add_edges(context, "ctx")
     out = []
     for n, ((left, right, v, m, layer, z), c) in enumerate(rb):
         own = c.get("fid", ("own", n))
@@ -2115,33 +2458,46 @@ def _median_gaps(rb, context=()):
             tan = tan / np.maximum(np.hypot(tan[:, 0], tan[:, 1]), 1e-9)[:, None]
             out_ = out_ / np.maximum(np.hypot(out_[:, 0], out_[:, 1]), 1e-9)[:, None]
             mine_bl = _bl(c)
-            for owner, O, tv, obl in edges:
-                if owner == own or not len(O) or _different_bl(mine_bl, obl):
+            for owner, O, tv, obl, O_out in edges:
+                if owner == own or len(O) < 2 or _different_bl(mine_bl, obl):
                     continue
                 # (only near ones: a cheap box test first)
                 if (O[:, 0].min() > E[:, 0].max() + MEDIAN_JOIN_M or O[:, 0].max() < E[:, 0].min() - MEDIAN_JOIN_M
                         or O[:, 1].min() > E[:, 1].max() + MEDIAN_JOIN_M
                         or O[:, 1].max() < E[:, 1].min() - MEDIAN_JOIN_M):
                     continue
-                d = np.hypot(E[:, None, 0] - O[None, :, 0], E[:, None, 1] - O[None, :, 1])
-                dz = np.abs(E[:, None, 2] - O[None, :, 2])
+                A, AB = O[:-1, :2], O[1:, :2] - O[:-1, :2]
+                L2 = np.maximum((AB * AB).sum(1), 1e-12)
+                seg_t = np.clip(((E[:, None, :2] - A[None, :, :]) * AB[None, :, :]).sum(2) / L2[None, :], 0.0, 1.0)
+                Q = A[None, :, :] + seg_t[:, :, None] * AB[None, :, :]
+                Qz = O[:-1, 2][None, :] + seg_t * (O[1:, 2] - O[:-1, 2])[None, :]
+                d = np.hypot(E[:, None, 0] - Q[:, :, 0], E[:, None, 1] - Q[:, :, 1])
+                dz = np.abs(E[:, None, 2] - Qz)
                 d = np.where(dz < PARAPET_COVER_DZ, d, np.inf)
-                j = d.argmin(1)
-                d = d[np.arange(len(E)), j]
+                s = d.argmin(1)
+                idx_e = np.arange(len(E))
+                d = d[idx_e, s]
+                ts = seg_t[idx_e, s]
                 # (beside, not behind or ahead: a deck going on from this one's end at a merge was a "median" growing
                 # with the distance back to its end, the slab filled toward it and the parapet gone; the two ramps
                 # merging on I-95 by the Middle Branch, 2026-10-31)
                 # and outside this edge (another deck's edge over this one's slab, two merging roads side by side on
                 # one deck: no gap)
-                rel = O[j, :2] - E[:, :2]
+                rel = (A[s] + ts[:, None] * AB[s]) - E[:, :2]
                 along = np.abs((rel * tan).sum(1))
-                # (nor this edge's end on another's end: one deck going on from the other, the parapet going on too)
+                # (edge normals must face each other so overlapping decks never match a far outer edge across lanes)
+                o_out = O_out[s] + ts[:, None] * (O_out[s + 1] - O_out[s])
+                o_out = o_out / np.maximum(np.hypot(o_out[:, 0], o_out[:, 1]), 1e-9)[:, None]
+                facing = (out_ * o_out).sum(1) < -0.25
+                # (nor this edge's end on another's end for same-direction decks; opposing twins keep their abutments)
                 ends = np.zeros(len(E), bool)
-                ends[[0, -1]] = (j[[0, -1]] == 0) | (j[[0, -1]] == len(O) - 1)
-                against = (mine * tv[j]).sum(1) < -0.5
+                ends[[0, -1]] = ((s[[0, -1]] == 0) & (ts[[0, -1]] <= 1e-6)) | (
+                    (s[[0, -1]] == len(O) - 2) & (ts[[0, -1]] >= 1.0 - 1e-6))
+                o_tv = tv[s] + ts[:, None] * (tv[s + 1] - tv[s])
+                against = (mine * o_tv).sum(1) < -0.5
                 # (opposite traffic over each other's slab still gets its median barrier between them)
                 hit = ((d < MEDIAN_JOIN_M) & ((g == 0) | (d < g)) & (along <= np.maximum(MEDIAN_ALONG * d, MEDIAN_ALONG_M))
-                       & (((rel * out_).sum(1) > -MEDIAN_INSIDE_M) | against) & ~ends)
+                       & facing & (((rel * out_).sum(1) > -MEDIAN_INSIDE_M) | against) & ~(ends & ~against))
                 g = np.where(hit, np.maximum(d, 1e-3), g)
                 opp = np.where(hit, against, opp)
                 over = np.where(hit, (rel * out_).sum(1) < 0.0, over)     # (its edge over this slab: _opposite)
@@ -2196,6 +2552,27 @@ def _smooth_reach(ext, edge):
     for k in range(len(ext) - 2, -1, -1):
         ext[k] = max(ext[k], ext[k + 1] - ds[k])
     return ext
+
+
+def _edge_reach(wide, ext, g, opp, edge, over=None, slab=False):
+    """Smoothed slab/parapet reach past `edge`, capped at non-overlapping median positions where opposite traffic stands."""
+    ext = np.asarray(ext, np.float64)
+    g = np.asarray(g, np.float64)
+    opp = np.asarray(opp, bool)
+    near_opp = (opp & (g > 0) & (g <= MEDIAN_BARRIER_M)).copy()
+    inside = (near_opp & np.asarray(over, bool)) if over is not None else np.zeros(len(g), bool)
+    adj = np.where(inside, 0.0 if slab else -0.025, np.where(near_opp, -0.05 if slab else -0.075, 0.0))
+    tgt = ext + adj
+    if len(tgt) >= 2:
+        if near_opp[1] and g[0] == 0.0:
+            near_opp[0] = True
+            tgt[0] = tgt[1]
+        if near_opp[-2] and g[-1] == 0.0:
+            near_opp[-1] = True
+            tgt[-1] = tgt[-2]
+    raw = np.where(near_opp | (tgt < 0.0), tgt, np.maximum(wide, tgt))
+    sm = _smooth_reach(raw, edge)
+    return np.where(near_opp, np.minimum(sm, tgt), sm)
 
 
 def _opposite(g, opp, ext, cov, over=None):
@@ -2321,30 +2698,104 @@ def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
     if not rb:
         return []
 
-    cr = [r for r in ribbons(list(context)) if r[5] is not None]
-    cov_ctx = [(r, c) for r, c in zip(cr, context)] + _ground_carriageways(list(chunks) + list(ground))
-    covered = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
-    medians = _median_gaps([(r, c) for r, c in rb],
-                           [(r, c) for r, c in zip(ribbons(list(context)), context) if r[5] is not None])
+def _non_opposing_cover(rb_item, ctx_items, edge_pts, mask, mine):
+    """Evaluate _parapet_cover at masked edge points against only non-opposing ribbons."""
+    if not mask.any():
+        return None
+    own_fid = rb_item[1].get("fid")
+    kept = []
+    for r2, c2 in ctx_items:
+        if own_fid is not None and c2.get("fid") == own_fid:
+            continue
+        if rb_item[1].get("tdir") and c2.get("tdir"):
+            mid2 = (r2[0] + r2[1]) * 0.5
+            d = np.hypot(edge_pts[mask, None, 0] - mid2[None, :, 0], edge_pts[mask, None, 1] - mid2[None, :, 1])
+            j = d.argmin(1)
+            tv2 = _travel_vec(r2[0], r2[1], c2.get("tdir", 0))
+            if float(np.median((mine[mask] * tv2[j]).sum(1))) < -0.5:
+                continue
+        kept.append((r2, c2))
+    if not kept:
+        return np.zeros(len(mask), bool), np.zeros(len(mask), bool)
+    return _parapet_cover([rb_item], kept)[0]
+
+
+def _edge_states(rb, chunks, context, ground):
+    """Compute surface-cover masks and median gaps for deck ribbons, keeping opposite-traffic median barriers clear."""
+    ctx_decks = [(r, c) for r, c in ribbon_pairs(list(context)) if r[5] is not None]
+    cov_ctx = ctx_decks + _ground_carriageways(list(chunks) + list(ground))
+    raw_cov = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
+    medians = _median_gaps([(r, c) for r, c in rb], ctx_decks)
+    covered = []
+    for n, ((left, right, _v, _m, _ly, _z), c) in enumerate(rb):
+        cl_cov, cr_cov = raw_cov[n][0].copy(), raw_cov[n][1].copy()
+        gl_, gr_, ol_, or_, _vl, _vr = medians[n]
+        ml = cl_cov & ol_ & (gl_ > 0) & (gl_ <= MEDIAN_BARRIER_M)
+        mr = cr_cov & or_ & (gr_ > 0) & (gr_ <= MEDIAN_BARRIER_M)
+        if ml.any() or mr.any():
+            mine = _travel_vec(left, right, c.get("tdir", 0))
+            others = [rb[i] for i in range(len(rb)) if i != n] + cov_ctx
+            if ml.any():
+                re_l, _ = _non_opposing_cover(rb[n], others, left, ml, mine)
+                cl_cov[ml] = re_l[ml]
+            if mr.any():
+                _, re_r = _non_opposing_cover(rb[n], others, right, mr, mine)
+                cr_cov[mr] = re_r[mr]
+        covered.append((cl_cov, cr_cov))
+    return raw_cov, covered, medians, cov_ctx
+
+
+def _edge_offsets(edge_cov_n, medians_n, tunnel):
+    """Per side ((ext, wide, cov_nose), ...) suppressing non-opposing gore flare and ledges on covered edges."""
+    wide = 0.0 if tunnel else PARAPET_W
+    gl_, gr_, ol_, or_, vl_, vr_ = medians_n
+    cov_l0, cov_r0 = edge_cov_n
+    sides = []
+    for g, opp, over, cov0 in ((gl_, ol_, vl_, cov_l0), (gr_, or_, vr_, cov_r0)):
+        ext, cov = _opposite(g, opp, *_noses(g), over)
+        flat = cov0 & ~opp
+        ext = np.where(flat, 0.0, ext)
+        w_side = 0.0 if tunnel else np.where(flat, 0.0, wide)
+        sides.append((ext, w_side, cov))
+    return sides[0], sides[1]
+
+
+def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
+    """Actual generated bridge parapets as XY centre lines plus the mesh geometry.
+
+    Uses the same coverage masks, edge offsets, tunnel exclusion, and minimum-run rule as deck().
+    _rb lets deck() share its already-computed ribbons. Returned dictionaries are ordered by deck
+    chunk and edge, and include the points deck() uses verbatim.
+    """
+    junctions = _junction_surfaces(chunks, context)
+    if _rb is None:
+        dch = [c for c in chunks if c.get("deck")]
+        cr_all = [(r, c) for r, c in ribbon_pairs(list(context)) if r[5] is not None]
+        rb = trim_overlaps([(r, c) for r, c in ribbon_pairs(dch) if r[5] is not None], cr_all,
+                           junctions)
+    else:
+        rb = _rb
+    if not rb:
+        return []
+
+    edge_cov, covered, medians, _ = _edge_states(rb, chunks, context, ground)
     out = []
     for n, ((left, right, v, _m, _layer, z), c) in enumerate(rb):
         if c.get("tunnel"):       # deck() draws the tunnel floor without parapets
             continue
         lat = left - right
         u = lat / np.maximum(np.hypot(lat[:, 0], lat[:, 1]), 1e-9)[:, None]
-        wide = 0.0 if c.get("tunnel") else PARAPET_W
         gl_, gr_, ol_, or_, vl_, vr_ = medians[n]
-        (xl, cl), (xr, cr_) = _opposite(gl_, ol_, *_noses(gl_), vl_), _opposite(gr_, or_, *_noses(gr_), vr_)
+        (xl, wl, cl), (xr, wr, cr_) = _edge_offsets(edge_cov[n], medians[n], bool(c.get("tunnel")))
         covered[n] = (covered[n][0] | cl, covered[n][1] | cr_)
-        # (full barriers, never the low curb: a gore nose's points, _noses; a median barrier's, _opposite)
-        nose = (((gl_ > 0) & ~cl & ~ol_) | (ol_ & (gl_ <= MEDIAN_BARRIER_M)),
-                ((gr_ > 0) & ~cr_ & ~or_) | (or_ & (gr_ <= MEDIAN_BARRIER_M)))
+        # Full concrete barrier only along opposing-traffic medians; same-direction gores follow curb selection.
+        nose = (ol_ & (gl_ <= MEDIAN_BARRIER_M), or_ & (gr_ <= MEDIAN_BARRIER_M))
         if len(pads):               # (none inside a junction pad: roads.deck_pads)
             import roads as _roads
             covered[n] = (covered[n][0] | _roads.pad_inside(pads, left, z=z),
                           covered[n][1] | _roads.pad_inside(pads, right, z=z))
-        el = left + u * _smooth_reach(_reach(wide, xl), left)[:, None]
-        er = right - u * _smooth_reach(_reach(wide, xr), right)[:, None]
+        el = left + u * _edge_reach(wl, xl, gl_, ol_, left, vl_)[:, None]
+        er = right - u * _edge_reach(wr, xr, gr_, or_, right, vr_)[:, None]
         k = len(z)
         for sgn, edge, inner, cov, nz in ((1, el, left, covered[n][0], nose[0]),
                                           (-1, er, right, covered[n][1], nose[1])):
@@ -2376,7 +2827,8 @@ def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
                         "z": junctions[c['fid']].at(edge_run) if c.get('fid') in junctions else z[sl],
                         "v": v[sl],
                         "out": u[sl] * sgn,
-                        "nose": bool(nz[sl].any()),     # (a gore nose's: a full barrier, never the low curb)
+                        "nose": bool(nz[sl].any()),
+                        "nose_mask": nz[sl].copy(),
                     })
                 i = j + 1
     return out
@@ -2388,25 +2840,21 @@ def _pier(p, origin, P, T, UV, M, mat):
     x, y, ux, uy, zt, zb, width = p[:7]
     thick = p[7] if len(p) > 7 else None        # a truss's anchor pier: one solid wall this thick, the truss's width
     tag = p[8] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
-    portal = tag if tag is not None and tag[0] == "portal" else None
     median = tag if tag is not None and tag[0] == "median" else None
+    pinfo = _portal_columns(p)
+    if pinfo is False:
+        return
     t = np.array([ux, uy])
     nrm = np.array([-uy, ux])
     c = np.array([x, y])
     boxes = []                                  # (centre, half along t, half across, z0, z1, widen per m down)
     cap_w = width / 2 + PARAPET_W
-    if portal is not None:
-        _z_road, off, hw = float(portal[1]), float(portal[2]), float(portal[3])
-        gap = PIER_COLUMN / 2 + 1.15
-        left_c, right_c = off - (hw + gap), off + (hw + gap)
-        col_top = zt
-        if zt >= _z_road + 6.10:
-            cap_bot = min(max(zt - PIER_CAP_H, _z_road + 6.05), zt - 0.05)
-            col_top = cap_bot
-            mid_lat = (left_c + right_c) / 2
-            boxes.append((c + nrm * mid_lat, PIER_T / 2 + 0.3, (right_c - left_c) / 2, cap_bot, zt, 0.0))
+    if pinfo is not None:
+        _z_road, left_c, right_c, cap_bot = pinfo
+        mid_lat = 0.5 * (left_c + right_c)
+        boxes.append((c + nrm * mid_lat, PIER_T / 2 + 0.3, 0.5 * (right_c - left_c) + PIER_COLUMN / 2, cap_bot, zt, 0.0))
         for lat in (left_c, right_c):
-            boxes.append((c + nrm * lat, PIER_COLUMN / 2, PIER_COLUMN / 2, zb, col_top, 0.0))
+            boxes.append((c + nrm * lat, PIER_COLUMN / 2, PIER_COLUMN / 2, zb, cap_bot, 0.0))
     elif median is not None:
         ht, hn = float(median[1]), float(median[2])
         offs = median[3] if len(median) > 3 else (0.0,)
@@ -2419,7 +2867,7 @@ def _pier(p, origin, P, T, UV, M, mat):
         boxes.append((c, thick / 2, width / 2, zb, zt, PIER_TAPER))
     else:
         boxes.append((c, PIER_T / 2 + 0.3, cap_w, zt - PIER_CAP_H, zt, 0.0))
-    if portal is not None or median is not None or thick is not None:
+    if pinfo is not None or median is not None or thick is not None:
         pass
     elif width > PIER_BENT_W:
         nc = max(2, int(round(width / 9.0)))
@@ -2476,7 +2924,7 @@ STONE_UV_M = 3.0           # m per repeat of the stone on a low arch
 CONCRETE_UV_M = 4.0        # m per repeat of the concrete (as a tunnel's)
 LOW_PORTAL_UP = 1.4        # m a low arch's portal face reaches over the vault (to the ground over it) ...
 LOW_PORTAL_SIDE = 3.0      # ... and beside the opening
-LOW_RISE = 0.4             # a low arch's vault rises this share of its height from its walls (a segmental arch)
+LOW_RISE = 0.25            # a low arch's vault rises this share of its height from its walls (a segmental arch)
 ARCH_CAP_OVER = 0.75       # m a low arch's top lies over its vault (roads.ARCH_SOIL_MIN of soil there, + a little)
 LOW_CAP_MIN = 1.0          # m: a stone top shorter than this (a road just behind the face) is left out
 LOW_CAP_M = 7.0            # m a low arch's stone top runs back from its portal face over the mouth: the terrain there
@@ -2491,12 +2939,14 @@ TUNNEL_LAMP_DROP = 0.25    # ... its middle this far under the wall's top, ...
 TUNNEL_LAMP_IN = 0.08      # ... this far in from the wall
 
 
-def _tunnel_section(hw, th=TUNNEL_H, low=False):
+def _tunnel_section(hw, th=TUNNEL_H, low=False, box=False):
     """The tube's cross-section from the left road edge's floor over the vault to the right one: (lateral offset
     from the centre line, positive = left; height over the floor) for half-width hw (centre to wall) and a vault
     th over the floor (its walls in proportion). low: a park arch's segmental vault, a shallow circular arc rising
-    LOW_RISE of th from its walls (Central Park's transverse arches)."""
-    if low:
+    LOW_RISE of th from its walls (Central Park's transverse arches); box: vertical walls with full th headroom."""
+    if box:
+        vault = [(float(x), float(th)) for x in np.linspace(hw, -hw, 9)]
+    elif low:
         rise = LOW_RISE * th
         wall = th - rise
         r = (hw * hw + rise * rise) / (2 * rise)
@@ -2626,7 +3076,7 @@ def tunnel(chunks, origin, walls=()):
         stone = low and not c.get("concrete")
         mat = 3 if stone else 5                               # (its portal faces: 2, the stone in daylight; a full
                                                             # tube's inside: 5, TUNNEL_INNER)
-        sec = _tunnel_section(hw, th, low)
+        sec = _tunnel_section(hw, th, low, box=low and bool(c.get("concrete")))
         k, m = len(mid), len(sec)
         rows = np.empty((m, k, 3))
         for j, (off, h) in enumerate(sec):
@@ -2671,8 +3121,11 @@ def tunnel(chunks, origin, walls=()):
             o = sec.copy()
             up, side = (LOW_PORTAL_UP, LOW_PORTAL_SIDE) if low else (PORTAL_FRAME, PORTAL_FRAME)
             if pup is not None:     # to the ground over the portal (TunnelProfiles.portal_ups); a low arch's at least
-                # LOW_PORTAL_UP (under a hill higher than its top, the ground dipping into its mouth showed over it)
-                up = max(LOW_PORTAL_UP, float(pup)) if low else float(pup)
+                # LOW_PORTAL_UP unless capped under a lower overpass road (_road_caps)
+                if low:
+                    up = max(0.15, float(pup)) if cap_m is not None else max(LOW_PORTAL_UP, float(pup))
+                else:
+                    up = float(pup)
             o[:, 0] = np.sign(o[:, 0]) * (np.abs(o[:, 0]) + side)
             # its foot under the ground (2 m into a hillside; a low arch's mouth is flat: just under its floor, or the
             # face's bottom stood as a dark wedge beside the opening)
@@ -2715,7 +3168,9 @@ def _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, side, top, th, origin, depth=No
     a = mid[at]
     b = a + t * (LOW_CAP_M if depth is None else depth)
     ua = u[at]
-    z0 = float(z[at]) + top - (LOW_PORTAL_UP - ARCH_CAP_OVER)   # the soil's level (the face stands over it)
+    z0 = float(z[at]) + min(float(th) + ARCH_CAP_OVER, float(top) - 0.05)
+    if z0 <= float(z[at]) + float(th) + 0.12:
+        return nv
     corners = np.array([[*(a + ua * side), z0], [*(a - ua * side), z0], [*(b - ua * side), z0], [*(b + ua * side), z0]])
     foot = corners.copy()
     foot[:, 2] = float(z[at])

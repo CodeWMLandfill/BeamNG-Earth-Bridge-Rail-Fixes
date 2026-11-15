@@ -514,7 +514,17 @@ def sync_unpacked_mods_on_install(user_dirs, payload_dir, state_root, apply_fixe
         if apply_fixes:
             roads_dest = mod_root / "lua/ge/extensions/beamngEarth/roads.lua"
             roads_dest.parent.mkdir(parents=True, exist_ok=True)
-            roads_dest.write_bytes((payload_dir / patch_server.MOD_ROADS_LUA).read_bytes())
+            fallback_roads = (payload_dir / patch_server.MOD_ROADS_LUA).read_bytes()
+            if roads_dest.is_file():
+                base_roads = roads_dest.read_bytes()
+                if b"return false, 'not supported'" in base_roads:
+                    bfile_roads = bdir / "lua/ge/extensions/beamngEarth/roads.lua"
+                    base_roads = bfile_roads.read_bytes() if bfile_roads.is_file() else fallback_roads
+                roads_dest.write_bytes(
+                    patch_server.patch_roads_lua_bytes(base_roads, fallback_bytes=fallback_roads)
+                )
+            else:
+                roads_dest.write_bytes(fallback_roads)
 
         if enable_reporter:
             bug_dest = mod_root / "lua/ge/extensions/beamngEarth/bugreport.lua"

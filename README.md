@@ -4,6 +4,21 @@ Fixes broken bridges, ramps, piers, divided highways, railway crossings, and lan
 
 > **Work in Progress - Accelerated by Community Reports:** This add-on **does not fix every bridge and railway in the game**. Because **BeamNG.Earth** generates roads and bridges across the entire world, this project is an active work in progress that is **accelerated by community bug reporting**. When you run into a broken bridge, overpass, or railway crossing, press **`Ctrl+Shift+B`** while driving to report it so that structural pattern can be fixed in future updates.
 
+## Global Feature & Archetype Completion Metrics
+
+Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-15T04:02:10Z`):
+
+- **Global Shard Coverage:** `128 / 128` shards (`100.0%`) - **8,949,779** structures categorized worldwide
+- **Archetype Elimination Progress:** `0 / 234` structural archetypes cleared (`0` structures eliminated by archetype, `240,613` directly verified clean)
+- **Overall Feature Completion:** `240,613 / 8,949,779` (`2.69%`)
+
+| Category | Categorized | Verified Clean | Archetypes Cleared | Completion % |
+| --- | ---: | ---: | ---: | ---: |
+| Bridges | 5,838,327 | 126,578 | 0 / 91 | 2.17% |
+| Railways | 1,934,028 | 58,295 | 0 / 51 | 3.01% |
+| Tunnels | 1,177,424 | 55,740 | 0 / 92 | 4.73% |
+| **Combined Total** | **8,949,779** | **240,613** | **0 / 234** | **2.69%** |
+
 ## Before & After
 
 ### Multi-Level & Truss Bridges

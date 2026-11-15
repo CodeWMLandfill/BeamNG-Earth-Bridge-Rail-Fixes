@@ -820,7 +820,47 @@ COLLISION_BOXES = {
     # the game's wooden power pole (powerlines.G_POLE): its Colmesh, the trunk and the cross-arm's head
     "hvpole": (9.96, ((-0.162, -0.162, -0.083, 0.162, 0.162, 5.803),
                       (-0.731, -0.189, 5.803, 0.769, 0.162, 9.948))),
+    "pole_concrete_recessed": (8.5, ((-0.200, -0.191, 0.000, 0.200, 0.130, 7.695),
+                                      (-0.200, -0.191, 7.695, 0.295, 0.130, 8.500))),
+    "fr_wood_pole": (8.5, ((-0.135, -0.135, 0.000, 0.135, 0.135, 7.695),
+                           (-0.135, -0.135, 7.695, 0.295, 0.135, 8.500))),
+    "eu_wood_pole": (8.5, ((-0.135, -0.135, 0.000, 0.135, 0.135, 7.695),
+                           (-0.135, -0.135, 7.695, 0.295, 0.135, 8.500))),
+    "eu_pole_concrete_open": (8.5, ((-0.238, -0.133, -0.001, 0.238, 0.133, 7.300),
+                                     (-1.020, -0.133, 7.300, 1.020, 0.133, 8.500))),
+    "eu_pole_concrete_pair": (8.5, ((-0.290, -0.133, 0.000, 0.290, 0.133, 7.300),
+                                     (-1.020, -0.133, 7.300, 1.020, 0.133, 8.500))),
+    "eu_pole_concrete_round": (8.5, ((-0.185, -0.180, 0.000, 0.185, 0.180, 7.300),
+                                      (-0.185, -0.180, 7.300, 0.328, 0.180, 8.500))),
+    "eu_pole_concrete_three": (8.5, ((-0.185, -0.180, 0.000, 0.185, 0.180, 7.300),
+                                      (-0.608, -0.180, 7.300, 0.608, 0.180, 8.500))),
+    "eu_pole_steel_lattice": (8.5, ((-0.285, -0.133, 0.000, 0.285, 0.133, 7.300),
+                                     (-1.020, -0.133, 7.300, 1.020, 0.133, 8.501))),
+    "eu_pole_wood_a": (8.5, ((-0.750, -0.100, -0.006, 0.750, 0.100, 7.300),
+                              (-1.020, -0.100, 7.300, 1.020, 0.100, 8.507))),
+    "eu_pole_wood_h": (8.5, ((-1.045, -0.141, 0.000, 1.045, 0.141, 7.300),
+                              (-1.220, -0.141, 7.300, 1.220, 0.141, 8.500))),
+    "eu_pole_wood_side": (8.5, ((-0.145, -0.141, 0.000, 0.145, 0.141, 7.300),
+                                 (-0.145, -0.141, 7.300, 0.328, 0.141, 8.500))),
+    "eu_pole_wood_t": (8.5, ((-0.145, -0.141, 0.000, 0.145, 0.141, 7.300),
+                              (-1.020, -0.141, 7.300, 1.020, 0.141, 8.500))),
 }
+_POLE_GROUPS = frozenset((
+    G_POLE,
+    "hvpole",
+    "pole_concrete_recessed",
+    "fr_wood_pole",
+    "eu_wood_pole",
+    "eu_pole_concrete_open",
+    "eu_pole_concrete_pair",
+    "eu_pole_concrete_round",
+    "eu_pole_concrete_three",
+    "eu_pole_steel_lattice",
+    "eu_pole_wood_a",
+    "eu_pole_wood_h",
+    "eu_pole_wood_side",
+    "eu_pole_wood_t",
+))
 COLLISION_BOXES.update(citylamps.COLLISION_BOXES)
 COLLISION_BOXES.update(designsigns.BOXES)
 ROAD_PROP_GAP_M = 0.15
@@ -979,6 +1019,30 @@ class RoadClearance:
                 return False
         return True
 
+    def in_gore(self, x, y, z, max_gap=6.5, min_cos=-0.5, z_band=2.5):
+        """True if (x, y, z) lies inside a narrow island or diverging gore wedge between two coplanar carriageways."""
+        if not len(self.a):
+            return False
+        p = np.array([float(x), float(y)], np.float64)
+        pick = self.candidates(p - (self.max_half + float(max_gap)), p + (self.max_half + float(max_gap)))
+        if len(pick) < 2:
+            return False
+        a, b = self.a[pick], self.b[pick]
+        delta = b[:, :2] - a[:, :2]
+        L2 = np.maximum((delta * delta).sum(1), 1e-12)
+        t = np.clip(((p - a[:, :2]) * delta).sum(1) / L2, 0.0, 1.0)
+        q = a + t[:, None] * (b - a)
+        valid = ~np.isfinite(q[:, 2]) | (np.abs(q[:, 2] - float(z)) <= z_band)
+        vec = q[:, :2] - p
+        dist = np.hypot(vec[:, 0], vec[:, 1])
+        edge = dist - self.half[pick]
+        keep = valid & (edge < float(max_gap)) & (dist > 1e-6)
+        if int(keep.sum()) < 2:
+            return False
+        u = vec[keep] / dist[keep, None]
+        ed = edge[keep]
+        return bool((((u @ u.T) <= min_cos) & ((ed[:, None] + ed[None, :]) < float(max_gap))).any())
+
 
 def lamp_lenses(rows):
     """A lens row [G_LENS, x, y, z, yaw, 1, 1, 0] under each head of every lamp row (LAMP_HEADS, MAPPED_LAMP_HEADS: a
@@ -1112,7 +1176,7 @@ def under_decks(rows, decks, wires=None):
         # A utility pole whose top misses the 0.5 m headroom still loses its wires, so remove the bare pole
         # under the deck too. Only poles: a streetlight that clears a short deck's
         # real soffit is not this case.
-        pole = np.fromiter((str(q[0]) in ("pole", "hvpole") for q in rows), bool, len(rows))
+        pole = np.fromiter((str(q[0]) in _POLE_GROUPS for q in rows), bool, len(rows))
         if pole.any():
             groups = {}
             for pts, half, depth in norm:
@@ -1331,7 +1395,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                     pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
                     pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
                             round(yaw, 1), 1.0, pole_style.height, 0.0]
-                    if not clearance.clear(pole):
+                    if not clearance.clear(pole) or clearance.in_gore(pole[1], pole[2], pole[3]):
                         if wires is not None and len(run_poles) > 1:
                             wires.extend(_own_spans(run_poles, box))
                         run_poles = []
@@ -1440,7 +1504,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
             pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
                     round(yaw, 1), 1.0, pole_style.height, 0.0]
-            if not clearance.clear(pole):
+            if not clearance.clear(pole) or clearance.in_gore(pole[1], pole[2], pole[3]):
                 if len(run) > 1 and wires is not None:
                     wires.extend(_own_spans(run, box))
                 run = []

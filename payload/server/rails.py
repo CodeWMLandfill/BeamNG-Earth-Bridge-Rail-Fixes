@@ -207,7 +207,7 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
                 if len(xy) < 2 or not _near(xy, box, reach + 20.0):
                     continue
                 if kind is None:
-                    cname = str(cls[i])
+                    cname = str(getattr(specs[i], "cls", None) or cls[i])
                     if cname in ("motorway", "motorway_link"):
                         motorways[(fid, k)] = (xy, specs[i].width / 2)
                         continue            # an interstate has no at-grade railway crossing (no street track on it)

@@ -18,12 +18,13 @@ log = logging.getLogger("earthd.bridge_rail_report")
 
 DEFAULT_ENDPOINT = "https://beamng-earth-bridge-rail-fixes.yourlocalpcgamer.workers.dev/report"
 ADDON_ID = "beamng-earth-bridge-rail-fixes"
-ADDON_VERSION = "0.1.0"
+ADDON_VERSION = "0.2.0"
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
 ALLOWED_KINDS = ("bridge", "rail", "road", "other")
 ALLOWED_KEYS = frozenset({
     "lat", "lon", "kind", "summary", "note", "earthVersion", "addonVersion",
     "headingDeg", "altM", "speedMs", "anchorId", "camera", "nearest", "screenshot",
+    "loading_incomplete", "loading_reason",
 })
 
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
@@ -270,13 +271,15 @@ def build_payload(msg, shot_path=None, options=None):
         "summary": redact_paths(str(raw.get("summary") or f"In-game {kind} report @ {lat:.5f}, {lon:.5f}"))[:200],
         "addonVersion": ADDON_VERSION,
     }
-    for key in ("note", "earthVersion", "anchorId"):
+    for key in ("note", "earthVersion", "anchorId", "loading_reason"):
         val = raw.get(key)
         if isinstance(val, str) and val.strip():
             max_len = 2000 if key == "note" else (64 if key == "earthVersion" else 128)
             cleaned = redact_paths(val.strip())[:max_len]
             if cleaned:
                 payload[key] = cleaned
+    if isinstance(raw.get("loading_incomplete"), bool):
+        payload["loading_incomplete"] = raw["loading_incomplete"]
     for key, lo, hi in (("headingDeg", -360.0, 360.0), ("altM", -1000.0, 100000.0), ("speedMs", -1000.0, 1000.0)):
         val = raw.get(key)
         if isinstance(val, (int, float)) and not isinstance(val, bool) and math.isfinite(float(val)):
@@ -340,21 +343,51 @@ def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait
             shot_path = candidate
 
     payload = build_payload(msg, shot_path=shot_path, options=opts)
-    req = urllib.request.Request(
-        endpoint,
-        data=json.dumps(payload, allow_nan=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": f"BeamNG-Earth-Bridge-Rail-Fixes/{ADDON_VERSION}",
-        },
-        method="POST",
-    )
-    try:
+
+    def _post_json(body_dict):
+        req = urllib.request.Request(
+            endpoint,
+            data=json.dumps(body_dict, allow_nan=False).encode("utf-8"),
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": f"BeamNG-Earth-Bridge-Rail-Fixes/{ADDON_VERSION}",
+            },
+            method="POST",
+        )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+            return json.loads(resp.read().decode("utf-8"))
+
+    try:
+        result = _post_json(payload)
     except urllib.error.HTTPError as err:
         body = err.read().decode("utf-8", errors="replace")[:300]
-        result = {"ok": False, "status": err.code, "error": redact_paths(body or str(err))}
+        if (
+            err.code == 400
+            and "Unsupported top-level field" in body
+            and ("loading_incomplete" in payload or "loading_reason" in payload)
+        ):
+            legacy = {k: v for k, v in payload.items() if k not in ("loading_incomplete", "loading_reason")}
+            nearest = dict(legacy.get("nearest") or {})
+            loading_obj = dict(nearest.get("loading") or {}) if isinstance(nearest.get("loading"), dict) else {}
+            if "loading_incomplete" in payload:
+                loading_obj["loading_incomplete"] = payload["loading_incomplete"]
+            if "loading_reason" in payload:
+                loading_obj["loading_reason"] = payload["loading_reason"]
+            nearest["loading"] = loading_obj
+            legacy["nearest"] = _sanitize_value(nearest)
+            tag = f"[loading_incomplete: {payload.get('loading_reason') or 'true'}]"
+            note = str(legacy.get("note") or "")
+            if tag not in note:
+                legacy["note"] = (f"{note} {tag}".strip() if note else tag)[:2000]
+            try:
+                result = _post_json(legacy)
+            except urllib.error.HTTPError as err2:
+                body2 = err2.read().decode("utf-8", errors="replace")[:300]
+                result = {"ok": False, "status": err2.code, "error": redact_paths(body2 or str(err2))}
+            except Exception as err2:
+                result = {"ok": False, "error": redact_paths(str(err2))}
+        else:
+            result = {"ok": False, "status": err.code, "error": redact_paths(body or str(err))}
     except Exception as err:
         result = {"ok": False, "error": redact_paths(str(err))}
 

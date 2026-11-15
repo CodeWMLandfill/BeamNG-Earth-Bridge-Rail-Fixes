@@ -90,6 +90,23 @@ def parts(frame, cells, box, reach=REACH_M):
     return out
 
 
+ROAD_PARAPET_W = 0.45   # m past a road bridge's carriageway edge (roadmesh.PARAPET_W)
+BRIDGE_UNDER_M = 3.0    # m below a road bridge deck where slab/girders and headroom exclude a footbridge
+
+
+def _line_dist(xy, line):
+    """Per point of xy (k, 2): (min_dist, seg_idx, seg_t) to polyline line (m, 2)."""
+    a, b = line[:-1], line[1:]
+    d = b - a
+    L2 = np.maximum((d * d).sum(1), 1e-12)
+    t = np.clip(((xy[:, None, :] - a[None]) * d[None]).sum(2) / L2[None], 0.0, 1.0)
+    q = a[None] + t[..., None] * d[None]
+    dist = np.hypot(*(xy[:, None, :] - q).transpose(2, 0, 1))
+    j = np.argmin(dist, 1)
+    k = np.arange(len(xy))
+    return dist[k, j], j, t[k, j]
+
+
 def _over_roads(xy, crossers):
     """Per point of xy: on a carriageway (crossers: [(centreline, half width, z)])."""
     on = np.zeros(len(xy), bool)
@@ -97,19 +114,61 @@ def _over_roads(xy, crossers):
         line = np.asarray(line, np.float64)[:, :2]
         if len(line) < 2:
             continue
-        a, b = line[:-1], line[1:]
-        d = b - a
-        L2 = np.maximum((d * d).sum(1), 1e-12)
-        t = np.clip(((xy[:, None, :] - a[None]) * d[None]).sum(2) / L2[None], 0.0, 1.0)
-        dist = np.hypot(*(xy[:, None, :] - (a[None] + t[..., None] * d[None])).transpose(2, 0, 1)).min(1)
-        on |= dist <= hw
+        if (xy[:, 0].max() < line[:, 0].min() - hw or xy[:, 0].min() > line[:, 0].max() + hw or
+                xy[:, 1].max() < line[:, 1].min() - hw or xy[:, 1].min() > line[:, 1].max() + hw):
+            continue
+        on |= _line_dist(xy, line)[0] <= hw
     return on
 
 
-def deck(xy, zg, crossers):
+def _over_road_bridges(xy, z, half, road_bridges):
+    """Per point of xy: laterally overlapping a road bridge deck+parapet without vertical separation."""
+    hit = np.zeros(len(xy), bool)
+    for line, hw, zb in road_bridges:
+        line = np.asarray(line, np.float64)[:, :2]
+        if len(line) < 2:
+            continue
+        reach = hw + ROAD_PARAPET_W + half + PARAPET_T
+        if (xy[:, 0].max() < line[:, 0].min() - reach or xy[:, 0].min() > line[:, 0].max() + reach or
+                xy[:, 1].max() < line[:, 1].min() - reach or xy[:, 1].min() > line[:, 1].max() + reach):
+            continue
+        dist, j, tj = _line_dist(xy, line)
+        near = dist <= reach
+        if not near.any():
+            continue
+        if zb is None:
+            hit |= near
+            continue
+        zb = np.asarray(zb, np.float64)
+        if zb.ndim == 0 or len(zb) < len(line):
+            zr = np.full(len(xy), float(zb.reshape(-1)[0]))
+        else:
+            zr = zb[j] + tj * (zb[j + 1] - zb[j])
+        hit |= near & np.isfinite(zr) & (z - DECK_D - zr < CLEAR_ROAD_M) & (z >= zr - BRIDGE_UNDER_M)
+    return hit
+
+
+def _with_heights(road_bridges, ground):
+    """Attach deck height arrays to [(line, hw)] or [(line, hw, z)] road bridge entries."""
+    items = list(road_bridges)
+    if not items:
+        return []
+    need = [i for i, item in enumerate(items) if len(item) < 3 or item[2] is None]
+    if need:
+        import roads
+        zbs = roads.deck_heights([np.asarray(items[i][0], np.float64)[:, :2] for i in need], ground)
+        for i, zb in zip(need, zbs):
+            items[i] = (items[i][0], items[i][1], zb)
+    return [
+        (np.asarray(it[0], np.float64)[:, :2], float(it[1]), np.asarray(it[2], np.float64))
+        for it in items if len(it) >= 3 and it[2] is not None and len(it[0]) >= 2
+    ]
+
+
+def deck(xy, zg, crossers, road_bridges=(), half=0.0):
     """The walking surface's heights (k,) of a bridge piece xy (k, 2) over the ground zg (k,) there (the drawn ground:
     a road under it is its surface), or None where the straight line between its ends does not clear what it crosses
-    (CLEAR_*). Pure."""
+    (CLEAR_*) or collides with road_bridges ([(centreline, half width, z)]). Pure."""
     import railways
     s = railways._arc(xy)
     L = float(s[-1])
@@ -123,18 +182,22 @@ def deck(xy, zg, crossers):
     road = _over_roads(xy, crossers)
     if (room[mid & road] < CLEAR_ROAD_M).any():
         return None                 # (a slab across a carriageway at its level)
+    if road_bridges and (_over_road_bridges(xy, z, half, road_bridges) & mid).any():
+        return None                 # (parallel walkway on or colliding with a road bridge deck)
     if (z[mid] < zg[mid] - BURIED_M).any() or room[mid].max() < CLEAR_GROUND_M:
         return None                 # (in the ground: the elevation's own bridge, a hill; or nothing under it)
     return z
 
 
-def add(mesh, bridges, ground, crossers, ex, concrete, small):
+def add(mesh, bridges, ground, crossers, ex, concrete, small, road_bridges=()):
     """The decks of bridges (parts') into railways' _Mesh mesh: the slab and its parapets over the points within ex (the
     tile's box with its overlap), the piers into small (railways.tile_mesh draws them with the sleepers, as room
-    allows). ground(xy (n, 2)) -> z (one call for all of them)."""
+    allows). ground(xy (n, 2)) -> z (one call for all of them); road_bridges: [(line, half)] or [(line, half, z)]."""
     import railways
     if not bridges:
         return
+    rbridges = _with_heights(road_bridges, ground)
+    pier_cross = list(crossers) + rbridges if rbridges else crossers
     allxy = np.concatenate([xy for _, xy, _ in bridges])
     zg_all = np.asarray(ground(allxy), np.float64)
     up = np.array([0.0, 0.0, 1.0])
@@ -142,7 +205,8 @@ def add(mesh, bridges, ground, crossers, ex, concrete, small):
     for _fid, xy, w in bridges:
         zg = zg_all[k:k + len(xy)]
         k += len(xy)
-        z = deck(xy, zg, crossers)
+        half = float(w) / 2.0
+        z = deck(xy, zg, crossers, rbridges, half=half)
         if z is None:
             continue
         inside = (xy[:, 0] >= ex[0] - STEP_M) & (xy[:, 0] <= ex[2] + STEP_M) & \
@@ -151,7 +215,6 @@ def add(mesh, bridges, ground, crossers, ex, concrete, small):
             continue
         u = railways._left(xy)
         s = railways._arc(xy)
-        half = w / 2.0
         for i, j in railways._runs(~inside):
             sl = slice(i, j + 1)
             p, uu, t, v = xy[sl], u[sl], z[sl], s[sl] / 3.0
@@ -167,7 +230,7 @@ def add(mesh, bridges, ground, crossers, ex, concrete, small):
                 mesh.strip(np.c_[e_in, hi], np.c_[e_out, hi], 0.0, 0.05, v, concrete, up)
                 mesh.strip(np.c_[e_out, hi], np.c_[e_out, t - DECK_D], 0.0, 0.5, v, concrete, o)
             pr = _piers(s, xy, u, z, zg, i, j)
-            pr = railways._sited(pr, crossers, ground) if pr is not None else None
+            pr = railways._sited(pr, pier_cross, ground) if pr is not None else None
             if pr is not None:
                 small.append((pr, PIER_ALONG / 2, max(half - 0.2, 0.4), concrete))
 

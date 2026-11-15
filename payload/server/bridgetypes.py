@@ -1013,7 +1013,7 @@ def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_li
                     Lt2, Rt2 = np.r_[run[a + 1][0], run[a + 1][3]], np.r_[run[a + 1][1], run[a + 1][3]]
                     beams.append((Lt, Rt2, *BRACE))
                     beams.append((Rt, Lt2, *BRACE))
-    beams = _clear_of_decks(beams, P)
+    beams = _clear_of_decks(beams, P, road_lines=road_lines, ground_fn=ground_fn)
     return (beams, piers) if with_piers else beams
 
 
@@ -1184,7 +1184,7 @@ def arch_members(P, arcs, tans, ms, info, ground_fn):
     beams = []
     if through:
         tied = L < TIED_SPAN_M
-        z0 = [st[0][6] - 1.0, st[-1][6] - 1.0] if tied else [max(float(g), st[0][6] - L / 8) for g in g_ends]
+        z0 = [st[0][6], st[-1][6]] if tied else [max(float(g), st[0][6] - L / 8) for g in g_ends]
         top = deck_c + THROUGH_TOP * L
     else:
         z0 = [float(g) for g in g_ends]
@@ -1213,7 +1213,7 @@ def arch_members(P, arcs, tans, ms, info, ground_fn):
             e = s[1] + s[3] * (s[5] if side else s[4])
             dz = zr[a] - s[7]
             if through and dz > 1.0:                    # a hanger down to the deck
-                beams.append((np.r_[e, zr[a] - rh / 2], np.r_[e, s[6] - 0.8], 0.25, 0.25))
+                beams.append((np.r_[e, zr[a] - rh / 2], np.r_[e, s[6]], 0.25, 0.25))
             elif not through and s[6] - zr[a] > 1.5:    # a spandrel post up to the deck
                 beams.append((np.r_[e, zr[a] + rh / 2], np.r_[e, s[6] - 1.2], 0.8, 0.8))
     for a in range(1, n):                                # bracing between the ribs, clear of the traffic
@@ -1375,23 +1375,30 @@ def structure_spans(parts, info, ground_fn, wet_fn=None, pylons=()):
     return [(sl, half_w)] if sl is not None else []
 
 
-def structure_members(parts, info, ground_fn, wet_fn=None, road_lines=(), pylons=()):
+def structure_members(parts, info, ground_fn, wet_fn=None, road_lines=(), pylons=(), depths=None, other_decks=()):
     """(beams, piers) of a chain's structure (chain_structure): a truss (truss_members, a lens or a curved top chord
     where info["shape"] says), an arch, a suspension or a cable-stayed span (one main span: main_span, centred on the
     river: _river), a movable span (movable_members); ([], []) for a plain deck. Each beam carries its paint (p, q, w,
     h, paint)."""
     if info is None:
         return [], []
-    beams, piers = _structure_members(parts, info, ground_fn, wet_fn, road_lines, pylons)
+    beams, piers = _structure_members(parts, info, ground_fn, wet_fn, road_lines, pylons,
+                                      depths=depths, other_decks=other_decks)
     pt = info.get("paint") or "grey"
     return [tuple(b[:4]) + (pt,) for b in beams], piers
 
 
-def _structure_members(parts, info, ground_fn, wet_fn, road_lines, pylons=()):
+def _structure_members(parts, info, ground_fn, wet_fn, road_lines, pylons=(), depths=None, other_decks=()):
     if info["type"] in TRUSS_TYPES:
-        return truss_members(parts, info, ground_fn, wet_fn, with_piers=True, road_lines=road_lines)
+        beams, piers = truss_members(parts, info, ground_fn, wet_fn, with_piers=True, road_lines=road_lines)
+        if other_decks:
+            P, _, _ = _prep(parts)
+            beams = _clear_of_decks(beams, (), other_decks=other_decks)
+        return beams, piers
     if info["type"] in MOVABLE_TYPES:
-        return movable_members(parts, info, ground_fn, wet_fn, road_lines)
+        beams, piers = movable_members(parts, info, ground_fn, wet_fn, road_lines, depths=depths)
+        P, _, _ = _prep(parts)
+        return _clear_of_decks(beams, P, other_decks=other_decks, road_lines=road_lines, ground_fn=ground_fn), piers
     if info["type"] not in ARCH_TYPES + (NBI_SUSPENSION, NBI_STAYED):
         return [], []
     P, arcs, tans = _prep(parts)
@@ -1399,10 +1406,12 @@ def _structure_members(parts, info, ground_fn, wet_fn, road_lines, pylons=()):
     if ms is None:
         return [], []
     if info["type"] in ARCH_TYPES:
-        return _clear_of_decks(arch_members(P, arcs, tans, ms, info, ground_fn), P), []
+        return _clear_of_decks(arch_members(P, arcs, tans, ms, info, ground_fn), P,
+                               other_decks=other_decks, road_lines=road_lines, ground_fn=ground_fn), []
     ms, mtops = mapped_towers(P, arcs, ms, pylons)
     return _clear_of_decks(suspension_members(P, arcs, tans, ms, info, ground_fn, stayed=info["type"] == NBI_STAYED,
-                                              mapped_tops=mtops), P), []
+                                              mapped_tops=mtops), P,
+                           other_decks=other_decks, road_lines=road_lines, ground_fn=ground_fn), []
 
 
 LIFT_TOWER = 0.42       # a lift span's towers: their tops over the deck, a share of the span (the Hawthorne Bridge:
@@ -1452,7 +1461,7 @@ def _river_span(P, arcs, info, river):
     return k, c, L
 
 
-def movable_members(parts, info, ground_fn, wet_fn=None, road_lines=()):
+def movable_members(parts, info, ground_fn, wet_fn=None, road_lines=(), depths=None):
     """(beams, piers) of a movable bridge's main span (NBI 15-17; its span from the inventory, centred on the water by
     main_span). A lift or swing span, or a bascule the map or Wikidata calls a truss (info["truss"]), is a through truss
     over the river spans (its top chord curved where the map says arch: info["shape"]); a lift span gets its two
@@ -1513,17 +1522,19 @@ def movable_members(parts, info, ground_fn, wet_fn=None, road_lines=()):
                     chosen = cand
                     break
             p, t, nrm, lo, hi, zlo, zhi = chosen if chosen is not None else end0
+            deck_d = float(depths[k]) if (depths is not None and 0 <= k < len(depths) and depths[k] is not None) \
+                else (DECK_DEPTH + GIRDER_D)
+            z_top = zlo - deck_d
             for off in (lo - HOUSE[0] / 2, hi + HOUSE[0] / 2):
                 e = p + nrm * off
                 hfoot = np.array([e + nrm * (a * HOUSE[0] / 2.0) + t * (b * HOUSE[1] / 2.0)
                                   for a in (-1, 0, 1) for b in (-1, 0, 1)])
                 hrl = road_lines(hfoot) if callable(road_lines) else road_lines
                 if _clear_of_roads(hfoot, hrl, ROAD_GAP_M):
-                    beams.append((np.r_[e, zlo - DECK_DEPTH - GIRDER_D], np.r_[e, zhi + HOUSE_UP_M], *HOUSE))
+                    beams.append((np.r_[e, z_top], np.r_[e, zhi + HOUSE_UP_M], *HOUSE))
             if chosen is not None:
                 c_mid = p + nrm * ((lo + hi) / 2.0)
                 gz = float(np.asarray(ground_fn(c_mid[None]), np.float64)[0])
-                z_top = zlo - DECK_DEPTH - GIRDER_D
                 if z_top - gz > 2.0:
                     piers.append((float(c_mid[0]), float(c_mid[1]), float(t[0]), float(t[1]), float(z_top),
                                   gz - 2.0, float(hi - lo + HOUSE[0] * 2), BASCULE_PIER_T))
@@ -1534,36 +1545,99 @@ CLEAR_HEADROOM_M = 6.0  # _clear_of_decks: a member this little over a carriagew
 HEADROOM_STEP_M = 2.0
 
 
-def _clear_of_decks(beams, P):
-    """The members [(p, q, w, h, ...)] that keep CLEAR_HEADROOM_M over every deck of P (xy, z, width) they pass over: a stay
-    whose fan reached over the other carriageway where the two part on a curve came down to car height across its
-    lanes (an autodrive hit one at 49 mph on the Port Mann Bridge's south approach, GitHub #65). Members beside the
-    decks or under them stay. Pure."""
-    if not beams or not P:
-        return beams
-    segs = [(xy[:-1], xy[1:], z[:-1], z[1:], w / 2.0) for xy, z, w in P if len(xy) >= 2]
+def _pack_deck_segs(decks):
+    segs = [(xy[:-1], xy[1:], z[:-1], z[1:], w / 2.0)
+            for xy, z, w in decks if len(xy) >= 2]
+    if not segs:
+        return None
     A = np.concatenate([a for a, _, _, _, _ in segs])
     B = np.concatenate([b for _, b, _, _, _ in segs])
-    ZA = np.concatenate([za for _, _, za, _, _ in segs])
-    ZB = np.concatenate([zb for _, _, _, zb, _ in segs])
-    HW = np.concatenate([np.full(len(a), h) for a, _, _, _, h in segs])
     AB = B - A
-    L2 = np.maximum((AB * AB).sum(1), 1e-12)
+    return (A, B, np.concatenate([za for _, _, za, _, _ in segs]),
+            np.concatenate([zb for _, _, _, zb, _ in segs]),
+            np.concatenate([np.full(len(a), h) for a, _, _, _, h in segs]),
+            AB, np.maximum((AB * AB).sum(1), 1e-12))
+
+
+def _clear_of_decks(beams, P, other_decks=(), road_lines=(), ground_fn=None):
+    """The members [(p, q, w, h, ...)] that keep CLEAR_HEADROOM_M over every deck of P, sibling/crossing other_decks,
+    and ground road_lines they pass over. Members beside the roadways or under them stay. Pure."""
+    if not beams:
+        return beams
+    own = _pack_deck_segs(P)
+    oth = _pack_deck_segs([(np.asarray(xy, np.float64)[:, :2], np.asarray(z, np.float64), float(w))
+                           for xy, z, w in other_decks]) if other_decks else None
+    has_roads = bool(road_lines) and ground_fn is not None
+    r_cache = None
+    if not callable(road_lines) and has_roads:
+        rsegs = []
+        for item in road_lines:
+            ln, hw = _as_road(item)
+            ln = np.asarray(ln, np.float64)
+            if ln.ndim == 2 and len(ln) >= 2:
+                rsegs.append((ln[:-1, :2], ln[1:, :2], float(hw) if hw is not None else ROAD_GAP_M))
+        if rsegs:
+            RA = np.concatenate([a for a, _, _ in rsegs])
+            RB = np.concatenate([b for _, b, _ in rsegs])
+            RAB = RB - RA
+            r_cache = (RA, RB, RAB, np.maximum((RAB * RAB).sum(1), 1e-12),
+                       np.concatenate([np.full(len(a), hw) for a, _, hw in rsegs]))
+    if own is None and oth is None and not has_roads:
+        return beams
+    step = min(HEADROOM_STEP_M, 1.0)
     out = []
     for b in beams:
         p, q = np.asarray(b[0], np.float64), np.asarray(b[1], np.float64)
-        n = max(int(np.hypot(*(q[:2] - p[:2])) / HEADROOM_STEP_M), 1) + 1
+        bw = float(b[2]) if len(b) > 2 else 0.0
+        bh = float(b[3]) if len(b) > 3 else 0.0
+        n = max(int(np.linalg.norm(q - p) / step), 1) + 1
         pts = p[None] + (q - p)[None] * np.linspace(0.0, 1.0, n)[:, None]
         lo_b, hi_b = pts[:, :2].min(0) - 30.0, pts[:, :2].max(0) + 30.0
-        near = ~((np.maximum(A, B) < lo_b).any(1) | (np.minimum(A, B) > hi_b).any(1))
-        if not near.any():
-            out.append(b)
-            continue
-        a, ab, l2 = A[near], AB[near], L2[near]
-        t = np.clip(((pts[:, None, :2] - a[None]) * ab[None]).sum(2) / l2[None], 0.0, 1.0)
-        d = np.hypot(*(pts[:, None, :2] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1))
-        dz = pts[:, 2:3] - (ZA[near][None] + (ZB[near] - ZA[near])[None] * t)
-        over = (d < HW[near][None] - 0.3) & (dz > -0.5) & (dz < CLEAR_HEADROOM_M)
-        if not over.any():
+        blocked = False
+        for pack, pad_w, min_dz in ((own, -0.3, -0.5), (oth, bw / 2.0, -0.5 - bh / 2.0)):
+            if pack is None:
+                continue
+            A, B, ZA, ZB, HW, AB, L2 = pack
+            near = ~((np.maximum(A, B) < lo_b).any(1) | (np.minimum(A, B) > hi_b).any(1))
+            if not near.any():
+                continue
+            a, ab, l2 = A[near], AB[near], L2[near]
+            t = np.clip(((pts[:, None, :2] - a[None]) * ab[None]).sum(2) / l2[None], 0.0, 1.0)
+            d = np.hypot(*(pts[:, None, :2] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1))
+            dz = pts[:, 2:3] - (ZA[near][None] + (ZB[near] - ZA[near])[None] * t)
+            if ((d < HW[near][None] + pad_w) & (dz > min_dz) & (dz < CLEAR_HEADROOM_M)).any():
+                blocked = True
+                break
+        if not blocked and has_roads:
+            rp = r_cache
+            if callable(road_lines):
+                rsegs = []
+                for item in road_lines(pts[:, :2]) or ():
+                    ln, hw = _as_road(item)
+                    ln = np.asarray(ln, np.float64)
+                    if ln.ndim == 2 and len(ln) >= 2:
+                        rsegs.append((ln[:-1, :2], ln[1:, :2], float(hw) if hw is not None else ROAD_GAP_M))
+                if rsegs:
+                    RA = np.concatenate([a for a, _, _ in rsegs])
+                    RB = np.concatenate([b_ for _, b_, _ in rsegs])
+                    RAB = RB - RA
+                    rp = (RA, RB, RAB, np.maximum((RAB * RAB).sum(1), 1e-12),
+                          np.concatenate([np.full(len(a), hw) for a, _, hw in rsegs]))
+                else:
+                    rp = None
+            if rp is not None:
+                RA, RB, RAB, RL2, RHW = rp
+                near = ~((np.maximum(RA, RB) < lo_b).any(1) | (np.minimum(RA, RB) > hi_b).any(1))
+                if near.any():
+                    a, ab, l2 = RA[near], RAB[near], RL2[near]
+                    t = np.clip(((pts[:, None, :2] - a[None]) * ab[None]).sum(2) / l2[None], 0.0, 1.0)
+                    d = np.hypot(*(pts[:, None, :2] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1))
+                    in_r = d < RHW[near][None] + max(0.0, bw / 2.0 - 0.1)
+                    if in_r.any():
+                        gz = np.asarray(ground_fn(pts[:, :2]), np.float64)[:, None]
+                        dz = pts[:, 2:3] - gz
+                        if (in_r & (dz > 0.15 - bh / 2.0) & (dz < CLEAR_HEADROOM_M)).any():
+                            blocked = True
+        if not blocked:
             out.append(b)
     return out

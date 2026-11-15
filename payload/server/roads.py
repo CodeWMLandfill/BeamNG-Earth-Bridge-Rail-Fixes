@@ -883,7 +883,7 @@ def _facts_load(feats, kind, extra):
 # (bakepack.py), in place of the code hash; the plans' key holds it too (plancache.plans_format). Bump it whenever a
 # change makes other facts (level ranges, specs, lane flow, grade separations or their inputs' rules), or players keep
 # the old ones; tests/test_bake_formats.py fails until it is bumped.
-FACTS_FORMAT = 16     # 16: _fork_bridge_tails closes short ground tails at 3+-way elevated bridge forks and _rule_elsewhere preserves border-crossing rule bridge ranges across home_copy; 14..15: _sync_border_specs aligns border-crossing counted carriageway specs (median gap, local lanes/speed/urban) with the home or lex-smallest neighbour cell including split-home MVT border jitter; 13: a grade separation's bridge spans a skew crossing (the bridged road's half width over the tangent added: a track at 45 deg under the A4 at Glaireuse cut a trench through its carriageway past a square deck, GitHub #1020), its fractions and every bridge/tunnel reach's in sub_polyline's metric (gradesep._metric, _ring_kx: on a 15 km road the deck stood 8.7 m off its crossing); 12: a long road's copy far from its home takes the grade separations its neighbour cells found too (_home_far: the A4 at Glaireuse, GitHub #1020); 11: an underpass in a cutting the DEM shows (gradesep._underpasses: a longer road tunnel with the ground over it under TUNNEL_OPEN_COVER, SEP_M under the line over it either side: Highway 3 at Hameenlinna, GitHub #1009) bridged by the roads over it; 10: a short ground gap between a tunnel's portal and a bridge of the same road made bridge (_portal_decks: CA-1's northbound Tom Lantos bore, a 22 % drop onto its bridge); 9: underpasses: a tunnel's portal kept where its own approach road joins it (_tunnel_reach, the I-280 underpass at Millbrae), a road's home cell takes the grade separations every cell it crosses found for it (_gradesep_elsewhere: CA-1's bridge over Wilder Tunnel); 8: bridge parts retain mapped local level transitions (PR #873), a segment's tunnel ranges joined only over a gap inside one source way (PR #927, was: any gap under 30 m); 7: PR #843 (restored highway shoulders, regional merge marking profiles: Spec.state); 6: busways (PR #836) and walkway spans (PR #842) in the cells; 5: PR #505's Spec.france (French road scenery flag); 4: pass roads with a mapped or default two-lane count stay mountain roads (the Stelvio); 3: PR #471 lane counts (validated highway counts, two-lane highway default) and #686 (Swedish dual carriageways, 2.75 m lanes); 2: OSM's own surface first, "unpaved" on car roads gravel, regional gravel for untagged minor roads
+FACTS_FORMAT = 21     # 21: 16..17: _canon_border_spec + _reach_cell_layer(max_hops=8) propagate finite osm_lanes across multi-hop crossing cells into home and fallback specs so long one-way motorways never jump lane counts across cell edges; 20: 19: collinear degree-2 bridge continuation width/lanes and strict parallel carriageway width trim; 17-18: parallel carriageway width trimming and same-level stack exclusion; 14-16: bridge ends inside a short crossing road-tunnel carriageway lengthen across its cut shoulder including neighbouring cells (_skew_over_tunnels), open-cut tunnels feed bridge underpass clearance, and service bridges climb up to DECK_SERVICE_GRADE; 16: _fork_bridge_tails closes short ground tails at 3+-way elevated bridge forks and _rule_elsewhere preserves border-crossing rule bridge ranges across home_copy; 14..15: _sync_border_specs aligns border-crossing counted carriageway specs (median gap, local lanes/speed/urban) with the home or lex-smallest neighbour cell including split-home MVT border jitter; 13: a grade separation's bridge spans a skew crossing (the bridged road's half width over the tangent added: a track at 45 deg under the A4 at Glaireuse cut a trench through its carriageway past a square deck, GitHub #1020), its fractions and every bridge/tunnel reach's in sub_polyline's metric (gradesep._metric, _ring_kx: on a 15 km road the deck stood 8.7 m off its crossing); 12: a long road's copy far from its home takes the grade separations its neighbour cells found too (_home_far: the A4 at Glaireuse, GitHub #1020); 11: an underpass in a cutting the DEM shows (gradesep._underpasses: a longer road tunnel with the ground over it under TUNNEL_OPEN_COVER, SEP_M under the line over it either side: Highway 3 at Hameenlinna, GitHub #1009) bridged by the roads over it; 10: a short ground gap between a tunnel's portal and a bridge of the same road made bridge (_portal_decks: CA-1's northbound Tom Lantos bore, a 22 % drop onto its bridge); 9: underpasses: a tunnel's portal kept where its own approach road joins it (_tunnel_reach, the I-280 underpass at Millbrae), a road's home cell takes the grade separations every cell it crosses found for it (_gradesep_elsewhere: CA-1's bridge over Wilder Tunnel); 8: bridge parts retain mapped local level transitions (PR #873), a segment's tunnel ranges joined only over a gap inside one source way (PR #927, was: any gap under 30 m); 7: PR #843 (restored highway shoulders, regional merge marking profiles: Spec.state); 6: busways (PR #836) and walkway spans (PR #842) in the cells; 5: PR #505's Spec.france (French road scenery flag); 4: pass roads with a mapped or default two-lane count stay mountain roads (the Stelvio); 3: PR #471 lane counts (validated highway counts, two-lane highway default) and #686 (Swedish dual carriageways, 2.75 m lanes); 2: OSM's own surface first, "unpaved" on car roads gravel, regional gravel for untagged minor roads
 
 
 def _facts_baked(feats, kind, extra):
@@ -1218,9 +1218,253 @@ def _level_steps(feats, idx, inputs, steps, lidar=None):
     else:
         lid_off = np.r_[0, np.cumsum([len(g) for g in lidar])].astype(np.int64)
         lid_pts = np.asarray([(a[0], a[1], b[0], b[1]) for g in lidar for a, b in g], np.float64).reshape(-1, 4)
-    return _ranges_lists(*layer.rules(_spec_mask(feats, specs), _spec_widths(feats, specs), sk, sw,
+    out = _ranges_lists(*layer.rules(_spec_mask(feats, specs), _spec_widths(feats, specs), sk, sw,
                                       np.asarray(idx, np.int64), *_ranges_flat(inputs), lid_off, lid_pts, steps,
                                       _level_prm()))
+    if (steps & _STEP_SKEW) and SKEW_ON:
+        out = _skew_over_tunnels(feats, idx, out, specs)
+    return out
+
+
+TUNNEL_SKEW_MAX_M = 120.0   # m: short crossing road-tunnel range whose open cut a bridge end must clear
+TUNNEL_CUT_SHOULDER_M = 3.0 # m: extra grading cut width outside the tunnel carriageway (grading.shoulder)
+
+
+def _slice_xy_s(xy, s, a_m, b_m):
+    """Sub-polyline of local ENU xy (n, 2) with cumulative arc s over [a_m, b_m], and its arc offsets."""
+    if b_m <= a_m or len(xy) < 2:
+        return None, None
+    keep = (s > a_m) & (s < b_m)
+    p0 = np.array([[float(np.interp(a_m, s, xy[:, 0])), float(np.interp(a_m, s, xy[:, 1]))]], np.float64)
+    p1 = np.array([[float(np.interp(b_m, s, xy[:, 0])), float(np.interp(b_m, s, xy[:, 1]))]], np.float64)
+    mid = xy[keep]
+    pts = np.vstack([p0, mid, p1]) if len(mid) else np.vstack([p0, p1])
+    arcs = np.r_[a_m, s[keep], b_m] if len(mid) else np.array([a_m, b_m], np.float64)
+    return pts, arcs
+
+
+def _seg_cross_xy(xy_a, s_a, xy_b):
+    """Segment crossings between (xy_a, s_a) and xy_b: [(s_a_cross, sin_angle, cos_angle)]."""
+    dp = xy_a[1:] - xy_a[:-1]
+    dq = xy_b[1:] - xy_b[:-1]
+    la = np.hypot(dp[:, 0], dp[:, 1])
+    lb = np.hypot(dq[:, 0], dq[:, 1])
+    va, vb = la > 1e-6, lb > 1e-6
+    if not va.any() or not vb.any():
+        return ()
+    p, dp, la, sa0 = xy_a[:-1][va], dp[va], la[va], s_a[:-1][va]
+    q, dq, lb = xy_b[:-1][vb], dq[vb], lb[vb]
+    denom = dp[:, None, 0] * dq[None, :, 1] - dp[:, None, 1] * dq[None, :, 0]
+    delta = q[None, :, :] - p[:, None, :]
+    nz = np.abs(denom) > 1e-9
+    t = np.where(nz, (delta[:, :, 0] * dq[None, :, 1] - delta[:, :, 1] * dq[None, :, 0]) / np.where(nz, denom, 1.0), -1.0)
+    u = np.where(nz, (delta[:, :, 0] * dp[:, None, 1] - delta[:, :, 1] * dp[:, None, 0]) / np.where(nz, denom, 1.0), -1.0)
+    hits = nz & (t >= -1e-6) & (t <= 1.0 + 1e-6) & (u >= -1e-6) & (u <= 1.0 + 1e-6)
+    if not hits.any():
+        return ()
+    out = []
+    for ia, ib in np.argwhere(hits):
+        len_ab = float(la[ia] * lb[ib])
+        sin_a = min(1.0, abs(float(denom[ia, ib])) / len_ab)
+        cos_a = min(1.0, abs(float(dp[ia, 0] * dq[ib, 0] + dp[ia, 1] * dq[ib, 1])) / len_ab)
+        out.append((float(sa0[ia] + np.clip(float(t[ia, ib]), 0.0, 1.0) * la[ia]), sin_a, cos_a))
+    return out
+
+
+def _skew_over_tunnels(feats, idx, out, specs):
+    """Extend bridge range ends inside a crossing short road-tunnel's cut across its shoulder and skew width."""
+    if not out or not any(rk == "bridge" for rng in out for _, _, rk in rng):
+        return out
+    ll = np.asarray(feats.lonlat, np.float64)
+    if not len(ll):
+        return out
+    lat0 = float(np.nanmean(ll[:, 1]))
+    lon0 = float(np.nanmean(ll[:, 0]))
+    if not (math.isfinite(lat0) and math.isfinite(lon0)):
+        return out
+    kx, ky = 111319.5 * math.cos(math.radians(lat0)), 111319.5
+    xy_cache = {}
+
+    def ring_xy(layer, i):
+        key = (id(layer), i)
+        got = xy_cache.get(key)
+        if got is None:
+            ring = next((np.asarray(r, np.float64) for p in layer.parts(i) for r in p if len(r) >= 2), None)
+            if ring is None:
+                got = (None, None)
+            else:
+                xy = np.column_stack([(ring[:, 0] - lon0) * kx, (ring[:, 1] - lat0) * ky])
+                s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+                got = (xy, s) if s[-1] > 0.0 else (None, None)
+            xy_cache[key] = got
+        return got
+
+    tcands = []
+    seen_t = set()
+
+    def collect_tunnels(layer):
+        raw_l = _raw_memo(layer)
+        ts_l = tunnel_specs(layer)
+        for j in range(len(layer)):
+            if ts_l[j] is None or not any(rk == "tunnel" for _, _, rk in raw_l[j]):
+                continue
+            xy_j, s_j = ring_xy(layer, j)
+            if xy_j is None:
+                continue
+            hw_t = float(ts_l[j].width) / 2.0 + TUNNEL_CUT_SHOULDER_M
+            L_j = float(s_j[-1])
+            fid_j = str(layer.ids[j])
+            for ta, tb, rk in raw_l[j]:
+                if rk != "tunnel" or (tb - ta) * L_j > TUNNEL_SKEW_MAX_M:
+                    continue
+                tkey = (fid_j, round(float(ta), 6), round(float(tb), 6))
+                if tkey in seen_t:
+                    continue
+                seen_t.add(tkey)
+                txy, _ = _slice_xy_s(xy_j, s_j, float(ta) * L_j, float(tb) * L_j)
+                if txy is not None:
+                    tcands.append((fid_j, txy, hw_t, (float(txy[:, 0].min()), float(txy[:, 1].min()),
+                                                    float(txy[:, 0].max()), float(txy[:, 1].max()))))
+
+    collect_tunnels(feats)
+    near_hook = feats.__dict__.get("_bnge_neighbours")
+    if near_hook is not None:
+        br_rows = [i for k, i in enumerate(idx) if any(rk == "bridge" for _, _, rk in out[k])]
+        if br_rows:
+            boxes = _feature_boxes(feats)
+            ix = np.asarray(br_rows, np.int64)
+            b = boxes[ix]
+            keep = np.isfinite(b).all(axis=1)
+            cb = _cell_bounds(feats)
+            if cb is not None:
+                keep &= ~((cb[0] <= b[:, 0]) & (b[:, 2] <= cb[2]) & (cb[1] <= b[:, 1]) & (b[:, 3] <= cb[3]))
+            if keep.any():
+                want = _cells_reached(near_hook, b[keep])
+                if want:
+                    import revisit
+                    try:
+                        for other in _near_layers(near_hook, want):
+                            if other is not None and other is not feats:
+                                collect_tunnels(other)
+                    except Exception as e:
+                        log.debug("skew over tunnels: neighbours: %s: %s", type(e).__name__, e)
+                        revisit.fault()
+    if not tcands:
+        return out
+
+    end_pts = None
+    def junc_cap(i, tunnel_fid, s_end, target_s, xy_i, s_i):
+        nonlocal end_pts
+        if end_pts is None:
+            pts, gs, fids = [], [], []
+            for g in range(len(feats)):
+                if specs[g] is None:
+                    continue
+                gxy, _ = ring_xy(feats, g)
+                if gxy is not None:
+                    gfid = str(feats.ids[g])
+                    pts.extend((gxy[0], gxy[-1]))
+                    gs.extend((g, g))
+                    fids.extend((gfid, gfid))
+            end_pts = (np.asarray(pts, np.float64).reshape(-1, 2), np.asarray(gs, np.int64), fids)
+        p_arr, g_arr, fid_list = end_pts
+        if not len(p_arr):
+            return target_s
+        lo_s, hi_s = min(s_end, target_s), max(s_end, target_s)
+        seg_xy, seg_s = _slice_xy_s(xy_i, s_i, lo_s, hi_s)
+        if seg_xy is None:
+            return target_s
+        pad = GAP_JUNCTION_M
+        not_t = np.asarray([gf != tunnel_fid for gf in fid_list], bool)
+        near = ((g_arr != i) & not_t
+                & (p_arr[:, 0] >= seg_xy[:, 0].min() - pad) & (p_arr[:, 0] <= seg_xy[:, 0].max() + pad)
+                & (p_arr[:, 1] >= seg_xy[:, 1].min() - pad) & (p_arr[:, 1] <= seg_xy[:, 1].max() + pad))
+        if not near.any():
+            return target_s
+        dir_sign = 1.0 if target_s > s_end else -1.0
+        best_ext = abs(target_s - s_end)
+        for pt in p_arr[near]:
+            for si in range(len(seg_xy) - 1):
+                a, b = seg_xy[si], seg_xy[si + 1]
+                ab = b - a
+                l2 = float(ab[0] * ab[0] + ab[1] * ab[1])
+                if l2 <= 1e-12:
+                    continue
+                u = max(0.0, min(1.0, float(np.dot(pt - a, ab) / l2)))
+                proj = a + u * ab
+                if float(np.hypot(*(pt - proj))) <= GAP_JUNCTION_M:
+                    s_hit = float(seg_s[si] + u * math.sqrt(l2))
+                    best_ext = min(best_ext, max(0.0, (s_hit - s_end) * dir_sign - GAP_JUNCTION_M))
+        return s_end + dir_sign * best_ext
+
+    base_specs = None
+    for k, i in enumerate(idx):
+        if not any(rk == "bridge" for _, _, rk in out[k]):
+            continue
+        xy_i, s_i = ring_xy(feats, i)
+        if xy_i is None:
+            continue
+        L_i = float(s_i[-1])
+        fid_i = str(feats.ids[i])
+        sp_i = specs[i]
+        if sp_i is None:
+            if base_specs is None:
+                base_specs = _road_specs_base(feats)
+            sp_i = base_specs[i]
+        up_half = float(sp_i.width) / 2.0 if sp_i is not None else 4.0
+        rngs = [list(r) for r in out[k]]
+        changed = False
+        for m, r in enumerate(rngs):
+            if r[2] != "bridge":
+                continue
+            for end_idx in (0, 1):
+                frac = r[end_idx]
+                if (end_idx == 0 and frac <= MIN_PART) or (end_idx == 1 and frac >= 1.0 - MIN_PART):
+                    continue
+                s_end = frac * L_i
+                dir_sign = -1.0 if end_idx == 0 else 1.0
+                if end_idx == 0:
+                    lim_s = (rngs[m - 1][1] * L_i + (MIN_PART * L_i if rngs[m - 1][2] != "bridge" else 0.0)) if m > 0 else 0.0
+                    max_ext = max(0.0, min(SKEW_MAX_M, s_end - lim_s))
+                else:
+                    lim_s = (rngs[m + 1][0] * L_i - (MIN_PART * L_i if rngs[m + 1][2] != "bridge" else 0.0)) if m + 1 < len(rngs) else L_i
+                    max_ext = max(0.0, min(SKEW_MAX_M, lim_s - s_end))
+                if max_ext <= 0.0:
+                    continue
+                sl_xy, sl_s = _slice_xy_s(xy_i, s_i, max(0.0, s_end - SKEW_MAX_M), min(L_i, s_end + SKEW_MAX_M))
+                if sl_xy is None:
+                    continue
+                sx0, sy0 = float(sl_xy[:, 0].min()), float(sl_xy[:, 1].min())
+                sx1, sy1 = float(sl_xy[:, 0].max()), float(sl_xy[:, 1].max())
+                best_ext, best_tj = 0.0, ""
+                for tfid, txy, hw_t, tb in tcands:
+                    if tfid == fid_i:
+                        continue
+                    pad = hw_t + up_half + SKEW_MARGIN_M
+                    if tb[2] < sx0 - pad or tb[0] > sx1 + pad or tb[3] < sy0 - pad or tb[1] > sy1 + pad:
+                        continue
+                    for s_cross, sin_a, cos_a in _seg_cross_xy(sl_xy, sl_s, txy):
+                        sin_e = max(sin_a, SKEW_MIN_SIN)
+                        reach_past = (hw_t + SKEW_MARGIN_M) / sin_e + up_half * cos_a / sin_e
+                        d_out = (s_cross - s_end) * dir_sign
+                        if d_out <= reach_past and d_out + reach_past > 0.0:
+                            ext = min(max_ext, d_out + reach_past)
+                            if ext > best_ext:
+                                best_ext, best_tj = ext, tfid
+                if best_ext > 0.0:
+                    new_s = junc_cap(i, best_tj, s_end, s_end + dir_sign * best_ext, xy_i, s_i)
+                    if (new_s - s_end) * dir_sign > 1e-3:
+                        r[end_idx] = max(0.0, min(1.0, new_s / L_i))
+                        changed = True
+        if changed:
+            merged = []
+            for r in rngs:
+                if merged and merged[-1][2] == "bridge" and r[2] == "bridge" and r[0] <= merged[-1][1]:
+                    merged[-1][1] = max(merged[-1][1], r[1])
+                else:
+                    merged.append(r)
+            out[k] = [tuple(r) for r in merged]
+    return out
 
 
 def _structure_width(feats, i):
@@ -2516,6 +2760,13 @@ def road_specs(feats, urban_fn=None, widths=None, left_hand=False):
 
 def _road_specs_kept(feats, urban_fn=None, widths=None, left_hand=False):
     """road_specs' list itself, the one remembered on feats when it was (callers must not change it)."""
+    got = _road_specs_base(feats, urban_fn, widths, left_hand)
+    got = _home_specs(feats, got, urban_fn, widths, left_hand)
+    return _passage_widths(feats, got)
+
+
+def _road_specs_base(feats, urban_fn=None, widths=None, left_hand=False):
+    """Local per-cell specs before cross-cell home reconciliation or passage widening."""
     memo = feats.__dict__.setdefault("_road_specs", {})
     import europewalks
     import franceroads
@@ -2562,7 +2813,182 @@ def _road_specs_kept(feats, urban_fn=None, widths=None, left_hand=False):
             got = memo.setdefault(k, got)
             if towns is not None and len(towns) == len(feats):
                 memo.setdefault(tk, towns)
-    return _passage_widths(feats, list(got))
+    return got
+
+
+def _id_str_pos(feats):
+    """{str(fid): first row index} cached on feats."""
+    got = feats.__dict__.get("_id_str_pos")
+    if got is None:
+        got = {}
+        for j, fid in enumerate(feats.ids.tolist()):
+            got.setdefault(str(fid), j)
+        feats.__dict__["_id_str_pos"] = got
+    return got
+
+
+def _reach_cell_layer(feats, target_cid, max_hops=8):
+    """Reach cell layer `target_cid` by stepping through `_bnge_neighbours` up to `max_hops` hops."""
+    me = feats.__dict__.get("_bnge_cell")
+    if me is None:
+        return None
+    cur_cid = str(me[0])
+    target_cid = str(target_cid)
+    if cur_cid == target_cid:
+        return feats
+    cur = feats
+    seen = {cur_cid}
+    try:
+        z0, cx, cy = (int(v) for v in cur_cid.split("/"))
+        zt, xt, yt = (int(v) for v in target_cid.split("/"))
+        grid_ok = (z0 == zt)
+    except (TypeError, ValueError):
+        grid_ok = False
+        cx = cy = xt = yt = z0 = 0
+    for _ in range(max_hops):
+        hook = cur.__dict__.get("_bnge_neighbours")
+        if hook is None:
+            return None
+        want = {target_cid}
+        step_cid = None
+        if grid_ok and (cx, cy) != (xt, yt):
+            nx = cx + (1 if xt > cx else -1 if xt < cx else 0)
+            ny = cy + (1 if yt > cy else -1 if yt < cy else 0)
+            step_cid = "%d/%d/%d" % (z0, nx, ny)
+            want.add(step_cid)
+        try:
+            layers = _near_layers(hook, want)
+        except Exception as exc:
+            log.debug("home specs: neighbours: %s: %s", type(exc).__name__, exc)
+            return None
+        by_cid = {str(f.__dict__["_bnge_cell"][0]): f for f in (layers or ())
+                  if f is not None and f.__dict__.get("_bnge_cell")}
+        if target_cid in by_cid:
+            return by_cid[target_cid]
+        if step_cid is not None and step_cid in by_cid and step_cid not in seen:
+            seen.add(step_cid)
+            cur = by_cid[step_cid]
+            cx, cy = nx, ny
+            continue
+        return None
+    return None
+
+
+def _canon_home_specs(home_feats, urban_fn=None, left_hand=False):
+    """{str(fid): canonical Spec} for counted cross-cell roads whose home cell is `home_feats`."""
+    memo = home_feats.__dict__.setdefault("_canon_home_specs", {})
+    k = _street_spec_key(urban_fn, None, left_hand)
+    got = memo.get(k)
+    if got is not None:
+        return got
+    me = home_feats.__dict__.get("_bnge_cell")
+    hook = home_feats.__dict__.get("_bnge_neighbours")
+    if me is None or hook is None or not len(home_feats):
+        memo[k] = {}
+        return memo[k]
+    import mapcells
+    home_cid = str(me[0])
+    base = _road_specs_base(home_feats, urban_fn, None, left_hand)
+    counted = _lane_flow_counted(home_feats)
+    if not counted.any():
+        memo[k] = {}
+        return memo[k]
+    homes = _home_cells(home_feats)
+    boxes = _feature_boxes(home_feats)
+    cb = _cell_bounds(home_feats)
+    osm_h = np.asarray(_spec_inputs(home_feats)["cols"]["osm_lanes"], np.float64)
+    out = {}
+    for j in np.flatnonzero(counted).tolist():
+        sp = base[j]
+        if sp is None or homes[j] != home_cid:
+            continue
+        bj = boxes[j]
+        if cb is not None and np.isfinite(bj).all() and (
+                cb[0] + 1e-5 <= bj[0] and bj[2] <= cb[2] - 1e-5 and cb[1] + 1e-5 <= bj[1] and bj[3] <= cb[3] - 1e-5):
+            continue
+        fid = str(home_feats.ids[j])
+        if not (j < len(osm_h) and np.isfinite(osm_h[j])) and np.isfinite(bj).all():
+            try:
+                cks = [str(ck) for ck in mapcells.cells_for_bbox(float(bj[1]), float(bj[0]), float(bj[3]), float(bj[2]))
+                       if str(ck) != home_cid]
+            except Exception:
+                cks = []
+            if getattr(hook, "names", None) is None:
+                try:
+                    cks.extend(str(f.__dict__["_bnge_cell"][0]) for f in (hook() or ())
+                               if f is not None and f.__dict__.get("_bnge_cell")
+                               and str(f.__dict__["_bnge_cell"][0]) != home_cid)
+                except Exception:
+                    pass
+            for cid in sorted(set(cks))[:16]:
+                other = _reach_cell_layer(home_feats, cid)
+                if other is None or not len(other):
+                    continue
+                m = _id_str_pos(other).get(fid)
+                if m is None:
+                    continue
+                osm_o = np.asarray(_spec_inputs(other)["cols"]["osm_lanes"], np.float64)
+                if m < len(osm_o) and np.isfinite(osm_o[m]):
+                    sp_o = _road_specs_base(other, urban_fn, None, left_hand)[m]
+                    if sp_o is not None:
+                        sp = sp._replace(width=sp_o.width, lanes=sp_o.lanes, gap=sp_o.gap, median=sp_o.median)
+                        break
+        out[fid] = sp
+    memo[k] = out
+    return out
+
+
+def _home_specs(feats, base, urban_fn=None, widths=None, left_hand=False):
+    """Reconcile cross-cell one-way counted carriageways to their canonical home-cell lane count and width."""
+    if widths is not None or not len(feats):
+        return base
+    me = feats.__dict__.get("_bnge_cell")
+    hook = feats.__dict__.get("_bnge_neighbours")
+    if me is None or hook is None:
+        return base
+    memo = feats.__dict__.setdefault("_road_specs_home", {})
+    k = _street_spec_key(urban_fn, None, left_hand)
+    got = memo.get(k)
+    if got is not None and len(got) == len(base):
+        return got
+    counted = _lane_flow_counted(feats)
+    if not counted.any():
+        memo[k] = base
+        return base
+    me_cid = str(me[0])
+    homes = _home_cells(feats)
+    boxes = _feature_boxes(feats)
+    cb = _cell_bounds(feats)
+    by_home = {}
+    for i in np.flatnonzero(counted).tolist():
+        if base[i] is None:
+            continue
+        bi = boxes[i]
+        if homes[i] == me_cid and cb is not None and np.isfinite(bi).all() and (
+                cb[0] + 1e-5 <= bi[0] and bi[2] <= cb[2] - 1e-5 and cb[1] + 1e-5 <= bi[1] and bi[3] <= cb[3] - 1e-5):
+            continue
+        by_home.setdefault(homes[i], []).append(i)
+    if not by_home:
+        memo[k] = base
+        return base
+    out = list(base)
+    changed = False
+    for home_cid, rows in by_home.items():
+        h_layer = feats if home_cid == me_cid else _reach_cell_layer(feats, home_cid)
+        if h_layer is None:
+            continue
+        canon = _canon_home_specs(h_layer, urban_fn, left_hand)
+        if not canon:
+            continue
+        for i in rows:
+            sp_c = canon.get(str(feats.ids[i]))
+            if sp_c is not None and (out[i].width != sp_c.width or out[i].lanes != sp_c.lanes
+                                     or out[i].gap != sp_c.gap or out[i].median != sp_c.median):
+                out[i] = out[i]._replace(width=sp_c.width, lanes=sp_c.lanes, gap=sp_c.gap, median=sp_c.median)
+                changed = True
+    res = out if changed else base
+    memo[k] = res
+    return res
 
 
 def _passage_widths(feats, specs):
@@ -2572,8 +2998,12 @@ def _passage_widths(feats, specs):
     import busstations
     if not busstations.PASSAGE_IDS:
         return specs
+    copied = False
     for j, sp in enumerate(specs):
         if sp is not None and sp.cls == "service" and str(feats.ids[j]) in busstations.PASSAGE_IDS:
+            if not copied:
+                specs = list(specs)
+                copied = True
             kw = {}
             if sp.kind == "cobble":             # (the map's paving_stones for the whole yard: asphalt, _map_surface_value)
                 kw = {"kind": "paved", "surf": "asphalt"}
@@ -2983,6 +3413,24 @@ def _lane_flow_local(feats):
         except Exception as e:          # (this cell alone)
             log.debug("lane flow: neighbours: %s: %s", type(e).__name__, e)
     rows = [_lane_flow_rows(f) for f in layers]
+    if len(layers) > 1:
+        a0 = rows[0][2]
+        miss = np.flatnonzero((a0[:, 0] != 0.0) & np.isnan(a0[:, 1]))
+        if len(miss):
+            a0_copy = None
+            for fk, rk in zip(layers[1:], rows[1:]):
+                pos_k = _id_str_pos(fk)
+                ak = rk[2]
+                for idx0 in miss.tolist():
+                    if a0_copy is not None and np.isfinite(a0_copy[idx0, 1]):
+                        continue
+                    mk = pos_k.get(str(feats.ids[idx0]))
+                    if mk is not None and mk < len(ak) and np.isfinite(ak[mk, 1]):
+                        if a0_copy is None:
+                            a0_copy = a0.copy()
+                        a0_copy[idx0, 1] = ak[mk, 1]
+            if a0_copy is not None:
+                rows[0] = (rows[0][0], rows[0][1], a0_copy)
     ids = [_lane_flow_ids(f) for f in layers]
     got = np.asarray(fast._ef.lane_flow_cells(ids, [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows],
                                               float(LANE_FLOW_MAX)))
@@ -3602,6 +4050,143 @@ def _unbuilt_all(feats):
 _BORDER_SPEC_PAD_DEG = 8e-5     # (~9 m lat: covers quantized MVT start vertices split near a z=14 cell edge)
 
 
+def _id_str_pos(feats):
+    """Cached {str(fid): first row index} mapping on a features layer."""
+    got = feats.__dict__.get("_id_str_pos")
+    if got is None:
+        got = {}
+        for j, fid in enumerate(feats.ids.tolist()):
+            got.setdefault(str(fid), j)
+        feats.__dict__["_id_str_pos"] = got
+    return got
+
+
+def _reach_cell_layer(feats, target_cid, max_hops=8):
+    """Reach cell layer `target_cid` by stepping through `_bnge_neighbours` up to `max_hops` hops."""
+    me = feats.__dict__.get("_bnge_cell")
+    if me is None:
+        return None
+    cur_cid = str(me[0])
+    target_cid = str(target_cid)
+    if cur_cid == target_cid:
+        return feats
+    cur = feats
+    seen = {cur_cid}
+    try:
+        z0, cx, cy = (int(v) for v in cur_cid.split("/"))
+        zt, xt, yt = (int(v) for v in target_cid.split("/"))
+        grid_ok = (z0 == zt)
+    except (TypeError, ValueError):
+        grid_ok = False
+        cx = cy = xt = yt = z0 = 0
+    for _ in range(max_hops):
+        hook = cur.__dict__.get("_bnge_neighbours")
+        if hook is None:
+            return None
+        want = {target_cid}
+        step_cid = None
+        if grid_ok and (cx, cy) != (xt, yt):
+            nx = cx + (1 if xt > cx else -1 if xt < cx else 0)
+            ny = cy + (1 if yt > cy else -1 if yt < cy else 0)
+            step_cid = "%d/%d/%d" % (z0, nx, ny)
+            want.add(step_cid)
+        try:
+            layers = _near_layers(hook, want)
+        except Exception as exc:
+            log.debug("border specs: hop %s: %s: %s", target_cid, type(exc).__name__, exc)
+            return None
+        by_cid = {str(f.__dict__["_bnge_cell"][0]): f for f in (layers or ())
+                  if f is not None and f.__dict__.get("_bnge_cell")}
+        if target_cid in by_cid:
+            return by_cid[target_cid]
+        if step_cid is not None and step_cid in by_cid and step_cid not in seen:
+            seen.add(step_cid)
+            cur = by_cid[step_cid]
+            cx, cy = nx, ny
+            continue
+        return None
+    return None
+
+
+def _canon_border_spec(home_feats, idx_in_home, sp, urban_fn, left_hand, local_cache):
+    """Fill missing osm_lanes on a canonical home copy from a crossing cell copy up to 4 hops away."""
+    if sp is None:
+        return None
+    osm_h = home_feats.__dict__.get("_osm_lanes_vals")
+    if osm_h is None:
+        osm_h = _osm_values(home_feats, "lanes", *OSM_LANES)
+        home_feats.__dict__["_osm_lanes_vals"] = osm_h
+    if idx_in_home < len(osm_h) and np.isfinite(osm_h[idx_in_home]):
+        return sp
+    me = home_feats.__dict__.get("_bnge_cell")
+    hook = home_feats.__dict__.get("_bnge_neighbours")
+    if me is None or hook is None:
+        return sp
+    home_cid = str(me[0])
+    memo = home_feats.__dict__.setdefault("_canon_osm_spec", {})
+    mkey = (urban_fn is not None, id(urban_fn) if urban_fn is not None else 0, bool(left_hand))
+    fid = str(home_feats.ids[idx_in_home])
+    hit = memo.get((mkey, fid))
+    if hit is not None and hit[0] is urban_fn:
+        return hit[1]
+    bj = _feature_boxes(home_feats)[idx_in_home]
+    cb = _cell_bounds(home_feats)
+    res = sp
+    if np.isfinite(bj).all() and (
+            cb is None or not (cb[0] + 1e-5 <= bj[0] and bj[2] <= cb[2] - 1e-5
+                               and cb[1] + 1e-5 <= bj[1] and bj[3] <= cb[3] - 1e-5)):
+        import mapcells
+        try:
+            cks = [str(ck) for ck in mapcells.cells_for_bbox(float(bj[1]), float(bj[0]), float(bj[3]), float(bj[2]))
+                   if str(ck) != home_cid]
+        except Exception:
+            cks = []
+        if getattr(hook, "names", None) is None:
+            try:
+                cks.extend(str(f.__dict__["_bnge_cell"][0]) for f in (hook() or ())
+                           if f is not None and f.__dict__.get("_bnge_cell")
+                           and str(f.__dict__["_bnge_cell"][0]) != home_cid)
+            except Exception:
+                pass
+        try:
+            hz, hx, hy = (int(v) for v in home_cid.split("/"))
+        except (TypeError, ValueError):
+            hz = hx = hy = None
+
+        def _cand_order(cid):
+            if hz is not None:
+                try:
+                    cz, cx, cy = (int(v) for v in cid.split("/"))
+                    if cz == hz:
+                        return (0, max(abs(cx - hx), abs(cy - hy)), cid)
+                except (TypeError, ValueError):
+                    pass
+            return (1, 0, cid)
+
+        for cid in sorted(set(cks), key=_cand_order)[:24]:
+            other = _reach_cell_layer(home_feats, cid)
+            if other is None or not len(other):
+                continue
+            m = _id_str_pos(other).get(fid)
+            if m is None:
+                continue
+            osm_o = other.__dict__.get("_osm_lanes_vals")
+            if osm_o is None:
+                osm_o = _osm_values(other, "lanes", *OSM_LANES)
+                other.__dict__["_osm_lanes_vals"] = osm_o
+            if m < len(osm_o) and np.isfinite(osm_o[m]):
+                o_specs = local_cache.get(cid)
+                if o_specs is None:
+                    o_specs = _road_specs_local(other, urban_fn, left_hand)
+                    local_cache[cid] = o_specs
+                sp_o = o_specs[m]
+                if sp_o is not None and sp_o.cls == sp.cls:
+                    res = sp._replace(width=sp_o.width, lanes=sp_o.lanes, gap=sp_o.gap, median=sp_o.median)
+                    break
+    memo[(mkey, fid)] = (urban_fn, res)
+    return res
+
+
 def _sync_border_specs(feats, out, urban_fn, left_hand):
     """Align border-crossing counted carriageways' specs with their home (or lex-smallest) cell copy so
     dual-carriageway median gaps and local inputs never jump widths across a z=14 border."""
@@ -3619,102 +4204,134 @@ def _sync_border_specs(feats, out, urban_fn, left_hand):
     counted_idx = np.flatnonzero(mask).tolist()
     away_idx = [i for i in counted_idx if homes[i] != me_key]
     cb = _cell_bounds(feats)
+    boxes = _feature_boxes(feats)
     split_idx = []
     split_boxes = []
-    if cb is not None:
-        x0, y0, x1, y1 = cb
-        pad = _BORDER_SPEC_PAD_DEG
-        for i in counted_idx:
-            if homes[i] != me_key or feats.part_off[i] >= feats.part_off[i + 1]:
-                continue
+    home_cross_idx = []
+    osm_me = feats.__dict__.get("_osm_lanes_vals")
+    if osm_me is None:
+        osm_me = _osm_values(feats, "lanes", *OSM_LANES)
+        feats.__dict__["_osm_lanes_vals"] = osm_me
+    pad = _BORDER_SPEC_PAD_DEG
+    for i in counted_idx:
+        if homes[i] != me_key or feats.part_off[i] >= feats.part_off[i + 1]:
+            continue
+        split = False
+        if cb is not None:
             a = feats.coord_off[feats.ring_off[feats.part_off[i]]]
             b = feats.coord_off[feats.ring_off[feats.part_off[i + 1]]]
-            if b <= a:
-                continue
-            lon, lat = float(feats.lonlat[a, 0]), float(feats.lonlat[a, 1])
-            if lon - x0 < pad or x1 - lon < pad or lat - y0 < pad or y1 - lat < pad:
-                split_idx.append(i)
-                split_boxes.append((lon - pad, lat - pad, lon + pad, lat + pad))
-    if not away_idx and not split_idx:
+            if b > a:
+                lon, lat = float(feats.lonlat[a, 0]), float(feats.lonlat[a, 1])
+                if lon - cb[0] < pad or cb[2] - lon < pad or lat - cb[1] < pad or cb[3] - lat < pad:
+                    split = True
+                    split_idx.append(i)
+                    split_boxes.append((lon - pad, lat - pad, lon + pad, lat + pad))
+        if not split and not (i < len(osm_me) and np.isfinite(osm_me[i])):
+            bi = boxes[i]
+            if np.isfinite(bi).all() and (
+                    cb is None or not (cb[0] + 1e-5 <= bi[0] and bi[2] <= cb[2] - 1e-5
+                                       and cb[1] + 1e-5 <= bi[1] and bi[3] <= cb[3] - 1e-5)):
+                home_cross_idx.append(i)
+    if not away_idx and not split_idx and not home_cross_idx:
         return out
-    far_idx = [i for i in away_idx if _home_far(feats, hook, homes[i])]
+
     want = {homes[i] for i in away_idx if not _home_far(feats, hook, homes[i])}
-    if far_idx:
-        far_mask = np.zeros(len(feats), bool)
-        far_mask[far_idx] = True
-        reached = _border_cells(feats, hook, far_mask)
-        want = None if reached is None else (want | reached)
-    if split_boxes and want is not None:
+    if split_boxes:
         split_reached = _cells_reached(hook, np.asarray(split_boxes, np.float64))
         if split_reached is None:
             want = None
         else:
             want = want | {c for c in split_reached if c < me_key}
-    if want is not None and not want:
-        return out
-    try:
-        near = {f.__dict__["_bnge_cell"][0]: f for f in _near_layers(hook, want)
-                if f is not None and f is not feats and f.__dict__.get("_bnge_cell")}
-    except Exception as e:
-        log.debug("border specs: neighbours: %s: %s", type(e).__name__, e)
-        return out
-    if not near:
-        return out
+    near = {}
+    if want is None or want:
+        try:
+            near = {f.__dict__["_bnge_cell"][0]: f for f in _near_layers(hook, want)
+                    if f is not None and f is not feats and f.__dict__.get("_bnge_cell")}
+        except Exception as e:
+            log.debug("border specs: neighbours: %s: %s", type(e).__name__, e)
+            return out
+
     out = list(out)
-    pos_by_cell, homes_by_cell, spec_by_cell, idsets = {}, {}, {}, None
+    homes_by_cell, spec_by_cell, idsets = {}, {}, None
+    reached_home = {}
+    border_near_loaded = False
 
-    def _pos(k):
-        p = pos_by_cell.get(k)
-        if p is None:
-            p = {str(v): j for j, v in enumerate(near[k].ids.tolist())}
-            pos_by_cell[k] = p
-        return p
-
-    def _homes(k):
+    def _homes(k, layer):
         h = homes_by_cell.get(k)
         if h is None:
-            h = _home_cells(near[k])
+            h = _home_cells(layer)
             homes_by_cell[k] = h
         return h
+
+    def _ensure_border_near():
+        nonlocal border_near_loaded, idsets
+        if border_near_loaded:
+            return
+        border_near_loaded = True
+        far_idx = [i for i in away_idx if homes[i] not in near]
+        if not far_idx:
+            return
+        far_mask = np.zeros(len(feats), bool)
+        far_mask[far_idx] = True
+        extra_want = _border_cells(feats, hook, far_mask)
+        if extra_want is None or extra_want:
+            try:
+                for f in _near_layers(hook, extra_want):
+                    if f is not None and f is not feats and f.__dict__.get("_bnge_cell"):
+                        near.setdefault(f.__dict__["_bnge_cell"][0], f)
+            except Exception as e:
+                log.debug("border specs: border neighbours: %s: %s", type(e).__name__, e)
+        idsets = None
 
     for i in away_idx + split_idx:
         home = homes[i]
         fid = str(feats.ids[i])
+        other = None
         if home != me_key:
             canon = None
-            if home in near:
-                j = _pos(home).get(fid)
-                if j is not None and _homes(home)[j] == home:
-                    canon = home
+            cand_home = near.get(home)
+            if cand_home is None:
+                if home not in reached_home:
+                    reached_home[home] = _reach_cell_layer(feats, home)
+                cand_home = reached_home[home]
+            if cand_home is not None:
+                j = _id_str_pos(cand_home).get(fid)
+                if j is not None and _homes(home, cand_home)[j] == home:
+                    canon, other = home, cand_home
             if canon is None:
+                _ensure_border_near()
                 if idsets is None:
-                    idsets = {k: set(_pos(k).keys()) for k in near}
+                    idsets = {k: set(_id_str_pos(layer).keys()) for k, layer in near.items()}
                 cands = {me_key}
                 for k, ids in idsets.items():
                     if fid in ids:
                         cands.add(k)
                 canon = min(cands)
+                other = near.get(canon)
         else:
             if idsets is None:
-                idsets = {k: set(_pos(k).keys()) for k in near}
+                idsets = {k: set(_id_str_pos(layer).keys()) for k, layer in near.items()}
             cands = {me_key}
             for k, ids in idsets.items():
                 if k < me_key and fid in ids:
-                    j = _pos(k)[fid]
-                    if _homes(k)[j] != me_key:
+                    j = _id_str_pos(near[k])[fid]
+                    if _homes(k, near[k])[j] != me_key:
                         cands.add(k)
             canon = min(cands)
-        if canon == me_key:
+            other = near.get(canon)
+        if canon == me_key or other is None:
+            if (canon == me_key or homes[i] == me_key) and not (i < len(osm_me) and np.isfinite(osm_me[i])):
+                home_cross_idx.append(i)
             continue
-        other = near[canon]
-        j = _pos(canon).get(fid)
+        j = _id_str_pos(other).get(fid)
         if j is None:
             continue
         other_specs = spec_by_cell.get(canon)
         if other_specs is None:
             other_specs = _road_specs_local(other, urban_fn, left_hand)
             spec_by_cell[canon] = other_specs
-        mine, donor = out[i], other_specs[j]
+        donor = _canon_border_spec(other, j, other_specs[j], urban_fn, left_hand, spec_by_cell)
+        mine = out[i]
         if mine is None or donor is None or mine.cls != donor.cls:
             continue
         out[i] = mine._replace(
@@ -3728,6 +4345,12 @@ def _sync_border_specs(feats, out, urban_fn, left_hand):
             urban=donor.urban,
             walk=donor.walk,
         )
+
+    for i in home_cross_idx:
+        mine = out[i]
+        donor = _canon_border_spec(feats, i, mine, urban_fn, left_hand, spec_by_cell)
+        if donor is not None and donor is not mine:
+            out[i] = donor
     return out
 
 
@@ -4563,8 +5186,110 @@ def _bridge_specs(feats, want="bridge"):
     d = _road_rules().bridge_specs(inp["geo"], inp["cols"], inp["built"], has, gmed, gdir, _flow_fn(feats, inp),
                                    _spec_prm())
     out = _specs_of(d, inp, _marking_states(feats))
-    import germanroads          # (Germany's surveyed widths on decks and in tunnels too: a 6.5 m Kreisstraße's
-    return germanroads.adjust_specs(feats, out)     # bridge stayed at its class's 8 m, stepping at both ends)
+    import germanroads          # (Germany's surveyed widths on decks and in tunnels too: a 6.5 m Kreisstrasse's
+    out = germanroads.adjust_specs(feats, out)      # bridge stayed at its class's 8 m, stepping at both ends)
+    if want == "bridge":
+        out = _reconcile_collinear_bridge_specs(feats, inp, out, ground, has)
+    return out
+
+
+def _reconcile_collinear_bridge_specs(feats, inp, out, ground, has_bridge):
+    """Propagate explicit lane count and rural carriageway width from collinear degree-2 ground continuations
+    onto untagged bridge features of matching class, oneway, and link flag. Pure."""
+    n = len(feats)
+    if n < 2 or not np.any(has_bridge):
+        return out
+    cols = inp["cols"]
+    ll, co, ro, po = inp["geo"]
+    if len(ll) < 2:
+        return out
+    lat0 = float(np.mean(ll[:, 1]))
+    kx = 111320.0 * max(0.05, math.cos(math.radians(lat0)))
+    lon0 = float(ll[0, 0])
+    join = _EndJoin(0.5)
+    inc = {}
+    ends_of = [None] * n
+    for i in np.flatnonzero(cols["elig"]).tolist():
+        p0, p1 = int(co[ro[po[i]]]), int(co[ro[po[i + 1]]])
+        if p1 - p0 < 2:
+            continue
+        ring = ll[p0:p1]
+        xy0 = ((float(ring[0, 0]) - lon0) * kx, (float(ring[0, 1]) - lat0) * 111320.0)
+        xy1 = ((float(ring[1, 0]) - lon0) * kx, (float(ring[1, 1]) - lat0) * 111320.0)
+        xy_last = ((float(ring[-1, 0]) - lon0) * kx, (float(ring[-1, 1]) - lat0) * 111320.0)
+        xy_prev = ((float(ring[-2, 0]) - lon0) * kx, (float(ring[-2, 1]) - lat0) * 111320.0)
+        d0 = (xy1[0] - xy0[0], xy1[1] - xy0[1])
+        n0 = math.hypot(d0[0], d0[1])
+        d1 = (xy_prev[0] - xy_last[0], xy_prev[1] - xy_last[1])
+        n1 = math.hypot(d1[0], d1[1])
+        if n0 <= 1e-6 or n1 <= 1e-6:
+            continue
+        t0 = (d0[0] / n0, d0[1] / n0)
+        t1 = (d1[0] / n1, d1[1] / n1)
+        u0, u1 = join(xy0), join(xy_last)
+        ends_of[i] = ((u0, t0), (u1, t1))
+        inc.setdefault(u0, []).append((i, t0))
+        inc.setdefault(u1, []).append((i, t1))
+
+    has_w = cols["has_w"]
+    wv = cols["wv"]
+    osm_w = cols["osm_w"]
+    osm_lanes = cols["osm_lanes"]
+    over = cols["over"]
+    ring_col = cols["ring"]
+    se_col = cols["sweden"]
+    out = list(out)
+    has_explicit = [
+        bool(has_w[i] or np.isfinite(osm_w[i]) or np.isfinite(osm_lanes[i]) or over[i] >= 0)
+        for i in range(n)
+    ]
+    for _pass in range(3):
+        changed = False
+        for i in range(n):
+            sp = out[i]
+            if sp is None or not has_bridge[i] or has_explicit[i] or ring_col[i] or se_col[i] or sp.mountain:
+                continue
+            eo = ends_of[i]
+            if eo is None:
+                continue
+            cand = None
+            for u, ti in eo:
+                peers = inc.get(u, ())
+                if len(peers) != 2:
+                    continue
+                j, tj = peers[1] if peers[0][0] == i else peers[0]
+                if j == i or ring_col[j] or se_col[j] or not has_explicit[j]:
+                    continue
+                if ti[0] * tj[0] + ti[1] * tj[1] > -0.94:
+                    continue
+                peer_sp = out[j] if has_bridge[j] and out[j] is not None else ground[j]
+                if peer_sp is None or peer_sp.mountain:
+                    continue
+                if (peer_sp.cls != sp.cls or bool(peer_sp.oneway) != bool(sp.oneway)
+                        or bool(peer_sp.link) != bool(sp.link)):
+                    continue
+                rw_j = None
+                if has_w[j] and np.isfinite(wv[j]):
+                    rw_j = float(wv[j])
+                elif np.isfinite(osm_w[j]):
+                    rw_j = float(osm_w[j])
+                ln_j = peer_sp.lanes if (np.isfinite(osm_lanes[j]) or over[j] >= 0 or has_bridge[j]) else sp.lanes
+                if rw_j is None and ln_j is None:
+                    continue
+                w_new = float(carriageway(sp.cls, sp.kind, False, rw_j, sp.oneway, ln_j, sp.link))
+                if sp.median:
+                    w_new = min(w_new, float(peer_sp.width))
+                if cand is None or w_new > cand[0]:
+                    cand = (w_new, ln_j)
+            if cand is not None:
+                w_new, ln_new = cand
+                if abs(w_new - float(sp.width)) > 0.02 or ln_new != sp.lanes:
+                    out[i] = sp._replace(width=round(w_new, 2), lanes=ln_new)
+                    has_explicit[i] = True
+                    changed = True
+        if not changed:
+            break
+    return out
 
 
 class _EndJoin:
@@ -4780,37 +5505,49 @@ def _trim_parallel_widths(lines, zs, specs, levels):
         z_at = float(z_p[k] + t[k] * (z_p[k + 1] - z_p[k]))
         return float(d[k]), s_at, z_at, seg / sn
 
+    lane_floors = []
+    for k, sp in enumerate(specs):
+        ln = getattr(sp, "lanes", None)
+        if ln is not None and int(ln) >= 1:
+            lane_floors.append(max(3.5 * int(ln), 0.85 * widths[k]))
+        else:
+            lane_floors.append(3.5)
+
     for i in range(n):
         if len(pts[i]) < 2 or widths[i] <= 4.5 or arcs[i][-1] < 8.0:
             continue
+        cls_i = getattr(specs[i], "cls", None)
+        link_i = bool(getattr(specs[i], "link", False))
         for j in range(i + 1, n):
             if len(pts[j]) < 2 or widths[j] <= 3.0 or arcs[j][-1] < 8.0:
+                continue
+            if getattr(specs[j], "cls", None) != cls_i or bool(getattr(specs[j], "link", False)) != link_i:
                 continue
             if abs(lvs[i] - lvs[j]) >= 0.5:
                 continue
             wi, wj = caps[i], caps[j]
-            reach_lim = max(0.5 * max(wi, wj), 0.5 * (wi + wj) - EDGE_KISS_M)
+            reach_lim = max(0.5 * max(wi, wj), 0.5 * (wi + wj))
             if (pts[i].max(0) + reach_lim + 2.0 < pts[j].min(0)).any() or (
                     pts[j].max(0) + reach_lim + 2.0 < pts[i].min(0)).any():
                 continue
-            # Detect shared fork/merge endpoints so genuine diverging gore tapers are skipped near the fork
+            # Never globally trim widths on carriageways sharing a fork or merge node
             fork_ends_i = []
             for ei in (0, -1):
-                d_e, s_ej, z_ej, _ = _proj_seg(pts[j], arcs[j], z_arr[j], pts[i][ei])
-                if d_e <= max(0.5 * (wi + wj), 1.5) and abs(float(z_arr[i][ei]) - z_ej) <= 0.6:
+                d_e, _s_ej, z_ej, _ = _proj_seg(pts[j], arcs[j], z_arr[j], pts[i][ei])
+                if d_e <= 2.5 and abs(float(z_arr[i][ei]) - z_ej) <= 0.6:
                     fork_ends_i.append(0.0 if ei == 0 else float(arcs[i][-1]))
             fork_ends_j = []
             for ej in (0, -1):
-                d_e, s_ei, z_ei, _ = _proj_seg(pts[i], arcs[i], z_arr[i], pts[j][ej])
-                if d_e <= max(0.5 * (wi + wj), 1.5) and abs(float(z_arr[j][ej]) - z_ei) <= 0.6:
+                d_e, _s_ei, z_ei, _ = _proj_seg(pts[i], arcs[i], z_arr[i], pts[j][ej])
+                if d_e <= 2.5 and abs(float(z_arr[j][ej]) - z_ei) <= 0.6:
                     fork_ends_j.append(0.0 if ej == 0 else float(arcs[j][-1]))
-            gore_skip = min(35.0, 0.35 * min(float(arcs[i][-1]), float(arcs[j][-1])))
+            if fork_ends_i or fork_ends_j:
+                continue
             min_d = None
-            for a_idx, b_idx, f_ends in ((i, j, fork_ends_i), (j, i, fork_ends_j)):
+            coupled_n = 0
+            for a_idx, b_idx in ((i, j), (j, i)):
                 L_a, L_b = float(arcs[a_idx][-1]), float(arcs[b_idx][-1])
                 for s_a in np.arange(2.0, L_a - 2.0 + 1e-6, 4.0):
-                    if any(abs(s_a - fe) < gore_skip for fe in f_ends):
-                        continue
                     qa = np.array([float(np.interp(s_a, arcs[a_idx], pts[a_idx][:, 0])),
                                    float(np.interp(s_a, arcs[a_idx], pts[a_idx][:, 1]))])
                     za = float(np.interp(s_a, arcs[a_idx], z_arr[a_idx]))
@@ -4821,23 +5558,24 @@ def _trim_parallel_widths(lines, zs, specs, levels):
                     dist, s_b, zb, tb = _proj_seg(pts[b_idx], arcs[b_idx], z_arr[b_idx], qa)
                     if s_b <= 1.0 or s_b >= L_b - 1.0:
                         continue
-                    if abs(float(ta @ tb)) < 0.80 or abs(za - zb) > 2.0 or dist < 3.2:
+                    if abs(float(ta @ tb)) < 0.94 or abs(za - zb) > 2.5 or dist < 3.2:
                         continue
+                    coupled_n += 1
                     if min_d is None or dist < min_d:
                         min_d = dist
-            if min_d is None:
+            if min_d is None or coupled_n < 2:
                 continue
-            need = max(0.5 * max(caps[i], caps[j]), 0.5 * (caps[i] + caps[j]) - EDGE_KISS_M)
+            need = max(0.5 * max(caps[i], caps[j]), 0.5 * (caps[i] + caps[j]) - 0.10)
             if min_d > need + 1e-6:
                 continue
             single_cap = max(3.5, 2.0 * min_d - 0.30)
-            ni = min(caps[i], single_cap)
-            nj = min(caps[j], single_cap)
-            sum_cap = 2.0 * min_d + 2.0 * EDGE_KISS_M - 0.30
+            ni = max(lane_floors[i], min(caps[i], single_cap))
+            nj = max(lane_floors[j], min(caps[j], single_cap))
+            sum_cap = 2.0 * min_d - 0.20
             if ni + nj > sum_cap and ni + nj > 1e-6:
                 scale = sum_cap / (ni + nj)
-                ni = max(3.5, ni * scale)
-                nj = max(3.5, nj * scale)
+                ni = max(lane_floors[i], ni * scale)
+                nj = max(lane_floors[j], nj * scale)
             caps[i], caps[j] = ni, nj
     out = []
     for sp, w_old, w_new in zip(specs, widths, caps):
@@ -4964,6 +5702,83 @@ def _tie_beside(lines, zs, specs, measured=None, ground_lines=None):
                 if along >= span:
                     break
                 zs[i][k] += delta * (1.0 - along / span)
+
+    def _proj_dir(m, z_m, q):
+        P, ab = pts[m][:-1], np.diff(pts[m], axis=0)
+        l2 = np.maximum((ab * ab).sum(1), 1e-12)
+        t = np.clip(((q - P) * ab).sum(1) / l2, 0.0, 1.0)
+        near = P + t[:, None] * ab
+        d = np.hypot(*(q - near).T)
+        k = int(np.argmin(d))
+        seg = ab[k]
+        sn = max(float(np.hypot(seg[0], seg[1])), 1e-9)
+        return float(d[k]), float(z_m[k] + t[k] * (z_m[k + 1] - z_m[k])), seg / sn
+
+    def _unit_tan(m, k):
+        ka = min(max(k, 1), len(pts[m]) - 1)
+        dm = pts[m][ka] - pts[m][ka - 1]
+        nm = max(float(np.hypot(dm[0], dm[1])), 1e-9)
+        return dm / nm
+
+    # Level parallel twin carriageway decks separated by up to TIE_JOIN_M, easing smoothly to pinned ends
+    for i in range(n):
+        if len(pts[i]) < 2 or float(arcs[i][-1]) < 16.0 or getattr(specs[i], "link", False):
+            continue
+        if measured is not None and measured[i]:
+            continue
+        wi = float(specs[i].width)
+        cls_i = getattr(specs[i], "cls", None)
+        for j in range(i + 1, n):
+            if len(pts[j]) < 2 or float(arcs[j][-1]) < 16.0 or getattr(specs[j], "link", False):
+                continue
+            if measured is not None and measured[j]:
+                continue
+            if getattr(specs[j], "cls", None) != cls_i:
+                continue
+            wj = float(specs[j].width)
+            if abs(wi - wj) > max(4.0, 0.35 * max(wi, wj)):
+                continue
+            if min(np.hypot(*(pts[i][0] - pts[j][0])), np.hypot(*(pts[i][0] - pts[j][-1])),
+                   np.hypot(*(pts[i][-1] - pts[j][0])), np.hypot(*(pts[i][-1] - pts[j][-1]))) <= 1.0:
+                continue
+            reach = 0.5 * (wi + wj) + TIE_JOIN_M + 2.0
+            if (pts[i].max(0) + reach < pts[j].min(0)).any() or (pts[j].max(0) + reach < pts[i].min(0)).any():
+                continue
+            zi0, zj0 = zs[i].copy(), zs[j].copy()
+            coupled_len, max_dz = 0.0, 0.0
+            for k in range(len(pts[i])):
+                d, zj, tj = _proj_dir(j, zj0, pts[i][k])
+                gap_ij = d - 0.5 * (wi + wj)
+                if -1.0 <= gap_ij <= TIE_JOIN_M and abs(float(_unit_tan(i, k) @ tj)) >= 0.92:
+                    dz = abs(float(zi0[k]) - zj)
+                    if dz < 2.5:
+                        seg_w = (0.5 * float(arcs[i][1] - arcs[i][0]) if k == 0
+                                 else 0.5 * float(arcs[i][-1] - arcs[i][-2]) if k == len(pts[i]) - 1
+                                 else 0.5 * float(arcs[i][k + 1] - arcs[i][k - 1]))
+                        coupled_len += seg_w
+                        max_dz = max(max_dz, dz)
+            if coupled_len < 0.5 * min(float(arcs[i][-1]), float(arcs[j][-1])) or max_dz <= 0.02:
+                continue
+            for m, o, wm, wo, z_own, z_oth in ((i, j, wi, wj, zi0, zj0), (j, i, wj, wi, zj0, zi0)):
+                pin0, pin1 = fixed(m, 0, o), fixed(m, -1, o)
+                L_m = float(arcs[m][-1])
+                for k in range(len(pts[m])):
+                    d, zo, to = _proj_dir(o, z_oth, pts[m][k])
+                    if d - 0.5 * (wm + wo) > TIE_JOIN_M or abs(float(_unit_tan(m, k) @ to)) < 0.92:
+                        continue
+                    dh = 0.5 * (zo - float(z_own[k]))
+                    if abs(zo - float(z_own[k])) >= 2.5:
+                        continue
+                    wt = 1.0
+                    if pin0:
+                        e0 = min(max(12.0, abs(dh) / 0.04), 0.35 * L_m)
+                        u0 = float(np.clip(arcs[m][k] / max(e0, 1e-6), 0.0, 1.0))
+                        wt = min(wt, u0 * u0 * (3.0 - 2.0 * u0))
+                    if pin1:
+                        e1 = min(max(12.0, abs(dh) / 0.04), 0.35 * L_m)
+                        u1 = float(np.clip((L_m - arcs[m][k]) / max(e1, 1e-6), 0.0, 1.0))
+                        wt = min(wt, u1 * u1 * (3.0 - 2.0 * u1))
+                    zs[m][k] = float(z_own[k]) + wt * dh
     return zs
 
 
@@ -4974,6 +5789,60 @@ def _joined_lines(lines, joins):
         ln = np.array(out[k], np.float64, copy=True)
         ln[at, 0], ln[at, 1] = p
         out[k] = ln
+    return out
+
+
+BUTT_WELD_EASE_M = 15.0     # m over which a 1-to-1 collinear free-end weld eases laterally
+
+
+def _weld_butt_lines(lines, joins, specs=None):
+    """Return lines with 1-to-1 collinear free-end joins welded smoothly in XY onto the facing end."""
+    if not joins or not lines:
+        return list(lines)
+    nk = _EndJoin()
+    by_node = {}
+    for idx, ln in enumerate(lines):
+        if len(ln) < 2:
+            continue
+        by_node.setdefault(nk(ln[0]), []).append((idx, 0))
+        by_node.setdefault(nk(ln[-1]), []).append((idx, -1))
+    is_link = [bool(getattr(s, "link", False)) for s in specs] if specs is not None else [False] * len(lines)
+    to_node = {}
+    for k, _at, p in joins:
+        key_p = (nk(p), is_link[k])
+        to_node[key_p] = to_node.get(key_p, 0) + 1
+    out = [np.array(ln, np.float64, copy=True) for ln in lines]
+    for k, at, p in joins:
+        if len(lines[k]) < 2:
+            continue
+        if len(by_node.get(nk(lines[k][at]), ())) != 1:
+            continue
+        key_p = nk(p)
+        ends = [e for e in by_node.get(key_p, ()) if is_link[e[0]] == is_link[k]]
+        if len(ends) != 1 or to_node.get((key_p, is_link[k]), 0) != 1:
+            continue
+        other_i, other_at = ends[0]
+        if other_i == k or len(lines[other_i]) < 2:
+            continue
+        da = lines[k][0] - lines[k][1] if at == 0 else lines[k][-1] - lines[k][-2]
+        db = lines[other_i][0] - lines[other_i][1] if other_at == 0 else lines[other_i][-1] - lines[other_i][-2]
+        na, nb = float(np.hypot(*da[:2])), float(np.hypot(*db[:2]))
+        if na < 1e-9 or nb < 1e-9:
+            continue
+        if float(np.dot(da[:2], db[:2])) / (na * nb) > -0.5:
+            continue
+        ln = out[k]
+        delta = np.asarray(p, np.float64)[:2] - ln[at, :2]
+        pts = ln[:, :2]
+        arc = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pts, axis=0).T))]
+        total = float(arc[-1])
+        if total < 1e-6:
+            continue
+        dist = arc if at == 0 else total - arc
+        span = min(BUTT_WELD_EASE_M, total * 0.5)
+        w = np.clip(1.0 - dist / max(span, 1e-6), 0.0, 1.0)
+        w[-1 if at == 0 else 0] = 0.0
+        ln[:, :2] = pts + w[:, None] * delta[None, :]
     return out
 
 
@@ -4988,11 +5857,109 @@ def _ground_pins(lines, ground_lines):
     return list(fast.deck_ground_pins(ends, ground_lines, PIN_ROAD_M, PIN_M))
 
 
-def _merge_overlaps(lines, zs, widths, levels, rounds=3, pins=None):
+def _free_deck_ends(lines, ground_roads, pins=None, end_ons=None):
+    """(part_idx, 0 | -1) for unfinished dead-end branch stubs with no connected ground feature. Pure."""
+    if ground_roads is None or not lines:
+        return frozenset()
+    pts_xy = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
+    if any(len(xy) < 2 for xy in pts_xy):
+        return frozenset()
+    nodes, edges, _adj = _chain_graph(pts_xy)
+    if len(edges) != len(lines):
+        return frozenset()
+    deg = np.zeros(len(nodes), int)
+    inc = [[] for _ in nodes]
+    for k, (a, b, _s) in enumerate(edges):
+        deg[a] += 1
+        deg[b] += 1
+        inc[a].append((k, 0))
+        inc[b].append((k, -1))
+    deg = _pin(nodes, deg, pins)
+    on_map = {(int(k), 0 if int(at) == 0 else -1): int(j) for k, at, j, _arc in (end_ons or ())}
+    pin_pts = np.asarray(pins, np.float64).reshape(-1, 2) if (pins is not None and len(pins)) else None
+    g_segs = []
+    for g in ground_roads:
+        gxy = np.asarray(g, np.float64)[:, :2]
+        if len(gxy) >= 2:
+            g_segs.append((gxy.min(0) - LANDING_ROAD_M, gxy.max(0) + LANDING_ROAD_M, gxy[:-1], np.diff(gxy, axis=0)))
+
+    def has_ground(pt):
+        if pin_pts is not None and (np.hypot(pin_pts[:, 0] - pt[0], pin_pts[:, 1] - pt[1]) < PIN_M).any():
+            return True
+        px, py = float(pt[0]), float(pt[1])
+        for lo, hi, a_, ab_ in g_segs:
+            if px < lo[0] or px > hi[0] or py < lo[1] or py > hi[1]:
+                continue
+            l2_ = np.maximum((ab_ * ab_).sum(1), 1e-12)
+            t_ = np.clip(((pt - a_) * ab_).sum(1) / l2_, 0.0, 1.0)
+            if float(np.hypot(*(a_ + t_[:, None] * ab_ - pt).T).min()) <= LANDING_ROAD_M:
+                return True
+        return False
+
+    parent = list(range(len(nodes)))
+
+    def find(u):
+        while parent[u] != u:
+            parent[u] = parent[parent[u]]
+            u = parent[u]
+        return u
+
+    for a, b, _s in edges:
+        parent[find(a)] = find(b)
+    end_ground = {}
+    anchored_comps = set()
+    for k, (a, b, _s) in enumerate(edges):
+        for at, nd in ((0, a), (-1, b)):
+            if deg[nd] == 1 and (k, at) not in on_map:
+                hg = has_ground(pts_xy[k][at])
+                end_ground[(k, at)] = hg
+                if hg:
+                    anchored_comps.add(find(nd))
+    if not anchored_comps:
+        return frozenset()
+    changed = True
+    while changed:
+        changed = False
+        for (k_on, _at_on), j_on in on_map.items():
+            if 0 <= k_on < len(edges) and 0 <= j_on < len(edges):
+                ck, cj = find(edges[k_on][0]), find(edges[j_on][0])
+                if cj in anchored_comps and ck not in anchored_comps:
+                    anchored_comps.add(ck)
+                    changed = True
+    free = set()
+    for (k0, at0), hg in end_ground.items():
+        if hg:
+            continue
+        cur_k, cur_at = k0, at0
+        seen = {k0}
+        while True:
+            other_at = -1 if cur_at == 0 else 0
+            if (cur_k, other_at) in on_map:
+                j_tgt = on_map[(cur_k, other_at)]
+                if 0 <= j_tgt < len(edges) and find(edges[j_tgt][0]) in anchored_comps:
+                    free.add((k0, at0))
+                break
+            other_nd = edges[cur_k][1 if other_at == -1 else 0]
+            if deg[other_nd] >= 3:
+                if find(other_nd) in anchored_comps:
+                    free.add((k0, at0))
+                break
+            if deg[other_nd] != 2:
+                break
+            nxt = [(k2, at2) for k2, at2 in inc[other_nd] if k2 != cur_k]
+            if len(nxt) != 1 or nxt[0][0] in seen:
+                break
+            cur_k, cur_at = nxt[0]
+            seen.add(cur_k)
+    return frozenset(free)
+
+
+def _merge_overlaps(lines, zs, widths, levels, rounds=3, pins=None, free_ends=()):
     """Heights of decks lying over each other (a ramp leaving the mainline, parallel carriageways of
     one level) pulled to their mean where their surfaces overlap, so a split is one surface until the
     decks part (2026-10-11 the user: exits and splits not clean). Parts are related when they share an
     end node or a level and run within ~30 degrees of each other. Abutment ends stay (pins: deck_profile's). Pure."""
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
     nodes, edges, adj = _chain_graph(lines)
     deg = np.zeros(len(nodes), int)
     for a, b, _ in edges:
@@ -5028,8 +5995,8 @@ def _merge_overlaps(lines, zs, widths, levels, rounds=3, pins=None):
     # the joint of a 48 m part ending on the ground, 40 %)
     reach = [np.full(len(z), np.inf) for z in zs]
     for k0, (a0, b0, _s) in enumerate(edges[:n]):
-        for node, zend in ((a0, floors[k0][0]), (b0, floors[k0][-1])):
-            if deg[node] != 1 or not np.isfinite(zend):
+        for at0, node, zend in ((0, a0, floors[k0][0]), (-1, b0, floors[k0][-1])):
+            if deg[node] != 1 or (k0, at0) in free_set or not np.isfinite(zend):
                 continue
             d = _dijkstra(adj, {node: 0.0})
             for k, (ea, eb, es) in enumerate(edges[:n]):
@@ -5060,18 +6027,18 @@ def _merge_overlaps(lines, zs, widths, levels, rounds=3, pins=None):
             rise = np.full(len(es), np.inf)
             to_joint = np.full(len(es), np.inf)
             for end, d, at in ((a, es, 0), (b, es[-1] - es, -1)):
-                if deg[end] == 1:
+                if deg[end] == 1 and (i, at) not in free_set:
                     rise = np.minimum(rise, floors[i][at] + DECK_MAX_GRADE * d)
-                else:
+                elif deg[end] != 1:
                     to_joint = np.minimum(to_joint, d)
             capped = np.minimum(new[i], np.maximum(floors[i], rise))     # (from the unmerged heights: no creep per round)
             if np.isfinite(to_joint).any() and np.isfinite(rise).any():
                 w = np.clip(to_joint / max(float(es[-1]), 1e-6), 0.0, 1.0)
                 capped = w * capped + (1.0 - w) * new[i]
             new[i] = np.minimum(capped, np.maximum(reach[i], floors[i]))
-            if deg[a] == 1:
+            if deg[a] == 1 and (i, 0) not in free_set:
                 new[i][0] = zs[i][0]
-            if deg[b] == 1:
+            if deg[b] == 1 and (i, -1) not in free_set:
                 new[i][-1] = zs[i][-1]
         zs = new
     out = []
@@ -5086,21 +6053,25 @@ DUAL_DECK_M = 30.0      # m: parts of one level parallel within this are one dec
 
 
 def deck_profile(lines, ground_fn, crossings=(), clear=None, grade=None, lift=None, levels=None, widths=None, pins=None,
-                 ground_roads=None):
+                 ground_roads=None, end_ons=None, max_grade=None):
     """deck_profile_once, then repeated with the deck-over-deck requirements: where two parts of
     different levels cross, the higher one clears the lower one's deck by `clear` (2026-10-11: crossing
     decks clipped into each other). pins: points where a ground road goes on from a joint of decks (abutments too: _pin).
     Pure given ground_fn."""
     clear_m = DECK_ROAD_CLEAR if clear is None else float(clear)
+    free_ends = _free_deck_ends(lines, ground_roads, pins=pins, end_ons=end_ons)
+    on_ends = {(int(k), 0 if int(at) == 0 else -1) for k, at, _j, _arc in (end_ons or ())}
     eff = levels
     if levels is not None and widths is not None and len(lines) >= 2:
         eff = _normalize_stack_levels(lines, levels, widths, pins)
-    zs = deck_profile_once(lines, ground_fn, crossings, clear, grade, lift, pins=pins)
+    zs = deck_profile_once(lines, ground_fn, crossings, clear, grade, lift, pins=pins,
+                           free_ends=free_ends, on_ends=on_ends, max_grade=max_grade)
 
     def finish(got):
-        got = _bridge_span(lines, got, pins=pins, ground_roads=ground_roads)
+        got = _bridge_span(lines, got, pins=pins, ground_roads=ground_roads, free_ends=free_ends)
         if eff is not None and widths is not None and len(lines) >= 2:
-            got = _hold_stack_sep(lines, got, eff, widths, clear_m, ground_fn, pins, ground_roads=ground_roads)
+            got = _hold_stack_sep(lines, got, eff, widths, clear_m, ground_fn, pins,
+                                  ground_roads=ground_roads, end_ons=end_ons, free_ends=free_ends)
         return got
 
     n_road = len(crossings)
@@ -5109,7 +6080,7 @@ def deck_profile(lines, ground_fn, crossings=(), clear=None, grade=None, lift=No
     over = _deck_crossings(lines)
     stacks = _deck_stacks(lines, eff, widths, pins=pins) if widths is not None else []
     if not over and not stacks:
-        zs = _merge_overlaps(lines, zs, widths, levels, pins=pins) if widths is not None else zs
+        zs = _merge_overlaps(lines, zs, widths, levels, pins=pins, free_ends=free_ends) if widths is not None else zs
         if bridge_profile_mode() == "curve":
             zs = _ease(lines, zs, ground_fn, lift)
         return finish(zs)
@@ -5129,12 +6100,12 @@ def deck_profile(lines, ground_fn, crossings=(), clear=None, grade=None, lift=No
         if not extra:
             break
         new = deck_profile_once(lines, ground_fn, list(crossings) + extra, clear, grade, lift, n_road=n_road,
-                                levels=eff, pins=pins)
+                                levels=eff, pins=pins, free_ends=free_ends, on_ends=on_ends, max_grade=max_grade)
         if all(np.allclose(a, b, atol=0.02, equal_nan=True) for a, b in zip(new, zs)):
             zs = new
             break
         zs = new
-    zs = _merge_overlaps(lines, zs, widths, levels, pins=pins) if widths is not None else zs
+    zs = _merge_overlaps(lines, zs, widths, levels, pins=pins, free_ends=free_ends) if widths is not None else zs
     if bridge_profile_mode() == "curve":
         zs = _ease(lines, zs, ground_fn, lift)
     return finish(zs)
@@ -5245,7 +6216,106 @@ def _stamp_bound(z, s, at, value, higher, cap=None):
     return moved
 
 
-def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None, ground_roads=None):
+def _dag_stacks(stacks, edges, base, eff_lv, c0_comp=None):
+    """Break directed 2-cycles, k-cycles and C0-component cycles in stack constraints so _hold_stack_sep is a DAG."""
+    if not stacks:
+        return []
+    by_pair = {}
+    for hi, sh, lo, sl in stacks:
+        if hi == lo:
+            continue
+        by_pair.setdefault((min(hi, lo), max(hi, lo)), []).append((hi, float(sh), lo, float(sl)))
+    dir_rows = {}
+    for (u, v), rows in by_pair.items():
+        uv = [r for r in rows if r[0] == u]
+        vu = [r for r in rows if r[0] == v]
+        if uv and vu:
+            dlv = float(eff_lv[u]) - float(eff_lv[v])
+            if abs(dlv) >= 0.5:
+                keep_uv = dlv > 0.0
+            else:
+                dzu = float(np.median([float(np.interp(r[1], edges[u][2], base[u]))
+                                       - float(np.interp(r[3], edges[v][2], base[v])) for r in uv]))
+                dzv = float(np.median([float(np.interp(r[1], edges[v][2], base[v]))
+                                       - float(np.interp(r[3], edges[u][2], base[u])) for r in vu]))
+                keep_uv = (len(uv), round(dzu, 3)) >= (len(vu), round(dzv, 3))
+            chosen = uv if keep_uv else vu
+        else:
+            chosen = uv or vu
+        dir_rows[(chosen[0][0], chosen[0][2])] = chosen
+
+    def edge_weight(pair):
+        hi, lo = pair
+        rows = dir_rows[pair]
+        dlv = float(eff_lv[hi]) - float(eff_lv[lo])
+        tier = 1 if dlv > 0.25 else (0 if dlv >= -0.25 else -1)
+        dz = float(np.median([float(np.interp(r[1], edges[hi][2], base[hi]))
+                              - float(np.interp(r[3], edges[lo][2], base[lo])) for r in rows]))
+        return (tier, round(dlv, 3), round(dz, 3), len(rows), -hi, -lo)
+
+    def find_cycle(adj_map):
+        color = {}
+        parent = {}
+        for start in sorted(adj_map):
+            if color.get(start, 0) != 0:
+                continue
+            stack = [(start, iter(sorted(adj_map.get(start, ()))))]
+            color[start] = 1
+            while stack:
+                u, it = stack[-1]
+                for v in it:
+                    st = color.get(v, 0)
+                    if st == 1:
+                        cyc = [(u, v)]
+                        cur = u
+                        while cur != v:
+                            prev = parent[cur]
+                            cyc.append((prev, cur))
+                            cur = prev
+                        return cyc
+                    if st == 0:
+                        parent[v] = u
+                        color[v] = 1
+                        stack.append((v, iter(sorted(adj_map.get(v, ())))))
+                        break
+                else:
+                    color[u] = 2
+                    stack.pop()
+        return None
+
+    active = set(dir_rows)
+    while True:
+        adj_p = {}
+        for hi, lo in active:
+            adj_p.setdefault(hi, set()).add(lo)
+        cyc = find_cycle(adj_p)
+        if cyc is None:
+            break
+        active.remove(min(cyc, key=edge_weight))
+
+    if c0_comp is not None:
+        while True:
+            sup_edges = {}
+            adj_s = {}
+            for hi, lo in active:
+                ch, cl = c0_comp[hi], c0_comp[lo]
+                if ch == cl:
+                    continue
+                adj_s.setdefault(ch, set()).add(cl)
+                sup_edges.setdefault((ch, cl), []).append((hi, lo))
+            cyc_s = find_cycle(adj_s)
+            if cyc_s is None:
+                break
+            cands = [pair for se in cyc_s for pair in sup_edges.get(se, ())]
+            if not cands:
+                break
+            active.remove(min(cands, key=edge_weight))
+
+    return [r for pair, rows in dir_rows.items() if pair in active for r in rows]
+
+
+def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None, ground_roads=None, end_ons=None,
+                    free_ends=()):
     """After the grade, the ease and the span envelope: z_hi - z_lo stays at least `clear` on every stacked
     station. The upper deck rises until its abutment grade cap; the rest comes off the lower deck, not below
     the ground. Free ends stay where the solver left them, unless an upper deck ends over a lower deck with
@@ -5263,11 +6333,74 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
         deg[b] += 1
     deg = _pin(nodes, deg, pins)
     eff_lv = _normalize_stack_levels(lines, levels, widths, pins)
-    stacks = _deck_stacks(lines, eff_lv, widths, step=2.0, pins=pins)
     pts_xy = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
-    for i in range(len(lines)):
-        for j in range(i + 1, len(lines)):
-            if len(pts_xy[i]) < 2 or len(pts_xy[j]) < 2:
+    n_parts = len(lines)
+    inc_by_node = {}
+    for k, (a, b, s) in enumerate(edges):
+        if len(pts_xy[k]) < 2 or len(zs[k]) < 2 or float(s[-1]) <= 0.0:
+            continue
+        u0 = pts_xy[k][1] - pts_xy[k][0]
+        u0 = u0 / max(float(np.hypot(*u0)), 1e-9)
+        u1 = pts_xy[k][-2] - pts_xy[k][-1]
+        u1 = u1 / max(float(np.hypot(*u1)), 1e-9)
+        inc_by_node.setdefault(a, []).append((k, 0, u0))
+        inc_by_node.setdefault(b, []).append((k, -1, u1))
+    c0_node_items = [
+        (nd, inc) for nd, inc in inc_by_node.items()
+        if deg[nd] >= 2 and len(inc) >= 2 and not any(
+            float(ua @ ub) > 0.2 and abs(float(eff_lv[ka]) - float(eff_lv[kb])) >= 0.5
+            for ia, (ka, _ea, ua) in enumerate(inc) for kb, _eb, ub in inc[ia + 1:]
+        )
+    ]
+    c0_nodes = [inc for _nd, inc in c0_node_items]
+    c0_node_set = {nd for nd, _inc in c0_node_items}
+    c0_adj = [[] for _ in nodes]
+    c0_parent = list(range(n_parts))
+
+    def c0_find(u):
+        while c0_parent[u] != u:
+            c0_parent[u] = c0_parent[c0_parent[u]]
+            u = c0_parent[u]
+        return u
+
+    for _nd, inc in c0_node_items:
+        k0 = inc[0][0]
+        for k2, _ek2, _u2 in inc[1:]:
+            c0_parent[c0_find(k0)] = c0_find(k2)
+    c0_comp = [c0_find(k) for k in range(n_parts)]
+    for a, b, s in edges:
+        if a in c0_node_set and b in c0_node_set:
+            Lk = float(s[-1])
+            c0_adj[a].append((b, Lk))
+            c0_adj[b].append((a, Lk))
+    c0_dists = {nd: _dijkstra(c0_adj, {nd: 0.0}) for nd in c0_node_set}
+
+    def _near_c0_fork(hi, sh, lo, sl):
+        if c0_comp[hi] != c0_comp[lo] or not c0_dists:
+            return False
+        ah, bh, s_h = edges[hi]
+        al, bl, s_l = edges[lo]
+        Lh, Ll = float(s_h[-1]), float(s_l[-1])
+        for d_w in c0_dists.values():
+            dh = min(d_w[ah] + sh, d_w[bh] + (Lh - sh))
+            dl = min(d_w[al] + sl, d_w[bl] + (Ll - sl))
+            if max(dh, dl) * DECK_GRADE < DECK_ROAD_CLEAR:
+                return True
+        return False
+
+    stacks = _deck_stacks(lines, eff_lv, widths, step=2.0, pins=pins)
+    for i in range(n_parts):
+        if len(pts_xy[i]) < 2:
+            continue
+        si_arr = edges[i][2]
+        Li = float(si_arr[-1])
+        if Li <= 0.0:
+            continue
+        st_i = np.unique(np.r_[np.arange(0.0, Li, 2.0), Li])
+        qi = np.column_stack([np.interp(st_i, si_arr, pts_xy[i][:, 0]),
+                              np.interp(st_i, si_arr, pts_xy[i][:, 1])])
+        for j in range(n_parts):
+            if i == j or len(pts_xy[j]) < 2:
                 continue
             reach_ij = 0.5 * (float(widths[i]) + float(widths[j])) - 0.30
             if reach_ij <= 0.0:
@@ -5276,45 +6409,54 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
             lo_j, hi_j = pts_xy[j].min(0), pts_xy[j].max(0)
             if hi_i[0] < lo_j[0] or lo_i[0] > hi_j[0] or hi_i[1] < lo_j[1] or lo_i[1] > hi_j[1]:
                 continue
-            si_arr, sj_arr = edges[i][2], edges[j][2]
-            Li, Lj = float(si_arr[-1]), float(sj_arr[-1])
-            if Li <= 0.0 or Lj <= 0.0:
+            sj_arr = edges[j][2]
+            Lj = float(sj_arr[-1])
+            if Lj <= 0.0:
                 continue
-            ai, bi = edges[i][0], edges[i][1]
-            aj, bj = edges[j][0], edges[j][1]
             shared_ij = [(ei, ej) for ei in (0, -1) for ej in (0, -1)
                          if np.hypot(*(pts_xy[i][ei] - pts_xy[j][ej])) < 0.5]
-            st_i = np.unique(np.r_[np.arange(0.0, Li, 4.0), Li])
-            qi = np.column_stack([np.interp(st_i, si_arr, pts_xy[i][:, 0]),
-                                  np.interp(st_i, si_arr, pts_xy[i][:, 1])])
             Pj, abj = pts_xy[j][:-1], np.diff(pts_xy[j], axis=0)
             L2j = np.maximum((abj * abj).sum(1), 1e-12)
+            abi = np.diff(pts_xy[i], axis=0)
+            par_reach_ij = _stack_reach(widths[i], widths[j])
+            same_lv_ij = abs(float(eff_lv[i]) - float(eff_lv[j])) < 0.5
+            cand_ij = []
+            kiss_min_dz = np.inf
+            par_min_dz = np.inf
             for m_q, sh_q in enumerate(st_i):
                 sh_f = float(sh_q)
-                if (deg[ai] == 1 and sh_f <= 20.0) or (deg[bi] == 1 and Li - sh_f <= 20.0):
-                    continue
                 t_j = np.clip(((qi[m_q] - Pj) * abj).sum(1) / L2j, 0.0, 1.0)
                 d_j = np.hypot(*(Pj + t_j[:, None] * abj - qi[m_q]).T)
                 mj = int(np.argmin(d_j))
-                if float(d_j[mj]) >= reach_ij:
+                dist_ij = float(d_j[mj])
+                if dist_ij >= reach_ij:
                     continue
+                ki = min(max(int(np.searchsorted(si_arr, sh_f, side="right")) - 1, 0), len(abi) - 1)
+                ti = abi[ki] / max(float(np.hypot(abi[ki, 0], abi[ki, 1])), 1e-9)
+                tj = abj[mj] / max(float(math.sqrt(L2j[mj])), 1e-9)
+                is_par = abs(float(ti @ tj)) >= 0.80
                 sl_q = float(sj_arr[mj] + t_j[mj] * (sj_arr[mj + 1] - sj_arr[mj]))
-                if (deg[aj] == 1 and sl_q <= 20.0) or (deg[bj] == 1 and Lj - sl_q <= 20.0):
-                    continue
                 zi_q = float(np.interp(sh_f, si_arr, base[i]))
                 zj_q = float(np.interp(sl_q, sj_arr, base[j]))
-                if eff_lv[i] == eff_lv[j]:
-                    if abs(zi_q - zj_q) < DECK_FULL_DEPTH:
-                        continue
-                    hi_k, sh_k, lo_k, sl_k = (i, sh_f, j, sl_q) if zi_q > zj_q else (j, sl_q, i, sh_f)
-                else:
-                    hi_k, sh_k, lo_k, sl_k = (i, sh_f, j, sl_q) if eff_lv[i] > eff_lv[j] else (j, sl_q, i, sh_f)
-                    z_hi_q, z_lo_q = (zi_q, zj_q) if hi_k == i else (zj_q, zi_q)
-                    if z_hi_q - z_lo_q < DECK_FULL_DEPTH:
-                        continue
+                dz_abs = abs(zi_q - zj_q)
+                if is_par:
+                    par_min_dz = min(par_min_dz, dz_abs)
+                    if dist_ij >= par_reach_ij:
+                        if same_lv_ij:
+                            continue
+                        kiss_min_dz = min(kiss_min_dz, dz_abs)
+                if dz_abs < DECK_FULL_DEPTH:
+                    continue
+                hi_k, sh_k, lo_k, sl_k = (i, sh_f, j, sl_q) if zi_q > zj_q else (j, sl_q, i, sh_f)
                 L_hk = Li if hi_k == i else Lj
                 sh_ends = [ei if hi_k == i else ej for ei, ej in shared_ij]
                 if any((sh_k if eh == 0 else L_hk - sh_k) * DECK_GRADE < DECK_ROAD_CLEAR for eh in sh_ends):
+                    continue
+                cand_ij.append((hi_k, sh_k, lo_k, sl_k, is_par, dist_ij >= par_reach_ij))
+            for hi_k, sh_k, lo_k, sl_k, is_par_k, in_kiss in cand_ij:
+                if in_kiss and kiss_min_dz < DECK_FULL_DEPTH:
+                    continue
+                if is_par_k and same_lv_ij and par_min_dz < 4.5:
                     continue
                 stacks.append((hi_k, sh_k, lo_k, sl_k))
     for i, j, si, sj in _deck_crossings(lines):
@@ -5348,9 +6490,33 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
                         break
                     sl_q = float(s_lo_arr[m_lo] + t_lo[m_lo] * (s_lo_arr[m_lo + 1] - s_lo_arr[m_lo]))
                     stacks.append((hi, float(sh_q), lo, sl_q))
+    end_on_ends = {(int(k), 0 if int(at) == 0 else -1) for k, at, _j, _arc in (end_ons or ())}
+    free_end_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
+    if stacks:
+        norm_stacks = []
+        for hi, sh, lo, sl in stacks:
+            skip_on = False
+            for k_on, at_on, j_on, arc_on in (end_ons or ()):
+                Lk = float(edges[k_on][2][-1])
+                s_end = 0.0 if at_on == 0 else Lk
+                if hi == k_on and lo == j_on and abs(sh - s_end) <= 25.0 and abs(sl - float(arc_on)) <= 25.0:
+                    skip_on = True
+                    break
+                if lo == k_on and hi == j_on and abs(sl - s_end) <= 25.0 and abs(sh - float(arc_on)) <= 25.0:
+                    skip_on = True
+                    break
+            if skip_on or _near_c0_fork(hi, float(sh), lo, float(sl)):
+                continue
+            z_hi0 = float(np.interp(sh, edges[hi][2], base[hi]))
+            z_lo0 = float(np.interp(sl, edges[lo][2], base[lo]))
+            if z_lo0 - z_hi0 >= DECK_FULL_DEPTH:
+                norm_stacks.append((lo, sl, hi, sh))
+            else:
+                norm_stacks.append((hi, sh, lo, sl))
+        stacks = _dag_stacks(norm_stacks, edges, base, eff_lv, c0_comp=c0_comp)
     if not stacks:
         return zs
-    unpinned_hi = set()
+    unpinned_hi = set(end_on_ends) | set(free_end_set)
     if ground_roads is not None:
         g_segs = []
         for g in ground_roads:
@@ -5374,36 +6540,41 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
                 unpinned_hi.add((hi, 0))
             if L_hi - sh <= 25.0 and deg[b_hi] == 1 and not _has_ground_road(pts_xy[hi][-1]):
                 unpinned_hi.add((hi, -1))
-    caps, floors = [], []
+    caps, floors, g_caps = [], [], []
     for k, (z, (a, b, s), ln) in enumerate(zip(base, edges, lines)):
+        Lk = float(s[-1]) if len(s) else 0.0
+        gk = DECK_STEEP_GRADE if (Lk > 1.0 and abs(float(z[-1]) - float(z[0])) > DECK_MAX_GRADE * Lk) else DECK_MAX_GRADE
+        g_caps.append(gk)
         cap = np.full(len(z), np.inf)
         if deg[a] == 1 and (k, 0) not in unpinned_hi:
-            cap = np.minimum(cap, float(z[0]) + DECK_MAX_GRADE * s)
+            cap = np.minimum(cap, float(z[0]) + gk * s)
         if deg[b] == 1 and (k, -1) not in unpinned_hi:
-            cap = np.minimum(cap, float(z[-1]) + DECK_MAX_GRADE * (float(s[-1]) - s))
+            cap = np.minimum(cap, float(z[-1]) + gk * (Lk - s))
         caps.append(cap)
         xy = np.asarray(ln, np.float64)[:, :2]
         if ground_fn is None or len(xy) != len(z):
             floors.append(np.full(len(z), -np.inf))
         else:
             floors.append(np.asarray(ground_fn(xy), np.float64) + DECK_CLEAR)
-    inc_by_node = {}
-    for k, (a, b, s) in enumerate(edges):
-        if len(pts_xy[k]) < 2 or len(zs[k]) < 2 or float(s[-1]) <= 0.0:
-            continue
-        u0 = pts_xy[k][1] - pts_xy[k][0]
-        u0 = u0 / max(float(np.hypot(*u0)), 1e-9)
-        u1 = pts_xy[k][-2] - pts_xy[k][-1]
-        u1 = u1 / max(float(np.hypot(*u1)), 1e-9)
-        inc_by_node.setdefault(a, []).append((k, 0, u0))
-        inc_by_node.setdefault(b, []).append((k, -1, u1))
-    c0_nodes = [
-        inc for nd, inc in inc_by_node.items()
-        if deg[nd] >= 2 and len(inc) >= 2 and not any(
-            float(ua @ ub) > 0.2 and abs(float(eff_lv[ka]) - float(eff_lv[kb])) >= 0.5
-            for ia, (ka, _ea, ua) in enumerate(inc) for kb, _eb, ub in inc[ia + 1:]
-        )
-    ]
+    if c0_dists:
+        for k0, (z0_arr, (a0, b0, s0)) in enumerate(zip(base, edges)):
+            L0 = float(s0[-1]) if len(s0) else 0.0
+            if L0 <= 0.0 or not len(z0_arr):
+                continue
+            for at0, nd_ab, nd_in, z_ab in ((0, a0, b0, float(z0_arr[0])), (-1, b0, a0, float(z0_arr[-1]))):
+                if deg[nd_ab] != 1 or (k0, at0) in unpinned_hi or nd_in not in c0_node_set or not np.isfinite(z_ab):
+                    continue
+                d_in = c0_dists[nd_in]
+                for k, (ea, eb, s) in enumerate(edges):
+                    if k == k0 or c0_comp[k] != c0_comp[k0]:
+                        continue
+                    Lk = float(s[-1])
+                    dk = np.minimum(L0 + d_in[ea] + s, L0 + d_in[eb] + (Lk - s))
+                    if np.isfinite(dk).any():
+                        caps[k] = np.minimum(caps[k], z_ab + max(g_caps[k0], g_caps[k]) * dk)
+    unpinned_dn = set(end_on_ends) | set(free_end_set)
+    lo_parts = {lo for _hi, _sh, lo, _sl in stacks}
+    hi_parts = {hi for hi, _sh, _lo, _sl in stacks}
     for _round in range(6):
         req_up = [np.zeros(len(z), np.float64) for z in zs]
         req_dn = [np.zeros(len(z), np.float64) for z in zs]
@@ -5419,15 +6590,43 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
             rise, drop = min(deficit, room), deficit - min(deficit, room)
             if rise > 1e-6:
                 j = int(np.searchsorted(shi, sh))
-                for i in (max(j - 1, 0), min(j, len(zs[hi]) - 1)):
-                    tgt = min(float(zs[hi][i]) + rise, float(caps[hi][i]))
+                i0, i1 = max(j - 1, 0), min(j, len(zs[hi]) - 1)
+                if i0 < i1:
+                    if hi in lo_parts:
+                        r0 = r1 = rise
+                    else:
+                        slen = max(float(shi[i1] - shi[i0]), 1e-6)
+                        u = float(np.clip((sh - float(shi[i0])) / slen, 0.0, 1.0))
+                        d0_up = min(rise, max(0.0, float(caps[hi][i0]) - float(zs[hi][i0])))
+                        d1_up = min(rise, max(0.0, float(caps[hi][i1]) - float(zs[hi][i1])))
+                        r0 = rise if u < 1e-3 else max(rise, (rise - u * d1_up) / max(1.0 - u, 0.15))
+                        r1 = rise if (1.0 - u) < 1e-3 else max(rise, (rise - (1.0 - u) * d0_up) / max(u, 0.15))
+                    up_pairs = ((i0, r0), (i1, r1))
+                else:
+                    up_pairs = ((i0, rise),)
+                for i, r_i in up_pairs:
+                    tgt = min(float(zs[hi][i]) + r_i, float(caps[hi][i]))
                     if tgt > zs[hi][i] + 1e-6:
                         req_up[hi][i] = max(req_up[hi][i], tgt - zs[hi][i])
                         any_req = True
             if drop > 1e-6:
                 j = int(np.searchsorted(slo, sl))
-                for i in (max(j - 1, 0), min(j, len(zs[lo]) - 1)):
-                    tgt = max(float(zs[lo][i]) - drop, float(floors[lo][i]))
+                i0, i1 = max(j - 1, 0), min(j, len(zs[lo]) - 1)
+                if i0 < i1:
+                    if lo in hi_parts:
+                        dn0 = dn1 = drop
+                    else:
+                        slen = max(float(slo[i1] - slo[i0]), 1e-6)
+                        u = float(np.clip((sl - float(slo[i0])) / slen, 0.0, 1.0))
+                        d0_dn = min(drop, max(0.0, float(zs[lo][i0]) - float(floors[lo][i0])))
+                        d1_dn = min(drop, max(0.0, float(zs[lo][i1]) - float(floors[lo][i1])))
+                        dn0 = drop if u < 1e-3 else max(drop, (drop - u * d1_dn) / max(1.0 - u, 0.15))
+                        dn1 = drop if (1.0 - u) < 1e-3 else max(drop, (drop - (1.0 - u) * d0_dn) / max(u, 0.15))
+                    dn_pairs = ((i0, dn0), (i1, dn1))
+                else:
+                    dn_pairs = ((i0, drop),)
+                for i, dn_i in dn_pairs:
+                    tgt = max(float(zs[lo][i]) - dn_i, float(floors[lo][i]))
                     if tgt < zs[lo][i] - 1e-6:
                         req_dn[lo][i] = max(req_dn[lo][i], zs[lo][i] - tgt)
                         any_req = True
@@ -5441,23 +6640,25 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
         for k, (z, (a, b, s)) in enumerate(zip(zs, edges)):
             if len(z) < 2 or float(s[-1]) <= 0.0:
                 continue
+            gk = g_caps[k]
             if req_up[k].max() > 1e-6:
-                up = _tents(s, np.where(req_up[k] > 0.0, req_up[k], -np.inf), DECK_MAX_GRADE)
+                up = _tents(s, np.where(req_up[k] > 0.0, req_up[k], -np.inf), gk)
                 up = np.maximum(up, 0.0)
                 if deg[a] == 1 and (k, 0) not in unpinned_hi:
-                    up = np.minimum(up, DECK_MAX_GRADE * s)
+                    up = np.minimum(up, gk * s)
                 if deg[b] == 1 and (k, -1) not in unpinned_hi:
-                    up = np.minimum(up, DECK_MAX_GRADE * (float(s[-1]) - s))
+                    up = np.minimum(up, gk * (float(s[-1]) - s))
                 nz = np.minimum(z + up, np.maximum(caps[k], base[k]))
                 if np.abs(nz - z).max() > 1e-6:
                     z[:] = nz
                     moved = True
             if req_dn[k].max() > 1e-6:
                 dn = _tents(s, np.where(req_dn[k] > 0.0, req_dn[k], -np.inf), DECK_MAX_GRADE)
+                dn = np.minimum(dn, np.inf)
                 dn = np.maximum(dn, 0.0)
-                if deg[a] == 1:
+                if deg[a] == 1 and (k, 0) not in unpinned_dn:
                     dn = np.minimum(dn, DECK_MAX_GRADE * s)
-                if deg[b] == 1:
+                if deg[b] == 1 and (k, -1) not in unpinned_dn:
                     dn = np.minimum(dn, DECK_MAX_GRADE * (float(s[-1]) - s))
                 nz = np.maximum(z - dn, floors[k])
                 if np.abs(nz - z).max() > 1e-6:
@@ -5475,6 +6676,8 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
                 z_joint = max(z_ends)
             else:
                 z_joint = float(np.mean(z_ends))
+            z_cap_j = min(max(float(caps[k][ek]), float(base[k][ek])) for k, ek, _u in inc)
+            z_joint = min(z_joint, z_cap_j)
             for k, ek, _u in inc:
                 dz_e = z_joint - float(zs[k][ek])
                 if abs(dz_e) <= 1e-4:
@@ -5488,7 +6691,7 @@ def _hold_stack_sep(lines, zs, levels, widths, clear, ground_fn=None, pins=None,
                 if far_pinned:
                     run_m = min(run_m, L_k)
                 w_j = np.clip(1.0 - d_nd / max(run_m, 1e-6), 0.0, 1.0)
-                nz_k = np.maximum(zs[k] + dz_e * w_j, floors[k])
+                nz_k = np.minimum(np.maximum(zs[k] + dz_e * w_j, floors[k]), np.maximum(caps[k], base[k]))
                 if far_pinned:
                     nz_k[-1 if ek == 0 else 0] = base[k][-1 if ek == 0 else 0]
                 if np.abs(nz_k - zs[k]).max() > 1e-6:
@@ -5583,6 +6786,53 @@ def _deck_beside(lines, widths, step=STACK_STEP_M):
     return [(int(a), int(b)) for a, b in pairs]
 
 
+def _deck_overlap_pairs(lines, widths, step=4.0):
+    """(i, j), i < j: deck parts whose slabs come within MERGE_TOUCH_M at any 4 m sample (short skew crossings and
+    perpendicular ends stopping just short of an overpass centreline that 2-sample _deck_beside skips). Pure."""
+    n = len(lines)
+    if n < 2 or widths is None or len(widths) < n:
+        return []
+    pts = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
+    lo_b = [p.min(0) if len(p) >= 2 else None for p in pts]
+    hi_b = [p.max(0) if len(p) >= 2 else None for p in pts]
+    qs = []
+    for p in pts:
+        if len(p) < 2:
+            qs.append(None)
+            continue
+        si = np.r_[0.0, np.cumsum(np.hypot(*np.diff(p, axis=0).T))]
+        if si[-1] <= 0.0:
+            qs.append(p[:1])
+            continue
+        t = np.unique(np.r_[np.arange(0.0, si[-1], step), si[-1]])
+        qs.append(np.c_[np.interp(t, si, p[:, 0]), np.interp(t, si, p[:, 1])])
+
+    def _touches(qa, pb, reach):
+        P, ab = pb[:-1], np.diff(pb, axis=0)
+        L2 = np.maximum((ab * ab).sum(1), 1e-12)
+        u = np.clip(((qa[:, None, :] - P[None]) * ab[None]).sum(2) / L2[None], 0.0, 1.0)
+        near = P[None] + u[..., None] * ab[None]
+        return bool((np.hypot(*(qa[:, None, :] - near).transpose(2, 0, 1)).min() < reach))
+
+    out = []
+    for i in range(n):
+        if qs[i] is None:
+            continue
+        for j in range(i + 1, n):
+            if qs[j] is None:
+                continue
+            if any(np.hypot(*(pts[i][ei] - pts[j][ej])) < 0.5 for ei in (0, -1) for ej in (0, -1)):
+                continue
+            reach = 0.5 * (float(widths[i]) + float(widths[j])) + float(MERGE_TOUCH_M)
+            if reach <= 0.0:
+                continue
+            if (hi_b[i] + reach < lo_b[j]).any() or (hi_b[j] + reach < lo_b[i]).any():
+                continue
+            if _touches(qs[i], pts[j], reach) or _touches(qs[j], pts[i], reach):
+                out.append((i, j))
+    return out
+
+
 def water_clear(w):
     """m a deck clears the water under it for a wet run w m long: a share of the span (a river's channel wants a
     ship's room: the Queensboro Bridge's ~40 m over 250 m channels), at least WATER_CLEAR_MIN; a run longer than
@@ -5628,16 +6878,19 @@ def _curve_grade(lines, zs):
     return g
 
 
-def _end_step(lines, zs):
+def _end_step(lines, zs, free_ends=()):
     """The steepest grade of a deck's first or last segment at a free end (an abutment: no other part ends within
     0.75 m), where a curve that cannot meet its end leaves a step. Pure."""
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
     ends = [np.asarray(ln, np.float64)[k, :2] for ln in lines for k in (0, -1)]
     g = 0.0
-    for ln, z in zip(lines, zs):
+    for idx, (ln, z) in enumerate(zip(lines, zs)):
         ln = np.asarray(ln, np.float64)
         if len(ln) < 2:
             continue
         for a, b in ((0, 1), (-1, -2)):
+            if (idx, 0 if a == 0 else -1) in free_set:
+                continue
             if sum(np.hypot(*(e - ln[a, :2])) < 0.75 for e in ends) > 1:
                 continue
             run = max(float(np.hypot(*(ln[b, :2] - ln[a, :2]))), 0.5)
@@ -5645,15 +6898,30 @@ def _end_step(lines, zs):
     return g
 
 
+def _crossing_meta(cr, default_clear):
+    """Unpack crossing tuple (part, arc, z[, own_clear[, min_lv[, extra]]]): (pi, sc, zc, own, cl, min_lv, back_r, fwd_r, grade_sep)."""
+    pi, sc, zc = cr[:3]
+    own = len(cr) > 3 and cr[3] is not None
+    cl = cr[3] if own else default_clear
+    min_lv = cr[4] if len(cr) > 4 else None
+    extra = cr[5] if len(cr) > 5 and isinstance(cr[5], dict) else None
+    base_reach = 0.0 if own else DECK_CLEAR_REACH_M
+    back_r = float(extra["back"]) if extra and "back" in extra else base_reach
+    fwd_r = float(extra["fwd"]) if extra and "fwd" in extra else base_reach
+    grade_sep = bool(extra.get("grade_sep")) if extra else own
+    return pi, sc, zc, own, cl, min_lv, back_r, fwd_r, grade_sep
+
+
 def _curve_crossings(crossings, n_road=None, levels=None):
-    """deck_profile_once's crossings for deck_curve: (part, arc, height under it, its clearance or None). A
-    deck-over-deck requirement holds on the upper part itself (deck_curve applies a requirement where it is, not
+    """deck_profile_once's crossings for deck_curve: (part, arc, height under it, its clearance or None[, None, extra]).
+    A deck-over-deck requirement holds on the upper part itself (deck_curve applies a requirement where it is, not
     falling along the chain, so it never reaches the lower deck). Pure."""
-    return [(cr[0], cr[1], cr[2], cr[3] if len(cr) > 3 else None) for cr in crossings]
+    return [(cr[0], cr[1], cr[2], cr[3] if len(cr) > 3 else None)
+            + ((None, cr[5]) if len(cr) > 5 else ()) for cr in crossings]
 
 
 def deck_profile_once(lines, ground_fn, crossings=(), clear=None, grade=None, lift=None, n_road=None, levels=None,
-                      pins=None, curve=True):
+                      pins=None, curve=True, free_ends=(), on_ends=(), max_grade=None):
     """Deck heights (one array per part) of a bridge chain: deck_heights between the abutments, at
     least `lift` over the ground under it, and at least `clear` over each crossing road below
     ((part index, arc m, road height)), the requirement falling at `grade` along the chain; then
@@ -5663,19 +6931,24 @@ def deck_profile_once(lines, ground_fn, crossings=(), clear=None, grade=None, li
     clear = DECK_ROAD_CLEAR if clear is None else clear
     grade = DECK_GRADE if grade is None else grade
     lift = DECK_CLEAR if lift is None else lift
+    mg = DECK_MAX_GRADE if max_grade is None else float(max_grade)
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
     # (curve mode for a deck that clears something; one over nothing but the ground keeps the ground envelope's rounded
     # crest: Lombard Street, Baltimore's deck over its embankment, test_no_step_onto_a_steep_abutment)
-    if curve and lines and bridge_profile_mode() == "curve" and len(crossings):
-        got = deck_curve(lines, ground_fn, _curve_crossings(crossings, n_road, levels), (), clear, lift, pins=pins)
+    if curve and lines and bridge_profile_mode() == "curve" and (len(crossings) or free_set):
+        got = deck_curve(lines, ground_fn, _curve_crossings(crossings, n_road, levels), (), clear, lift,
+                         max_grade=max_grade, pins=pins, free_ends=free_set, on_ends=on_ends)
         if got is not None:
             g = _curve_grade(lines, got)
-            if g <= DECK_STEEP_GRADE or _end_step(lines, got) <= DECK_STEEP_GRADE:
+            if g <= DECK_STEEP_GRADE or _end_step(lines, got, free_ends=free_set) <= DECK_STEEP_GRADE:
                 return got
             # (a curve steeper than that may not meet its ends: a "bridge" mapped along a hillside stepped 40 m at
             # its abutment, GitHub #382 near Tata. The ground envelope's profile when it is the gentler one)
-            old = deck_profile_once(lines, ground_fn, crossings, clear, grade, lift, n_road, levels, pins, False)
-            return got if not old or _end_step(lines, got) <= _end_step(lines, old) + 0.05 else old
-    zs = deck_heights(lines, ground_fn, pins)
+            old = deck_profile_once(lines, ground_fn, crossings, clear, grade, lift, n_road, levels, pins, False,
+                                    free_ends=free_set, on_ends=on_ends, max_grade=max_grade)
+            return got if not old or _end_step(lines, got, free_ends=free_set) <= _end_step(
+                lines, old, free_ends=free_set) + 0.05 else old
+    zs = deck_heights(lines, ground_fn, pins, free_ends=free_set)
     if not zs:
         return zs
     nodes, edges, adj = _chain_graph(lines)
@@ -5686,51 +6959,51 @@ def deck_profile_once(lines, ground_fn, crossings=(), clear=None, grade=None, li
         deg[a] += 1
         deg[b] += 1
     deg = _pin(nodes, deg, pins)
-    # no steeper than DECK_MAX_GRADE from an abutment: a short bridge over a road cannot reach full
+    # no steeper than max_grade from an abutment: a short bridge over a road cannot reach full
     # headroom (2026-10-11: such decks became steep wedges, "walls" in the user's screenshot)
     cap = [np.full(len(ln), np.inf) for ln in lines]
     dab = [np.full(len(ln), np.inf) for ln in lines]      # m to the nearest abutment
     steep = [np.full(len(ln), np.inf) for ln in lines]    # DECK_STEEP_GRADE off each abutment (below)
     for k, (a, b, s) in enumerate(edges):
-        for node, zend in ((a, zs[k][0]), (b, zs[k][-1])):
-            if deg[node] != 1 or not np.isfinite(zend):
+        for at_e, node, zend in ((0, a, zs[k][0]), (-1, b, zs[k][-1])):
+            if deg[node] != 1 or (k, at_e) in free_set or not np.isfinite(zend):
                 continue
             d = _dijkstra(adj, {node: 0.0})
             for k2, (ea, eb, es) in enumerate(edges):
                 dk = np.minimum(d[ea] + es, d[eb] + (es[-1] - es))
-                cap[k2] = np.minimum(cap[k2], zend + DECK_MAX_GRADE * dk)
+                cap[k2] = np.minimum(cap[k2], zend + mg * dk)
                 dab[k2] = np.minimum(dab[k2], dk)
                 steep[k2] = np.minimum(steep[k2], zend + DECK_STEEP_GRADE * dk)
     n_road = len(crossings) if n_road is None else n_road
     req = [np.full(len(ln), -np.inf) for ln in lines]
     for ci, cr in enumerate(crossings):     # (part, arc, height under it[, its own clearance: over water])
-        pi, sc, zc = cr[:3]
-        cl = cr[3] if len(cr) > 3 and cr[3] is not None else clear
+        pi, sc, zc, _own, cl, min_lv_raw, back_r, fwd_r, grade_sep = _crossing_meta(cr, clear)
         # a deck-over-deck requirement (its 5th element: the upper part's level) lifts the parts of that level and
         # above only: falling along the chain it reached the lower deck it was measured on, lifting it, and so the
         # upper again each round (the Tsing Ma Bridge's upper deck 33 m over its lower one, 7 m in life, 2026-10-18)
-        min_lv = cr[4] if len(cr) > 4 and levels is not None else None
+        min_lv = min_lv_raw if levels is not None else None
         a, b, s = edges[pi]
         d = _dijkstra(adj, {a: sc, b: s[-1] - sc})
         # a junction at grade (Queens Plaza, the user's report #55, 2026-10-17: a ramp's map line starts in the
         # intersection it climbs from; its deck rose 0.8 m over the cross street there, a hump across it)
-        flat = (ci < n_road and len(cr) == 3 and float(np.interp(sc, s, dab[pi])) <= AT_GRADE_REACH_M
+        flat = (ci < n_road and not grade_sep and float(np.interp(sc, s, dab[pi])) <= AT_GRADE_REACH_M
                 and float(np.interp(sc, s, cap[pi])) < zc + AT_GRADE_M)
         for k, (ea, eb, es) in enumerate(edges):
             dk = np.minimum(d[ea] + es, d[eb] + (es[-1] - es))
             if k == pi:
-                dk = np.minimum(dk, np.abs(es - sc))
+                dk = np.maximum(np.maximum(sc - back_r - es, es - (sc + fwd_r)), 0.0)
+            else:
+                dk = np.maximum(dk - max(back_r, fwd_r), 0.0)
             if flat:
                 cap[k] = np.minimum(cap[k], zc + DECK_MAX_GRADE * dk)
             elif min_lv is None or levels[k] >= min_lv or k == pi:
                 # A lower road has width: keep a level clearance corridor around its
-                # centreline instead of reaching the target at just one point.
-                reach = DECK_CLEAR_REACH_M if len(cr) == 3 or cr[3] is None else 0.0
-                req[k] = np.maximum(req[k], zc + cl - grade * np.maximum(dk - reach, 0.0))
+                # centreline (wider when skewed or wide) instead of reaching the target at just one point.
+                req[k] = np.maximum(req[k], zc + cl - grade * dk)
                 if k == pi:
                     # A crossing can lie between mesh vertices. Both bracketing vertices
                     # need full height, otherwise linear interpolation loses headroom.
-                    for point in (sc - reach, sc, sc + reach):
+                    for point in (sc - back_r, sc, sc + fwd_r):
                         if not 0 <= point <= es[-1]:
                             continue
                         j = int(np.searchsorted(es, point, side="left"))
@@ -5747,7 +7020,8 @@ def deck_profile_once(lines, ground_fn, crossings=(), clear=None, grade=None, li
         # Meet the graded approach exactly. A constant skin allowance right up
         # to a pinned abutment otherwise restores a small lip after smoothing.
         blend = np.ones(len(z))
-        for distance in ([s] if deg[a] == 1 else []) + ([s[-1] - s] if deg[b] == 1 else []):
+        for distance in ([s] if (deg[a] == 1 and (k, 0) not in free_set) else []) + (
+                [s[-1] - s] if (deg[b] == 1 and (k, -1) not in free_set) else []):
             u = np.clip(distance / DECK_SIGMA, 0.0, 1.0)
             blend = np.minimum(blend, u * u * (3.0 - 2.0 * u))
         g = gz[k0:k0 + len(z)] + lift * blend
@@ -5768,9 +7042,9 @@ def deck_profile_once(lines, ground_fn, crossings=(), clear=None, grade=None, li
         # AI car hit at 65 mph (2026-10-27)
         cap[k] = np.minimum(cap[k], np.maximum(np.maximum(steep[k], g), np.where(np.isfinite(z), z, -np.inf)))
         zz = np.maximum(np.minimum(np.maximum(z, req[k]), cap[k]), g)
-        if deg[a] == 1:                         # an abutment keeps the ground's height
+        if deg[a] == 1 and (k, 0) not in free_set:   # an abutment keeps the ground's height
             zz[0] = z[0]
-        if deg[b] == 1:
+        if deg[b] == 1 and (k, -1) not in free_set:
             zz[-1] = z[-1]
         if len(zz) > 3:
             # no sag between two higher points (the Queensboro Bridge dipped 7 m over Roosevelt Island between its
@@ -5851,7 +7125,7 @@ def _simple_path(lines, graph=None):
 
 CHORD_KINK = 0.02       # curve_profile keeps the straight line between abutments meeting the approaches within this grade
 CHORD_SHELF_M = 1.0     # m
-CHORD_TOL = 0.35        # m a requirement may go short: 0.21 m of it margins, 6 m headroom to 5.86 m at worst
+CHORD_TOL = 0.15        # m: within BRIDGE_HEADROOM_MARGIN_M so MIN_BRIDGE_HEADROOM_M (6.0 m) is never undercut
 
 
 def _chord(s, g, need, z0, zL, g0, gL, max_grade, cap=None):
@@ -5887,7 +7161,8 @@ def _chord(s, g, need, z0, zL, g0, gL, max_grade, cap=None):
     return z
 
 
-def curve_profile(s, g, req, z0, zL, g0=0.0, gL=0.0, max_grade=None, lift=None, iters=20, cap=None):
+def curve_profile(s, g, req, z0, zL, g0=0.0, gL=0.0, max_grade=None, lift=None, iters=20, cap=None,
+                  free_ends=(False, False)):
     """One deck line's heights on a uniform grid s (0..L): from z0 to zL (the abutments), meeting the
     approach grades g0 (dz/ds just before s=0) and gL (just after L); at least req (the clearances) where
     the grade cap lets it, reached and left at DECK_DESIGN_GRADE (no steeper than max_grade from either end), joined by parabolic
@@ -5897,17 +7172,30 @@ def curve_profile(s, g, req, z0, zL, g0=0.0, gL=0.0, max_grade=None, lift=None, 
     lift = DECK_CLEAR if lift is None else lift
     s = np.asarray(s, np.float64)
     L = s[-1]
-    floor = np.asarray(g, np.float64) + lift
-    req = np.maximum(np.asarray(req, np.float64), floor)
-    cap = np.minimum(np.minimum(z0 + max_grade * s, zL + max_grade * (L - s)),
-                     np.inf if cap is None else cap)        # (and under a junction at grade's own cap)
+    g_arr = np.asarray(g, np.float64)
+    c_end = np.full(len(s), np.inf)
+    blend = np.ones(len(s))
+    if not free_ends[0]:
+        c_end = np.minimum(c_end, z0 + max_grade * s)
+        u0 = np.clip(s / DECK_SIGMA, 0.0, 1.0)
+        blend = np.minimum(blend, u0 * u0 * (3.0 - 2.0 * u0))
+    if not free_ends[1]:
+        c_end = np.minimum(c_end, zL + max_grade * (L - s))
+        u1 = np.clip((L - s) / DECK_SIGMA, 0.0, 1.0)
+        blend = np.minimum(blend, u1 * u1 * (3.0 - 2.0 * u1))
+    mono_floor = np.maximum(np.minimum.accumulate(g_arr), np.minimum.accumulate(g_arr[::-1])[::-1])
+    g_eff = np.minimum(g_arr, np.maximum(c_end, mono_floor))
+    floor = g_eff + lift * blend
+    req_in = np.asarray(req, np.float64)
+    req = np.maximum(np.minimum(req_in, np.where(req_in <= g_arr + lift + 1e-6, floor, np.inf)), floor)
+    cap = np.minimum(c_end, np.inf if cap is None else cap)        # (and under a junction at grade's own cap)
     line = z0 + (zL - z0) * s / max(L, 1e-9)    # never under the straight line between the abutments
     # the straight line between the abutments, or one parabola over it rising at most CHORD_KINK more steeply out of
     # each abutment, when that clears everything (the requirements within CHORD_TOL: they carry 0.21 m of margin;
     # the ground itself, which it may rest on) and meets both approaches within CHORD_KINK. The curve's floor stood
     # DECK_CLEAR over the approach ground beside each abutment and its smoothing crowned a 24 m overpass by 0.2-0.3 m
-    # (I-275 by the Sunshine Skyway, 2026-10-27: "it just has a HUMP in the middle that's not necessary")
-    chord = _chord(s, np.asarray(g, np.float64), np.asarray(req, np.float64) - lift, z0, zL, g0, gL, max_grade, cap)
+    # (2026-10-27: "it just has a HUMP in the middle that's not necessary")
+    chord = _chord(s, g_eff, np.asarray(req, np.float64) - lift, z0, zL, g0, gL, max_grade, cap)
     if chord is not None:
         return chord
     want = np.minimum(np.maximum(req, line), cap)
@@ -5917,13 +7205,23 @@ def curve_profile(s, g, req, z0, zL, g0=0.0, gL=0.0, max_grade=None, lift=None, 
     # the one that rises least above what is needed (a long curve over a short clearance stretch had to
     # be lifted 14 m over the Fremont Bridge's 58 m), else the one falling least short
     best = None
-    for kf in (1.0, 0.5, 0.25, 0.12, 0.067):
-        z = _curve_try(s, want, cap, z0, zL, g0, gL, step, L, DECK_CURVE_K * kf, iters)
+
+    def _try_curve(kf, kmin=DECK_CURVE_KMIN, cmin=DECK_CURVE_MIN):
+        nonlocal best
+        z = _curve_try(s, want, cap, z0, zL, g0, gL, step, L, DECK_CURVE_K * kf, iters,
+                       k_min=kmin, curve_min=cmin)
         short = float(np.max(want - z))
         over = float(np.max(z) - np.max(want))
         key = (0, over) if short <= 0.05 else (1, short)
         if best is None or key < best[0]:
             best = (key, z)
+
+    for kf in (1.0, 0.5, 0.25, 0.12, 0.067):
+        _try_curve(kf)
+    if best[0][0] != 0 and max_grade > DECK_MAX_GRADE:
+        # Steep service ramps need shorter vertical curves when standard highway K fails feasibility.
+        for kf, kmin, cmin in ((0.05, 60.0, 8.0), (0.02, 24.0, 6.0)):
+            _try_curve(kf, kmin, cmin)
     z = best[1].copy()
     return _lift_smooth(s, z, floor)                # the abutments stay on the approach road
 
@@ -5936,7 +7234,7 @@ def _tents(s, z, grade):
     return fast._ef.deck_tents(np.ascontiguousarray(s, np.float64), np.ascontiguousarray(z, np.float64), float(grade))
 
 
-def _curve_try(s, want, cap, z0, zL, g0, gL, step, L, K, iters):
+def _curve_try(s, want, cap, z0, zL, g0, gL, step, L, K, iters, k_min=DECK_CURVE_KMIN, curve_min=DECK_CURVE_MIN):
     raise_ = np.zeros(len(s))
     z = want
     for _ in range(iters):
@@ -5946,7 +7244,7 @@ def _curve_try(s, want, cap, z0, zL, g0, gL, step, L, K, iters):
         gr = np.diff(hull) / np.maximum(np.diff(s), 1e-9)
         # the whole crest's change (close hull corners act as one curve), or an end's
         A = max(float(np.max(gr) - np.min(gr)), abs(gr[0] - g0), abs(gr[-1] - gL))
-        W = float(np.clip(K * A, max(DECK_CURVE_MIN, DECK_CURVE_KMIN * A), max(DECK_CURVE_MIN, 0.8 * L)))
+        W = float(np.clip(K * A, max(curve_min, k_min * A), max(curve_min, 0.8 * L)))
         n = max(int(round(W / step)) | 1, 1)
         r = n // 2
         ext = np.r_[z0 - g0 * step * np.arange(r, 0, -1), hull, zL + gL * step * np.arange(1, r + 1)]
@@ -5966,9 +7264,10 @@ def _curve_try(s, want, cap, z0, zL, g0, gL, step, L, K, iters):
 
 def _path_curve(lines, order, ground_fn, crossings, spans, clear, lift, max_grade, ends=(None, None)):
     """curve_profile along one path of parts (order: [(part, reversed)]). ends: per end None (an abutment:
-    the ground's height, the approach grade from the ground beyond it) or (z, grade dz/ds arriving) (a
-    junction with a part already solved). Returns {part: heights}, the path's polyline (m, 2), its grid s,
-    heights z. None if degenerate."""
+    the ground's height, the approach grade from the ground beyond it), ("on",) (an elevated T-junction on a
+    parent deck), ("free",) (an unfinished dead-end branch stub), or (z, grade dz/ds arriving) (a junction
+    with a part already solved). Returns {part: heights}, the path's polyline (m, 2), its grid s, heights z.
+    None if degenerate."""
     pts, off, info = [], 0.0, {}
     for k, rev in order:
         ln = np.asarray(lines[k], np.float64)[:, :2]
@@ -5995,38 +7294,69 @@ def _path_curve(lines, order, ground_fn, crossings, spans, clear, lift, max_grad
     out_pts = np.array([P[0] + t0 * 12.0, P[-1] + t1 * 12.0])
     gz = np.asarray(ground_fn(np.r_[xy, out_pts]), np.float64)
     g, go = gz[:len(s)], gz[len(s):]
+    mg = DECK_MAX_GRADE if max_grade is None else float(max_grade)
+    free0 = isinstance(ends[0], tuple) and len(ends[0]) == 1 and ends[0][0] == "free"
+    free1 = isinstance(ends[1], tuple) and len(ends[1]) == 1 and ends[1][0] == "free"
+    on0 = isinstance(ends[0], tuple) and len(ends[0]) == 1 and ends[0][0] == "on"
+    on1 = isinstance(ends[1], tuple) and len(ends[1]) == 1 and ends[1][0] == "on"
+    if free0 and free1:
+        free0 = free1 = False
     if ends[0] is None:
         z0, g0 = float(g[0]), float(np.clip((g[0] - go[0]) / 12.0, -APPROACH_GRADE, APPROACH_GRADE))
+    elif on0:
+        z0, g0 = float(g[0]), 0.0
+    elif free0:
+        z0, g0 = np.inf, 0.0
     else:
-        z0, g0 = ends[0]
+        z0, g0 = float(ends[0][0]), float(ends[0][1])
     if ends[1] is None:
         zL, gL = float(g[-1]), float(np.clip((go[1] - g[-1]) / 12.0, -APPROACH_GRADE, APPROACH_GRADE))
+    elif on1:
+        zL, gL = float(g[-1]), 0.0
+    elif free1:
+        zL, gL = np.inf, 0.0
     else:
-        zL, gL = ends[1]
+        zL, gL = float(ends[1][0]), float(ends[1][1])
     req = g + lift
+    if on0:
+        req[0] = float(g[0])
+    if on1:
+        req[-1] = float(g[-1])
     junction = np.full(len(s), np.inf)
     for cr in crossings:
-        k, arc, zc = cr[:3]
-        own = len(cr) > 3 and cr[3] is not None
-        cl = cr[3] if own else clear
+        k, arc, zc, own, cl, _ml, back_r, fwd_r, grade_sep = _crossing_meta(cr, clear)
         if k in info:
             sc = to_s(k, arc)
             # a road by an abutment the deck cannot get AT_GRADE_M over is a junction at grade (the intersection a
             # ramp climbs from: deck_profile_once's rule): no requirement, the deck leaves the road's height
             d_end = min(sc if ends[0] is None else np.inf, L - sc if ends[1] is None else np.inf)
-            if not own and d_end <= AT_GRADE_REACH_M and                     min(z0, zL) + DECK_MAX_GRADE * d_end < zc + AT_GRADE_M:
-                junction = np.minimum(junction, zc + DECK_MAX_GRADE * np.abs(s - sc))
+            if not grade_sep and d_end <= AT_GRADE_REACH_M and min(z0, zL) + DECK_MAX_GRADE * d_end < zc + AT_GRADE_M:
+                junction = np.minimum(junction, zc + mg * np.abs(s - sc))
                 continue
-            # (upstream's full-headroom corridor, DECK_CLEAR_REACH_M either side, and the curve's 5 cm acceptance
-            # taken up front: the corridor came out 4 cm short, test_bridge_clearance)
-            m = np.abs(s - sc) <= max(DECK_ROAD_HALF, DECK_CLEAR_REACH_M if not own else 0.0) + 1e-8
+            # (upstream's full-headroom corridor, wide/skewed overlap reach either side, and the curve's 5 cm
+            # acceptance taken up front: the corridor came out 4 cm short, test_bridge_clearance)
+            r_back = DECK_ROAD_HALF if own else max(DECK_ROAD_HALF, back_r)
+            r_fwd = DECK_ROAD_HALF if own else max(DECK_ROAD_HALF, fwd_r)
+            m = (s >= sc - r_back - 1e-8) & (s <= sc + r_fwd + 1e-8)
             req[m] = np.maximum(req[m], zc + cl + (0.06 if not own else 0.0))
     for k, a0, a1, zmin in spans:
         if k in info:
             x0, x1 = sorted((to_s(k, a0), to_s(k, a1)))
             m = (s >= x0 - 1e-8) & (s <= x1 + 1e-8)
             req[m] = np.maximum(req[m], zmin)
-    z = curve_profile(s, g, req, z0, zL, g0, gL, max_grade, lift, cap=junction)
+    if free1:
+        lv = min(L, max(DECK_CURVE_MIN, DECK_CURVE_KMIN * abs(g0)))
+        z_base = z0 + 0.5 * g0 * lv
+        reach_req = np.minimum(req[1:], z0 + mg * s[1:])
+        zL = float(np.clip(max(z_base, float(np.max(reach_req))), float(g[-1] + lift), z0 + mg * L))
+        gL = 0.0
+    elif free0:
+        lv = min(L, max(DECK_CURVE_MIN, DECK_CURVE_KMIN * abs(gL)))
+        z_base = zL - 0.5 * gL * lv
+        reach_req = np.minimum(req[:-1], zL + mg * (L - s[:-1]))
+        z0 = float(np.clip(max(z_base, float(np.max(reach_req))), float(g[0] + lift), zL + mg * L))
+        g0 = 0.0
+    z = curve_profile(s, g, req, z0, zL, g0, gL, max_grade, lift, cap=junction, free_ends=(free0, free1))
     out = {}
     for k, rev in order:
         o, r, a = info[k]
@@ -6034,7 +7364,8 @@ def _path_curve(lines, order, ground_fn, crossings, spans, clear, lift, max_grad
     return out, xy, s, z
 
 
-def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, max_grade=None, pins=None):
+def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, max_grade=None, pins=None,
+               free_ends=(), on_ends=()):
     """Deck heights (one array per part) of a bridge chain by curve_profile. A chain of parts in one line is
     solved as one profile; a branched chain (ramps leaving a viaduct) as its longest abutment-to-abutment
     line first, then each remaining branch from the solved deck it leaves (its height and grade there) to
@@ -6046,11 +7377,24 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
     lift = DECK_CLEAR if lift is None else lift
     if not lines:
         return None
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
+    on_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (on_ends or ())}
+
+    def _end_spec(k_part, at_part):
+        if (k_part, at_part) in free_set:
+            return ("free",)
+        if (k_part, at_part) in on_set:
+            return ("on",)
+        return None
+
     args = (ground_fn, crossings, spans, clear, lift, max_grade)
     graph = _curve_graph(lines, pins)
     order = _simple_path(lines, graph)
     if order is not None:
-        got = _path_curve(lines, order, *args)
+        k0, r0 = order[0]
+        kl, rl = order[-1]
+        got = _path_curve(lines, order, *args, ends=(_end_spec(k0, -1 if r0 else 0),
+                                                     _end_spec(kl, 0 if rl else -1)))
         return None if got is None else [got[0][k] for k in range(len(lines))]
     nodes, edges, adj = graph
     # parts not joined at all (a chain also holds the decks crossing it, solved together for the deck-over-deck
@@ -6072,13 +7416,16 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
         out = [None] * len(lines)
         for ks in groups.values():
             idx = {k: i for i, k in enumerate(ks)}
+            sub_free = {(idx[k], at) for k, at in free_set if k in idx}
+            sub_on = {(idx[k], at) for k, at in on_set if k in idx}
             sub = deck_curve([lines[k] for k in ks], ground_fn,
                              [(idx[cr[0]],) + tuple(cr[1:]) for cr in crossings if cr[0] in idx],
-                             [(idx[k], a0, a1, z) for k, a0, a1, z in spans if k in idx], clear, lift, max_grade, pins)
+                             [(idx[k], a0, a1, z) for k, a0, a1, z in spans if k in idx], clear, lift, max_grade, pins,
+                             free_ends=sub_free, on_ends=sub_on)
             if sub is None:
                 sub = deck_profile_once([lines[k] for k in ks], ground_fn,
                                         [(idx[cr[0]],) + tuple(cr[1:]) for cr in crossings if cr[0] in idx], clear, None,
-                                        lift, pins=pins)
+                                        lift, pins=pins, free_ends=sub_free, on_ends=sub_on)
                 if bridge_profile_mode() == "curve" and sub is not None and any(
                         s is None for s in sub):
                     return None
@@ -6092,7 +7439,9 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
         deg[b] += 1
         inc[a].append(k)
         inc[b].append(k)
-    abut = [i for i in range(len(nodes)) if deg[i] == 1]
+    free_nodes = {edges[k][0 if at == 0 else 1] for k, at in free_set
+                  if 0 <= k < len(edges) and deg[edges[k][0 if at == 0 else 1]] == 1}
+    abut = [i for i in range(len(nodes)) if deg[i] == 1 and i not in free_nodes]
     if not abut:
         return None
     out = [None] * len(lines)
@@ -6178,6 +7527,17 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
             key = (top if np.isfinite(top) else -1e9, L)
             if best is None or key > best[0]:
                 best = (key, p)
+    if best is None and free_nodes:
+        for a0 in abut:
+            for a1 in sorted(free_nodes):
+                p = walk(a0, set(), lambda v, a1=a1: v == a1)
+                if p is None:
+                    continue
+                L = sum(edges[k][2][-1] for k, _ in p)
+                top = max((need.get(k, -np.inf) for k, _ in p), default=-np.inf)
+                key = (top if np.isfinite(top) else -1e9, L)
+                if best is None or key > best[0]:
+                    best = (key, p)
     if best is None:
         return None
     done = set()
@@ -6189,8 +7549,10 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
         start = edges[k0][1] if r0 else edges[k0][0]
         kl, rl = order[-1]
         end = edges[kl][0] if rl else edges[kl][1]
-        e0 = e1 = None
-        if not first:
+        if first:
+            e0 = _end_spec(k0, -1 if r0 else 0)
+            e1 = _end_spec(kl, 0 if rl else -1)
+        else:
             ln0 = np.asarray(lines[k0], np.float64)[:, :2]
             ln0 = ln0[::-1] if r0 else ln0
             d0 = (ln0[1] - ln0[0]) / max(np.hypot(*(ln0[1] - ln0[0])), 1e-9)
@@ -6201,6 +7563,8 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
                 d1 = (lnl[-1] - lnl[-2]) / max(np.hypot(*(lnl[-1] - lnl[-2])), 1e-9)
                 z1, g1 = end_of(end, d1)
                 e1 = (z1, g1)
+            else:
+                e1 = _end_spec(kl, 0 if rl else -1)
         first = False
         got = _path_curve(lines, order, *args, ends=(e0, e1))
         for k, _ in order:
@@ -6214,7 +7578,9 @@ def deck_curve(lines, ground_fn, crossings=(), spans=(), clear=None, lift=None, 
         if not todo:                            # the next branch: from any solved node with an open edge
             for nd in list(solved):
                 if any(k not in done for k in inc[nd]):
-                    p = walk(nd, done, lambda v: deg[v] == 1 or v in solved)
+                    p = walk(nd, done, lambda v: (deg[v] == 1 and v not in free_nodes) or v in solved)
+                    if p is None:
+                        p = walk(nd, done, lambda v: deg[v] == 1 or v in solved)
                     if p:
                         todo.append(p)
                         break
@@ -6309,16 +7675,20 @@ def _lift_smooth(s, z, floor, iters=8):
     np.maximum.at(want, hi, source_want)
     step0 = abs(float(z[1] - z[0])) > 0.25 * max(float(s[1] - s[0]), 1.0)
     step1 = abs(float(z[-1] - z[-2])) > 0.25 * max(float(s[-1] - s[-2]), 1.0)
+    steep_span = abs(float(z[-1] - z[0])) > DECK_MAX_GRADE * max(float(s[-1]), 1.0)
+    cone0 = np.maximum(_tents(g, np.where(inner, want, -np.inf), LIFT_GRADE), 0.0)
+    bank0 = not step0 and not steep_span and float(cone0[:min(len(cone0), r + 1)].max()) > 2.0 * DECK_CLEAR
+    bank1 = not step1 and not steep_span and float(cone0[max(0, len(cone0) - r - 1):].max()) > 2.0 * DECK_CLEAR
     addition = np.zeros_like(zg)
     for _ in range(iters):
         cone = _tents(g, np.where(inner, want, -np.inf), LIFT_GRADE)
         tgt = np.maximum(cone, 0.0)
-        if not step0:
+        if bank0:
             tgt[0] = 0.0
             pad_l = -tgt[1:r + 1][::-1] if len(tgt) > r else -np.pad(tgt[1:], (0, r - len(tgt) + 1))[::-1]
         else:
             pad_l = np.full(r, tgt[0])
-        if not step1:
+        if bank1:
             tgt[-1] = 0.0
             pad_r = -tgt[-r - 1:-1][::-1] if len(tgt) > r else -np.pad(tgt[:-1], (r - len(tgt) + 1, 0))[::-1]
         else:
@@ -6397,7 +7767,7 @@ def _ground_envelope(s, g, grade, curve=0.0):
     return out
 
 
-def _bridge_span(lines, zs, grade=None, pins=None, ground_roads=None):
+def _bridge_span(lines, zs, grade=None, pins=None, ground_roads=None, free_ends=()):
     """Raise a deck off a sudden DEM hole instead of draping down it.
 
     DECK_STEEP_GRADE only capped the climb off an abutment, so a span followed a cliff down inside the gap.
@@ -6408,6 +7778,7 @@ def _bridge_span(lines, zs, grade=None, pins=None, ground_roads=None):
     grade = DECK_STEEP_GRADE if grade is None else float(grade)
     if not lines or not zs or any(z is None for z in zs):
         return zs
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
     g_ends = None
     if ground_roads:
         gp = [np.asarray(g, np.float64)[k, :2] for g in ground_roads if len(g) >= 2 for k in (0, -1)]
@@ -6420,15 +7791,15 @@ def _bridge_span(lines, zs, grade=None, pins=None, ground_roads=None):
         deg[b] += 1
     deg = _pin(_nodes, deg, pins)
     out = []
-    for ln, z, (a, b, s) in zip(lines, zs, edges):
+    for k_idx, (ln, z, (a, b, s)) in enumerate(zip(lines, zs, edges)):
         z = np.asarray(z, np.float64)
         if z.ndim != 1 or len(z) < 3 or len(z) != len(s) or not np.isfinite(z).all() or float(s[-1]) <= 0:
             out.append(z)
             continue
         pts_xy = np.asarray(ln, np.float64)[:, :2]
         zz = np.maximum(z, _ground_envelope(s, z, grade))
-        for end, step, node in ((0, 1, a), (len(z) - 1, -1, b)):
-            if deg[node] != 1:
+        for end, step, node, at_e in ((0, 1, a, 0), (len(z) - 1, -1, b, -1)):
+            if deg[node] != 1 or (k_idx, at_e) in free_set:
                 continue
             p_end = pts_xy[end]
             joined = g_ends is not None and float(
@@ -6524,7 +7895,7 @@ def _pin(nodes, deg, pins):
     return deg
 
 
-def deck_heights(lines, end_z, pins=None):
+def deck_heights(lines, end_z, pins=None, free_ends=()):
     """Deck heights of chained bridge parts. lines: polylines (k, 2) in metres (one per bridge part);
     parts sharing an end point (within 0.5 m) are joined. end_z(xy (m, 2)) -> heights of the ground at
     the abutments (chain ends: points used by one part only). A joint's height is the abutments' heights weighted by
@@ -6534,7 +7905,8 @@ def deck_heights(lines, end_z, pins=None):
     first 3 m, 2026-10-27. Returns one height array per line. Pure given end_z."""
     if not lines:
         return []
-    edges, ez, dist = _end_dists(lines, end_z, pins)
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
+    edges, ez, dist = _end_dists(lines, end_z, pins, free_ends=free_set)
     out = []
 
     def weighted(dk):
@@ -6545,11 +7917,15 @@ def deck_heights(lines, end_z, pins=None):
             num += w * np.where(ok, ez[k], 0.0)
             den += w
         return np.where(den > 0, num / np.maximum(den, 1e-12), np.nan)
-    for a, b, s in edges:
+    for k_idx, (a, b, s) in enumerate(edges):
         if not dist:                            # a closed loop: no abutment known
             out.append(np.full(len(s), np.nan))
             continue
         za, zb = weighted([np.array([d[a], d[b]], np.float64) for d in dist])
+        if (k_idx, 0) in free_set and np.isfinite(zb):
+            za = zb
+        elif (k_idx, -1) in free_set and np.isfinite(za):
+            zb = za
         if np.isfinite(za) and np.isfinite(zb) and s[-1] > 0:
             out.append(za + (zb - za) * (s / s[-1]))
         else:
@@ -6557,7 +7933,7 @@ def deck_heights(lines, end_z, pins=None):
     return out
 
 
-def _end_dists(lines, end_z, pins=None):
+def _end_dists(lines, end_z, pins=None, free_ends=()):
     """The chain of lines (joined at end points within 0.5 m): its edges (start node, end node, arc (k,)),
     the heights end_z gives at its ends (points of one line only) and per end the distance along the chain
     to every node. Pure given end_z."""
@@ -6581,7 +7957,9 @@ def _end_dists(lines, end_z, pins=None):
         adj[a].append((b, s[-1]))
         adj[b].append((a, s[-1]))
     deg = _pin(nodes, deg, pins)
-    ends = [i for i in range(len(nodes)) if deg[i] == 1]
+    free_nodes = {edges[int(k)][0 if int(at) == 0 else 1]
+                  for k, at in (free_ends or ()) if 0 <= int(k) < len(edges)}
+    ends = [i for i in range(len(nodes)) if deg[i] == 1 and i not in free_nodes]
     ez = np.asarray(end_z(np.array([nodes[i] for i in ends]).reshape(-1, 2)), np.float64) if ends else np.zeros(0)
     import heapq
     dist = []                                   # per end: distance along the chain to every node
@@ -6627,8 +8005,8 @@ TUNNEL_SOIL_M = 1.0     # m of arch and soil kept over a low tunnel's vault
 ARCH_SIZE_SKIP_M = 5.0  # m at a low arch's mouths left out when its height is sized from the cover over it
 ROAD_CAP_JOIN_M = 20.0  # a road with an end this near a low arch's mouth joins it (its own road going on), not one over it
 ROAD_CAP_GAP_M = 0.5    # m a low arch's stone top stops short of a carriageway over its mouth ...
-ROAD_CAP_OVER_M = 1.0   # ... and its portal face reaches at most this far over that road
-TUNNEL_LOW_H = 3.6      # m: the lowest tube (floor to vault)
+ROAD_CAP_OVER_M = 0.4   # ... and its portal face reaches at most this far over that road
+TUNNEL_LOW_H = 4.0      # m: the lowest tube (floor to vault)
 MAJOR_LOW_H = 5.0       # m: ... on a major road (CONCRETE_WALL_CLASSES: road tunnels clear ~4.5 m, a truck ~4 m)
 # A covered section (a low arch or a tube) goes on along the tunnel until every ground road crossing over it within
 # TUNNEL_ROAD_REACH_M of its ends is covered, its carriageway and TUNNEL_ROAD_CLEAR_M past it (along the tunnel: / the
@@ -6671,13 +8049,91 @@ def portal_cover(kinds, cover, spec, s=None):
     return kinds
 
 
-def cover_roads(xy, s, kinds, lines, halves):
+def _seed_road_covers(xy, s, kinds, lines, halves, cover):
+    """Turn open-tunnel spans (kind == 0) that cross directly under a ground road embankment (cover >= TUNNEL_OPEN_COVER,
+    sin >= TUNNEL_ROAD_MIN_SIN, span >= SECTION_MIN_M) into low arches (kind = 1) when DEM smoothing left the ridge
+    narrower than SECTION_MIN_M so open tunnels do not cut through crossing motorways. Pure."""
+    xy2 = np.asarray(xy, np.float64)[:, :2]
+    s_arr = np.asarray(s, np.float64)
+    cov = np.asarray(cover, np.float64)
+    k_n = len(xy2)
+    if k_n < 2 or len(cov) != k_n or len(s_arr) != k_n:
+        return kinds
+    out = np.array(kinds, np.int64, copy=True)
+    dxy = np.zeros_like(xy2)
+    dxy[1:-1] = xy2[2:] - xy2[:-2]
+    dxy[0] = xy2[1] - xy2[0]
+    dxy[-1] = xy2[-1] - xy2[-2]
+    tang = dxy / np.maximum(np.hypot(dxy[:, 0], dxy[:, 1])[:, None], 1e-9)
+    xmin, ymin = float(xy2[:, 0].min()), float(xy2[:, 1].min())
+    xmax, ymax = float(xy2[:, 0].max()), float(xy2[:, 1].max())
+    for ln, hw in zip(lines, halves):
+        ln = np.asarray(ln, np.float64).reshape(-1, 2)
+        if len(ln) < 2:
+            continue
+        reach = float(hw) + TUNNEL_ROAD_CLEAR_M
+        if float(ln[:, 0].max()) < xmin - reach or float(ln[:, 0].min()) > xmax + reach or \
+                float(ln[:, 1].max()) < ymin - reach or float(ln[:, 1].min()) > ymax + reach:
+            continue
+        p0, p1 = ln[:-1], ln[1:]
+        smin_x = np.minimum(p0[:, 0], p1[:, 0]) - reach
+        smax_x = np.maximum(p0[:, 0], p1[:, 0]) + reach
+        smin_y = np.minimum(p0[:, 1], p1[:, 1]) - reach
+        smax_y = np.maximum(p0[:, 1], p1[:, 1]) + reach
+        sv = p1 - p0
+        sl2 = sv[:, 0] * sv[:, 0] + sv[:, 1] * sv[:, 1]
+        keep_seg = (sl2 > 1e-12) & (smax_x >= xmin) & (smin_x <= xmax) & (smax_y >= ymin) & (smin_y <= ymax)
+        if not keep_seg.any():
+            continue
+        p0 = p0[keep_seg]
+        sv = sv[keep_seg]
+        sl2 = sl2[keep_seg]
+        diff = xy2[:, None, :] - p0[None, :, :]
+        t = np.clip((diff[:, :, 0] * sv[None, :, 0] + diff[:, :, 1] * sv[None, :, 1]) / sl2[None, :], 0.0, 1.0)
+        proj = p0[None, :, :] + t[:, :, None] * sv[None, :, :]
+        dx = xy2[:, None, 0] - proj[:, :, 0]
+        dy = xy2[:, None, 1] - proj[:, :, 1]
+        dist2 = dx * dx + dy * dy
+        best = np.argmin(dist2, axis=1)
+        d = np.sqrt(dist2[np.arange(k_n), best])
+        rt = sv[best] / np.sqrt(sl2[best])[:, None]
+        sin_a = np.abs(tang[:, 0] * rt[:, 1] - tang[:, 1] * rt[:, 0])
+        hit = d <= reach
+        i = 0
+        while i < k_n:
+            if not hit[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < k_n and hit[j + 1]:
+                j += 1
+            if (out[i:j + 1] == 0).any():
+                c = i + int(np.argmin(d[i:j + 1]))
+                if sin_a[c] >= TUNNEL_ROAD_MIN_SIN and float(np.max(cov[i:j + 1])) >= TUNNEL_OPEN_COVER:
+                    a, b = i, j
+                    if 2.0 * reach >= SECTION_MIN_M:
+                        while float(s_arr[b] - s_arr[a]) < SECTION_MIN_M and (a > 0 or b + 1 < k_n):
+                            if a > 0 and (b + 1 >= k_n or d[a - 1] <= d[b + 1]):
+                                a -= 1
+                            else:
+                                b += 1
+                    if float(s_arr[b] - s_arr[a]) >= SECTION_MIN_M:
+                        out[a:b + 1] = np.where(out[a:b + 1] == 0, 1, out[a:b + 1])
+            i = j + 1
+    return out
+
+
+def cover_roads(xy, s, kinds, lines, halves, cover=None):
     """kinds (tunnel_sections') with each covered section carried on until the ground roads crossing over it (lines
     (k, 2) in xy's frame, carriageway half widths) are covered, TUNNEL_ROAD_*: earthfast.tunnel_cover_roads. The
     road meshes (TunnelProfiles) and the grading (grading._tunnel_sections) both: an open section the grading did
     not know of cut its trench through the A-7's lanes near Malaga (GitHub #450)."""
     kinds = np.asarray(kinds, np.int64)
-    if not lines or not (kinds > 0).any() or len(xy) < 2:
+    if not lines or len(xy) < 2:
+        return kinds
+    if cover is not None:
+        kinds = _seed_road_covers(xy, s, kinds, lines, halves, cover)
+    if not (kinds > 0).any():
         return kinds
     import fast
     fast.require(95, "tunnel_cover_roads")
@@ -7756,7 +9212,7 @@ def _built_segments(roads):
             continue
         a.append(xy[:-1])
         b.append(xy[1:])
-        hw.append(np.full(len(xy) - 1, spec.width / 2 + STRIP_PAVED_MARGIN_M))
+        hw.append(np.full(len(xy) - 1, float(spec.width) / 2.0 + STRIP_PAVED_MARGIN_M, dtype=np.float64))
     if not a:
         return None
     return np.ascontiguousarray(np.vstack(a)), np.ascontiguousarray(np.vstack(b)), np.ascontiguousarray(np.concatenate(hw))
@@ -7891,6 +9347,7 @@ def geom_span(lines):
 DECK_CLEAR_REACH_M = 20.0   # full headroom either side of a road crossing (matches approach fills' flat reach)
 DECK_GRADE = 0.05       # that requirement falls 5 % along the deck from the crossing
 DECK_MAX_GRADE = 0.06   # a deck climbs no steeper than this from an abutment
+DECK_SERVICE_GRADE = 0.14  # service ramps may climb up to this (< DECK_STEEP_GRADE) to clear underpasses
 DECK_STEEP_GRADE = 0.15  # ... nor, whatever ground the caps were raised to, than this over lower ground (no walls)
 CORNER_CONCRETE_M = 4.0  # m: a concrete street this close to a curb return fills its corner in concrete too
 AT_GRADE_M = 3.0        # m: a road crossing a deck within AT_GRADE_REACH_M of an abutment that cannot get this
@@ -8084,7 +9541,9 @@ def pier_sites(xy, z, width, ground_fn, road_lines=(), wet_fn=None, depth=None, 
         w = np.asarray(wet_fn(xy), bool)
         wet_runs = (w, s)
     pw = float(np.clip(0.7 * width, 2.5, 14.0))
-
+    span_w = max(pw, float(width) + 2.0 * roadmesh.PARAPET_W)
+    n_foot = max(5, int(math.ceil(span_w / 2.5)) + 1)
+    offs_f = np.linspace(-0.5 * span_w, 0.5 * span_w, n_foot)
     def _pose_and_elev(sc):
         p = np.array([np.interp(sc, s, xy[:, 0]), np.interp(sc, s, xy[:, 1])])
         j = min(int(np.searchsorted(s, sc)), len(s) - 1)
@@ -8116,7 +9575,7 @@ def pier_sites(xy, z, width, ground_fn, road_lines=(), wet_fn=None, depth=None, 
         if pe is None:
             return None
         p, t, nrm, zt, zb, _g = pe
-        foot = np.array([p + nrm * (pw * f) for f in (-0.5, -0.25, 0.0, 0.25, 0.5)])
+        foot = p[None] + offs_f[:, None] * nrm[None]
         if len(A):
             fast.require(0, "points_near_segments")
             if np.asarray(fast._ef.points_near_segments(foot, A, B, rad)).any():
@@ -8367,7 +9826,7 @@ def _floor_deck_over_ground(lines, out, widths, ground_fn):
         if L < 3.0:
             res.append(z)
             continue
-        n_st = max(2, int(math.ceil(L / 4.0)) + 1)
+        n_st = max(2, int(math.ceil(L / 1.0)) + 1)
         st = np.unique(np.r_[np.linspace(0.0, L, n_st), s])
         qx = np.interp(st, s, xy[:, 0])
         qy = np.interp(st, s, xy[:, 1])
@@ -8376,9 +9835,11 @@ def _floor_deck_over_ground(lines, out, widths, ground_fn):
         tseg = seg[idx]
         tn = np.maximum(np.hypot(tseg[:, 0], tseg[:, 1]), 1e-9)
         nrm = np.column_stack([-tseg[:, 1] / tn, tseg[:, 0] / tn])
-        off = max(float(w or 0.0) * 0.45, 0.0)
+        d_end = np.minimum(st, L - st)
+        off = max(float(w or 0.0) * 0.50, 0.0)
         if off > 0.5:
-            q_all = np.vstack([qxy, qxy + nrm * off, qxy - nrm * off])
+            off_st = (off * np.clip((d_end - 6.0) / 10.0, 0.0, 1.0))[:, None]
+            q_all = np.vstack([qxy, qxy + nrm * off_st, qxy - nrm * off_st])
             g_all = np.asarray(ground_fn(q_all), np.float64)
             n_q = len(st)
             if len(g_all) != 3 * n_q or not np.isfinite(g_all).all():
@@ -8391,19 +9852,20 @@ def _floor_deck_over_ground(lines, out, widths, ground_fn):
                 res.append(z)
                 continue
         z_st = np.interp(st, s, z)
-        d_end = np.minimum(st, L - st)
         lift = np.minimum(0.16, 0.04 * d_end)
         poke = (d_end > 1e-3) & (gz > z_st - 0.04) & ((gz + lift) > z_st)
         if not np.any(poke):
             res.append(z)
             continue
-        steep_env = np.maximum(
-            np.minimum(z[0] + DECK_STEEP_GRADE * st, z[-1] + DECK_STEEP_GRADE * (L - st)),
-            z_st + np.minimum(0.60, DECK_STEEP_GRADE * d_end))
+        end_grade_cap = 0.08
+        smooth_env = np.maximum(
+            np.minimum(z[0] + end_grade_cap * st, z[-1] + end_grade_cap * (L - st)),
+            z_st + np.minimum(1.20, 0.06 * d_end))
         max_env = np.minimum(z[0] + DECK_MAX_GRADE * st, z[-1] + DECK_MAX_GRADE * (L - st))
-        cap_st = np.minimum(steep_env, np.maximum(np.where((gz - z_st) <= 0.60, gz + lift, z_st), max_env))
+        cap_st = np.minimum(smooth_env, np.maximum(np.where((gz - z_st) <= 1.20, gz + lift, z_st), max_env))
         req_st = np.minimum(gz + lift, cap_st)
         dz = np.zeros(len(z), np.float64)
+        lever_cap = np.zeros(len(z), np.float64)
         for m in np.flatnonzero(poke & (req_st > z_st + 1e-6)):
             i = int(idx[m])
             slen = float(s[i + 1] - s[i])
@@ -8414,16 +9876,23 @@ def _floor_deck_over_ground(lines, out, widths, ground_fn):
             if i == 0:
                 if t > 1e-6:
                     dz[1] = max(dz[1], need / t)
+                    if (gz[m] - z_st[m]) <= 1.20:
+                        lever_cap[1] = max(lever_cap[1], need / t)
             elif i == len(z) - 2:
                 if 1.0 - t > 1e-6:
                     dz[i] = max(dz[i], need / (1.0 - t))
+                    if (gz[m] - z_st[m]) <= 1.20:
+                        lever_cap[i] = max(lever_cap[i], need / (1.0 - t))
             else:
                 dz[i] = max(dz[i], need)
                 dz[i + 1] = max(dz[i + 1], need)
         d_end_v = np.minimum(s, L - s)
         v_env = np.minimum(z[0] + DECK_MAX_GRADE * s, z[-1] + DECK_MAX_GRADE * (L - s)) - z
-        dz_cap = np.minimum(DECK_STEEP_GRADE * d_end_v,
-                            np.maximum(0.60 + np.minimum(0.16, 0.04 * d_end_v), v_env))
+        end_room = np.maximum(np.minimum(z[0] + 0.09 * s, z[-1] + 0.09 * (L - s)) - z, 0.0)
+        near_end = d_end_v <= 16.0
+        grade_lim = np.where(near_end, end_room, 0.08 * d_end_v)
+        dz_cap = np.minimum(grade_lim,
+                            np.maximum.reduce([1.20 + np.minimum(0.16, 0.04 * d_end_v), v_env, lever_cap]))
         dz = np.minimum(dz, np.maximum(dz_cap, 0.0))
         dz[0] = dz[-1] = 0.0
         if not np.any(dz > 1e-6):
@@ -8433,31 +9902,31 @@ def _floor_deck_over_ground(lines, out, widths, ground_fn):
             dz[k] = max(dz[k], dz[k - 1] - DECK_MAX_GRADE * (s[k] - s[k - 1]))
         for k in range(len(dz) - 2, 0, -1):
             dz[k] = max(dz[k], dz[k + 1] - DECK_MAX_GRADE * (s[k + 1] - s[k]))
-        dz = np.minimum(dz, DECK_STEEP_GRADE * d_end_v)
+        dz = np.minimum(dz, np.maximum(grade_lim, 0.0))
         z2 = z + dz
         z2[0], z2[-1] = z[0], z[-1]
         res.append(z2)
     return res
 
 
-def _seat_approach_ends(lines, zs, ground_roads, ground_fn):
-    """Seat loose bridge abutments onto a joined ground road 1.5 m outward when a steep sub-metre mouth step
-    (0.22 < |z[end] - g_out| <= 0.80 m) separates the abutment node from the graded approach bed. Gentle road
-    grades (<= 14%, |dz| <= 0.22 m) and unjoined river/cliff ends stay untouched."""
-    out = [np.asarray(z, np.float64).copy() for z in zs]
-    if ground_fn is None or not ground_roads or not lines or len(lines) != len(out):
-        return out
+def _joined_approach_cliffs(lines, ground_roads, ground_fn):
+    """For each loose deck endpoint joined to an approach ground road, return
+    [(k, ek, p, g_p, g15, target_z, has_cliff)], probing along the joined ground road at +1.5 m and +3.0 m
+    to detect abutment-cutoff cliffs in graded terrain. Pure."""
+    if ground_fn is None or not ground_roads or not lines:
+        return []
     g_polys = [np.asarray(g, np.float64)[:, :2] for g in ground_roads if len(np.asarray(g)) >= 2]
     if not g_polys:
-        return out
+        return []
     pts_xy = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
     deck_ends = [(i, ei, p[ei]) for i, p in enumerate(pts_xy) if len(p) >= 2 for ei in (0, -1)]
-    for k, (xy, z) in enumerate(zip(pts_xy, out)):
-        if len(xy) < 2 or len(z) != len(xy) or not np.isfinite(z).all():
+    cands = []
+    probes = []
+    for k, xy in enumerate(pts_xy):
+        if len(xy) < 2:
             continue
-        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
-        L = float(s[-1])
-        if L < 8.0:
+        L = float(np.sum(np.hypot(*np.diff(xy, axis=0).T)))
+        if L < 4.0:
             continue
         for ek in (0, -1):
             p = xy[ek]
@@ -8468,34 +9937,122 @@ def _seat_approach_ends(lines, zs, ground_roads, ground_fn):
             if dn <= 1e-9:
                 continue
             out_d = d_raw / dn
-            joined = False
+            best = None
             for gxy in g_polys:
                 for ge, gn in ((0, 1), (-1, -2)):
-                    if float(np.hypot(*(gxy[ge] - p))) <= 2.5:
+                    dist = float(np.hypot(*(gxy[ge] - p)))
+                    if dist <= 2.5:
                         gd = gxy[gn] - gxy[ge]
                         gdn = float(np.hypot(*gd))
                         if gdn > 1e-9 and float((gd / gdn) @ out_d) >= 0.70:
-                            joined = True
-                            break
-                if joined:
-                    break
-            if not joined:
+                            if best is None or dist < best[0]:
+                                best = (dist, gxy if ge == 0 else gxy[::-1])
+            if best is None:
                 continue
-            probe = p + 1.5 * out_d
-            try:
-                g_out = float(np.asarray(ground_fn(probe[None, :]), np.float64).ravel()[0])
-            except Exception:
+            g_dir = best[1]
+            g_arc = np.r_[0.0, np.cumsum(np.hypot(*np.diff(g_dir, axis=0).T))]
+            g_len = float(g_arc[-1])
+            def pt_at(d_m):
+                return np.array([float(np.interp(d_m, g_arc, g_dir[:, 0])),
+                                 float(np.interp(d_m, g_arc, g_dir[:, 1]))], np.float64)
+
+            if g_len >= 1.5:
+                q15, q30 = pt_at(1.5), pt_at(min(3.0, g_len))
+            else:
+                q15 = p + 1.5 * out_d
+                q30 = p + 3.0 * out_d
+            q8, q12 = (pt_at(8.0), pt_at(12.0)) if g_len >= 12.0 else (q15, q30)
+            cands.append((k, ek, p, g_len))
+            probes.extend((p, q15, q30, q8, q12))
+    if not cands:
+        return []
+    try:
+        vals = np.asarray(ground_fn(np.asarray(probes, np.float64)), np.float64).ravel()
+    except Exception:
+        return []
+    if len(vals) != 5 * len(cands):
+        return []
+    out = []
+    for i, (k, ek, p, g_len) in enumerate(cands):
+        g_p, g15, g30, g8, g12 = (float(vals[5 * i + j]) for j in range(5))
+        if not all(math.isfinite(v) for v in (g_p, g15, g30, g8, g12)):
+            continue
+        target_z = (2.0 * g15 - g30) if (g_len >= 3.0 and abs(g30 - g15) <= 0.30) else g15
+        if g_len >= 12.0 and abs(g12 - g8) <= 0.45:
+            far_z = 3.0 * g8 - 2.0 * g12
+            if far_z - max(g_p, target_z) > 1.0 and (g8 - g_p) > 1.0:
+                target_z = float(far_z)
+        has_cliff = abs(target_z - g_p) > 0.22 or abs(g15 - g_p) > 0.22
+        out.append((k, ek, p, g_p, g15, float(target_z), has_cliff))
+    return out
+
+
+def _seat_approach_ends(lines, zs, ground_roads, ground_fn):
+    """Seat loose bridge abutments onto a joined ground road when either a sub-metre mouth step
+    (0.22 < |dz| <= 0.80 m) or an abutment-cutoff cliff (has_cliff, |dz| > 0.22 m) separates the deck
+    end from the graded approach bed. Gentle/continuous road grades and unjoined ends stay untouched."""
+    out = [np.asarray(z, np.float64).copy() for z in zs]
+    if ground_fn is None or not ground_roads or not lines or len(lines) != len(out):
+        return out
+    pts_xy = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
+    arcs = [np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))] if len(xy) >= 2 else np.zeros(len(xy))
+            for xy in pts_xy]
+    for k, ek, _p, _gp, g15, target_z, has_cliff in _joined_approach_cliffs(pts_xy, ground_roads, ground_fn):
+        z = out[k]
+        s = arcs[k]
+        L = float(s[-1]) if len(s) else 0.0
+        if len(z) < 2 or len(z) != len(pts_xy[k]) or L < 4.0 or not np.isfinite(z).all():
+            continue
+        eff_target = float(np.clip(target_z, g15 - 0.18, g15 + 0.18)) if abs(target_z - g15) <= 0.35 else target_z
+        dz = float(z[ek]) - eff_target
+        dz_g15 = float(z[ek]) - float(g15)
+        if not (0.22 < abs(dz) <= 0.80 or 0.22 < abs(dz_g15) <= 0.80 or (has_cliff and abs(dz) > 0.22)):
+            continue
+        shift = eff_target - float(z[ek])
+        along = s if ek == 0 else (L - s)
+        run = min(max(abs(shift) / 0.04, 8.0), 0.5 * L)
+        t = np.clip(1.0 - along / max(run, 1e-6), 0.0, 1.0)
+        z += shift * (t * t * (3.0 - 2.0 * t))
+    return out
+
+
+def _seat_end_ons(lines, zs, ons, free_ends=()):
+    """Ease each elevated T-junction (`_end_ons`) end onto its parent deck's current profile. Pure."""
+    if not ons or not lines or not zs:
+        return zs
+    free_set = {(int(k), 0 if int(at) == 0 else -1) for k, at in (free_ends or ())}
+    out = [np.asarray(z, np.float64).copy() for z in zs]
+    pts = [np.asarray(ln, np.float64)[:, :2] for ln in lines]
+    arcs = [np.r_[0.0, np.cumsum(np.hypot(*np.diff(p, axis=0).T))] if len(p) >= 2 else np.zeros(len(p))
+            for p in pts]
+    for _ in range(3):
+        moved = False
+        for k, at, j, arc in ons:
+            if k < 0 or k >= len(out) or j < 0 or j >= len(out):
                 continue
-            if not math.isfinite(g_out):
+            zk, zj = out[k], out[j]
+            sk, sj = arcs[k], arcs[j]
+            if len(zk) < 2 or len(zj) < 2 or len(zk) != len(sk) or len(zj) != len(sj):
                 continue
-            dz = float(z[ek]) - g_out
-            if not (0.22 < abs(dz) <= 0.80):
+            Lk = float(sk[-1])
+            if Lk <= 1e-6:
                 continue
-            shift = (g_out + math.copysign(0.06, dz)) - float(z[ek])
-            along = s if ek == 0 else (L - s)
-            run = min(max(abs(shift) / 0.04, 8.0), 0.5 * L)
-            t = np.clip(1.0 - along / max(run, 1e-6), 0.0, 1.0)
-            z += shift * (t * t * (3.0 - 2.0 * t))
+            zt = float(np.interp(float(arc), sj, zj))
+            if not math.isfinite(zt) or not math.isfinite(float(zk[at])):
+                continue
+            dz = zt - float(zk[at])
+            if abs(dz) <= 1e-4:
+                continue
+            if (int(k), -1 if int(at) == 0 else 0) in free_set:
+                zk += dz
+            else:
+                along = sk if at == 0 else (Lk - sk)
+                run = min(max(abs(dz) / DECK_MAX_GRADE, 15.0), Lk)
+                t = np.clip(1.0 - along / max(run, 1e-6), 0.0, 1.0)
+                zk += dz * (t * t * (3.0 - 2.0 * t))
+            moved = True
+        if not moved:
+            break
     return out
 
 
@@ -8658,9 +10215,8 @@ def pier_portals(piers, decks):
     out = []
     for p in piers:
         tag_kind = p[8][0] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
-        if tag_kind == "portal":
-            out.append(p)
-            continue
+        prior_portal = (p[8] if len(p) > 8 and isinstance(p[8], tuple) and len(p[8]) >= 4 and p[8][0] == "portal"
+                        else None)
         x, y, ux, uy, zt, zb, width = p[:7]
         thick = float(p[7]) if len(p) > 7 and p[7] is not None else None
         q = np.array([float(x), float(y)], np.float64)
@@ -8677,6 +10233,9 @@ def pier_portals(piers, decks):
             pier_t = max(roadmesh.PIER_T, 0.5 * thick if thick is not None else 0.0)
         reach = cap_half + pier_t
         cands = []
+        if prior_portal is not None:
+            _pk, pz0, poff0, phw0 = prior_portal[:4]
+            cands.append((0.0, float(pz0), float(poff0) - float(phw0), float(poff0) + float(phw0)))
         for xy, z, w in recs:
             a, ab = xy[:-1], np.diff(xy, axis=0)
             L2 = np.maximum((ab * ab).sum(1), 1e-12)
@@ -8686,9 +10245,8 @@ def pier_portals(piers, decks):
             k = int(np.argmin(dist))
             hw = float(w) / 2.0
             zz = float(z[k] + t[k] * (z[min(k + 1, len(z) - 1)] - z[k]))
-            # Exclude the pier's own supporting deck while catching lower and near-coplanar adjacent decks
-            z_ceil = float(zt) + (DECK_MIN_DEPTH - 0.15 if dist[k] > 0.5 else 0.0)
-            if not (zz < z_ceil and float(zb) < zz + MIN_BRIDGE_HEADROOM_M):
+            # Strictly lower carriageways only (never self-deck or coplanar sibling/gore slabs)
+            if not (zz < float(zt) and float(zb) < zz + MIN_BRIDGE_HEADROOM_M):
                 continue
             if tag_kind == "median" and zz >= float(zt) - roadmesh.PIER_CAP_H and dist[k] >= hw + float(width) / 2.0 + 0.25:
                 continue
@@ -8699,7 +10257,7 @@ def pier_portals(piers, decks):
                 off = float((near[k] - q) @ nrm)
                 v_span = (off - hw, off + hw)
             cands.append((float(dist[k]), zz, v_span[0], v_span[1]))
-        hits = [c for c in cands if c[0] < 0.5 * (c[3] - c[2]) + reach or (c[2] < cap_half and c[3] > -cap_half)]
+        hits = [c for c in cands if c[2] < cap_half and c[3] > -cap_half]
         if not hits:
             out.append(tuple(p))
             continue
@@ -8718,10 +10276,38 @@ def pier_portals(piers, decks):
                     hi = max(hi, chi)
                     z_road = max(z_road, zz)
                     changed = True
+        mid_v = 0.5 * (lo + hi)
         hw_portal = 0.5 * (hi - lo)
         if hw_portal > PORTAL_MAX_HALF_M:
             continue
-        tag = ("portal", z_road, 0.5 * (lo + hi), hw_portal)
+        left_c = min(mid_v - (hw_portal + gap), -cap_half + 0.5 * roadmesh.PIER_COLUMN)
+        right_c = max(mid_v + (hw_portal + gap), cap_half - 0.5 * roadmesh.PIER_COLUMN)
+        if max(-left_c, right_c) > max(2.0 * cap_half, cap_half + 2.5):
+            continue
+        col_blocked = False
+        for c_lat in (left_c, right_c):
+            q_col = q + nrm * c_lat
+            for r_xy, r_z, r_w in recs:
+                ra, rab = r_xy[:-1], np.diff(r_xy, axis=0)
+                rL2 = np.maximum((rab * rab).sum(1), 1e-12)
+                rt = np.clip(((q_col - ra) * rab).sum(1) / rL2, 0.0, 1.0)
+                rnear = ra + rt[:, None] * rab
+                rdist = np.hypot(*(rnear - q_col).T)
+                rk = int(np.argmin(rdist))
+                rzz = float(r_z[rk] + rt[rk] * (r_z[min(rk + 1, len(r_z) - 1)] - r_z[rk]))
+                if rzz < float(zt) and float(zb) < rzz + MIN_BRIDGE_HEADROOM_M:
+                    if float(rdist[rk]) < 0.5 * float(r_w) + 0.5 * roadmesh.PIER_COLUMN + 1.0:
+                        col_blocked = True
+                        break
+            if col_blocked:
+                break
+        if col_blocked:
+            continue
+        if prior_portal is not None and abs(z_road - float(prior_portal[1])) <= 1e-6 and (
+                abs(mid_v - float(prior_portal[2])) <= 1e-6 and abs(hw_portal - float(prior_portal[3])) <= 1e-6):
+            out.append(p)
+            continue
+        tag = ("portal", z_road, mid_v, hw_portal)
         head = tuple(p[:8]) if len(p) > 7 else tuple(p[:7]) + (None,)
         out.append(head + (tag,) + tuple(p[9:]))
     return out
@@ -8877,6 +10463,30 @@ class BridgeProfiles:
             return z
         return ground
 
+    def _approach_ground(self, lines, gl, base):
+        """Wrap `base` so loose abutment endpoints sitting on a grading cutoff cliff return the
+        extrapolated joined approach road height instead of the raw cliff drop."""
+        ground_ends = {}
+        if not self.END_JOINS or not gl or not lines:
+            return base, ground_ends
+        cliffs = _joined_approach_cliffs(lines, gl, self._ground)
+        keep = []
+        for k, ek, p, _gp, _g15, target_z, has_cliff in cliffs:
+            ground_ends[(k, ek)] = float(target_z)
+            if has_cliff:
+                keep.append((float(p[0]), float(p[1]), float(target_z)))
+        if not keep:
+            return base, ground_ends
+        ks = np.asarray(keep, np.float64)
+
+        def ground(xy):
+            z = np.asarray(base(xy), np.float64)
+            xy = np.asarray(xy, np.float64).reshape(-1, 2)
+            for px, py, zt in ks:
+                z = np.where((np.abs(xy[:, 0] - px) < 1e-6) & (np.abs(xy[:, 1] - py) < 1e-6), zt, z)
+            return z
+        return ground, ground_ends
+
     def _ground(self, xy):
         la, lo, _ = self.frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
         return self.frame.geodetic_to_enu(la, lo, np.asarray(self.elev(la, lo), np.float64))[2]
@@ -8918,7 +10528,7 @@ class BridgeProfiles:
             half = item[2] if len(item) > 2 else None
             if k not in ground:
                 ground[k] = lines
-            if half is not None and k[1] == "g":
+            if half is not None and k[1] in ("g", "t"):
                 self._road_half[k] = float(half)
 
     def _cell_entries(self, key):
@@ -8935,6 +10545,21 @@ class BridgeProfiles:
         if feats is not None and len(feats):
             bs = self.specs_of(feats)
             rs = road_specs(feats)
+            ts = tunnel_specs(feats)
+            raw_fn = getattr(self, "raw", None) or getattr(self, "elev", None)
+            over_tun = None
+            if self.END_JOINS and any(t is not None for t in ts) and getattr(self, "frame", None) is not None and raw_fn is not None:
+                gl_t, gh_t = [], []
+                for j_r in range(len(feats)):
+                    if rs[j_r] is None:
+                        continue
+                    for r_g in ground_parts(feats, j_r):
+                        eg, ng = mapgeom.enu_xy(feats, self.frame, r_g)
+                        gl_t.append(np.stack([eg, ng], axis=1))
+                        gh_t.append(float(rs[j_r].width) / 2.0)
+                over_tun = (gl_t, gh_t)
+            unbuilt = unbuilt_mask(feats)
+            subtypes = feats.attrs.get("subtype")
             names = feats.attrs.get("name")
             for i in range(len(feats)):
                 fid = str(feats.ids[i])
@@ -8949,13 +10574,28 @@ class BridgeProfiles:
                                           float(np.mean(ring[:, 0])), lvls[j] if j < len(lvls) else 1.0, len(ring),
                                           str(names[i]) if names is not None else "")     # (roadz: name matching)
                     parts.extend(best.items())
-                if rs[i] is not None:
+                sp_r = rs[i]
+                if sp_r is None:
+                    hc = home_copy(feats, i)
+                    if hc is not None:
+                        sp_r = road_specs(hc[0])[hc[1]]
+                if sp_r is not None:
                     lines = []
                     for ring in ground_parts(feats, i):
                         e, n = mapgeom.enu_xy(feats, self.frame, ring)
                         lines.append(np.stack([e, n], axis=1))
-                    roads_.append(((fid, "g"), lines, float(rs[i].width) / 2.0))
-                elif _rail_drawn(feats, i):
+                    roads_.append(((fid, "g"), lines, float(sp_r.width) / 2.0))
+                    tlines = []
+                    for ring in _parts_by_level(feats, i, "tunnel"):
+                        e, n = mapgeom.enu_xy(feats, self.frame, ring)
+                        tlines.append(np.stack([e, n], axis=1))
+                    if tlines:
+                        roads_.append(((fid, "w"), tlines, None))
+                if ts[i] is not None and over_tun is not None:
+                    olines = open_tunnel_lines(feats, i, ts[i], self.frame, raw_fn, over=over_tun)
+                    if olines:
+                        roads_.append(((fid, "t"), olines, float(ts[i].width) / 2.0))
+                if sp_r is None and _rail_drawn(feats, i):
                     # a railway on the ground: the decks over it keep their headroom too (GitHub #324: a road bridge
                     # lay on the tracks; only roads under a deck were counted)
                     import railways
@@ -8967,6 +10607,13 @@ class BridgeProfiles:
                                 lines.append(np.stack([e, n], axis=1))
                     if lines:
                         roads_.append(((fid, "r"), lines, None))
+                elif not unbuilt[i] and (subtypes is None or str(subtypes[i]) == "road"):
+                    wlines = []
+                    for ring in _parts_by_level(feats, i, "ground") + _parts_by_level(feats, i, "tunnel"):
+                        e, n = mapgeom.enu_xy(feats, self.frame, ring)
+                        wlines.append(np.stack([e, n], axis=1))
+                    if wlines:
+                        roads_.append(((fid, "w"), wlines, None))
         got = (parts, roads_)
         with self.lock:
             if len(cache) > 64:
@@ -9024,6 +10671,9 @@ class BridgeProfiles:
             for a, b in _deck_beside([pool[k][1] for k in keys], [pool[k][0].width for k in keys]):
                 crossing.setdefault(keys[a], set()).add(keys[b])
                 crossing.setdefault(keys[b], set()).add(keys[a])
+            for a, b in _deck_overlap_pairs([pool[k][1] for k in keys], [pool[k][0].width for k in keys]):
+                crossing.setdefault(keys[a], set()).add(keys[b])
+                crossing.setdefault(keys[b], set()).add(keys[a])
             # and a free end joining another part's end (_end_joins): solved as one
             for a, b in self._end_join_pairs([pool[k][1] for k in keys], [pool[k][0].width / 2 for k in keys], ground,
                                              [pool[k][3] for k in keys]):
@@ -9058,17 +10708,113 @@ class BridgeProfiles:
             if not grew:
                 return sorted(comp)
 
+    def _ground_crossings(self, lines, pool, comp, ground):
+        """Crossing requirements [(part, arc, ground_z[, None, None, extra])] for surface roads ('g') and
+        open-cut tunnels ('t'), sampling the overlapping skewed/wide carriageway footprint and recording
+        per-crossing headroom reach."""
+        road_half = getattr(self, "_road_half", {})
+        gl_items = [(g, float(road_half.get(k, 0.0)), k[1] == "t")
+                    for k, v in ground.items() if k[1] in ("g", "t") for g in v]
+        gl = [g for g, _, _ in gl_items]
+        by_g = _crossings_by(lines, gl) if gl else []
+        cr, extras = [], []
+        sample_pts, sample_slices = [], []
+        part_arcs = [np.r_[0.0, np.cumsum(np.hypot(*np.diff(np.asarray(ln, np.float64)[:, :2], axis=0).T))]
+                     for ln in lines]
+        for gi, cs in enumerate(by_g):
+            if not cs:
+                continue
+            gline = np.asarray(gl[gi], np.float64)[:, :2]
+            rh, grade_sep = gl_items[gi][1], gl_items[gi][2]
+            gs = np.r_[0.0, np.cumsum(np.hypot(*np.diff(gline, axis=0).T))] if len(gline) >= 2 else np.zeros(1)
+            ga, gab = gline[:-1], np.diff(gline, axis=0)
+            gL2 = np.maximum((gab * gab).sum(1), 1e-12)
+            for c in cs:
+                cr.append(c)
+                pi, sc, pt = int(c[0]), float(c[1]), np.asarray(c[2], np.float64)[:2]
+                L_p = float(part_arcs[pi][-1]) if len(part_arcs[pi]) else 0.0
+                hw = float(pool[comp[pi]][0].width) / 2.0 + roadmesh.PARAPET_W
+                i0 = len(sample_pts)
+                sample_pts.append(pt)
+                back_r = fwd_r = DECK_CLEAR_REACH_M
+                dxy = np.asarray(lines[pi], np.float64)[:, :2]
+                if (len(ga) and gs[-1] > 1e-3 and len(dxy) >= 2
+                        and (grade_sep or min(sc, L_p - sc) > AT_GRADE_REACH_M) and hw > 0.5):
+                    tg = np.clip(((pt - ga) * gab).sum(1) / gL2, 0.0, 1.0)
+                    kg = int(np.argmin(np.hypot(*(ga + tg[:, None] * gab - pt).T)))
+                    s_pt = float(gs[kg] + tg[kg] * (gs[kg + 1] - gs[kg]))
+                    reach_g = hw + rh
+                    reach_s = min(max(6.0 * reach_g, 2.5 * hw, DECK_CLEAR_REACH_M), 80.0, float(gs[-1]))
+                    st_g = np.linspace(max(0.0, s_pt - reach_s), min(float(gs[-1]), s_pt + reach_s),
+                                       max(3, int(math.ceil(2.0 * reach_s / 2.0)) + 1))
+                    cand = np.c_[np.interp(st_g, gs, gline[:, 0]), np.interp(st_g, gs, gline[:, 1])]
+                    da, dab = dxy[:-1], np.diff(dxy, axis=0)
+                    dL = np.hypot(*dab.T)
+                    dL2 = np.maximum((dab * dab).sum(1), 1e-12)
+
+                    def proj_deck(q):
+                        td = np.clip(((q[:, None, :] - da[None]) * dab[None]).sum(2) / dL2[None], 0.0, 1.0)
+                        sd = np.hypot(*(q[:, None, :] - (da[None] + td[..., None] * dab[None])).transpose(2, 0, 1))
+                        si = np.argmin(sd, axis=1)
+                        rows = np.arange(len(q))
+                        return sd[rows, si], part_arcs[pi][si] + td[rows, si] * dL[si]
+
+                    dist_d, s_proj = proj_deck(cand)
+                    k0 = int(np.argmin(np.abs(st_g - s_pt)))
+                    over = dist_d <= reach_g
+                    if over[k0]:
+                        lo = hi = k0
+                        while lo > 0 and over[lo - 1]:
+                            lo -= 1
+                        while hi + 1 < len(over) and over[hi + 1]:
+                            hi += 1
+                        run = slice(lo, hi + 1)
+                        run_pts = cand[run]
+                        sample_pts.extend(run_pts)
+                        s_hits = [s_proj[run]]
+                        if rh > 0.5:
+                            seg_k = np.clip(np.searchsorted(gs[1:], st_g[run], side="right"), 0, len(gab) - 1)
+                            tan_g = gab[seg_k] / np.maximum(np.hypot(*gab[seg_k].T)[:, None], 1e-9)
+                            nrm_g = np.c_[-tan_g[:, 1], tan_g[:, 0]]
+                            for sign in (-1.0, 1.0):
+                                edge_pts = run_pts + sign * rh * nrm_g
+                                ed_dist, ed_s = proj_deck(edge_pts)
+                                keep = ed_dist <= hw + 0.5
+                                if keep.any():
+                                    sample_pts.extend(edge_pts[keep])
+                                    s_hits.append(ed_s[keep])
+                        all_s = np.concatenate(s_hits)
+                        near_s = all_s[np.abs(all_s - sc) <= 80.0]
+                        if len(near_s):
+                            back_r = min(80.0, max(DECK_CLEAR_REACH_M, sc - float(np.min(near_s)) + 2.0))
+                            fwd_r = min(80.0, max(DECK_CLEAR_REACH_M, float(np.max(near_s)) - sc + 2.0))
+                sample_slices.append((i0, len(sample_pts)))
+                extras.append({"back": back_r, "fwd": fwd_r, "grade_sep": grade_sep}
+                              if grade_sep or back_r > DECK_CLEAR_REACH_M + 0.1 or fwd_r > DECK_CLEAR_REACH_M + 0.1
+                              else None)
+        if not sample_pts:
+            return []
+        all_rz = np.asarray(self._ground(np.asarray(sample_pts, np.float64)), np.float64).reshape(-1)
+        out = []
+        for c, (a_, b_), ex in zip(cr, sample_slices, extras):
+            z = float(np.max(all_rz[a_:b_]))
+            out.append((c[0], c[1], z) if ex is None else (c[0], c[1], z, None, None, ex))
+        return out
+
     def _solve(self, comp, pool, ground):
         """Deck heights of the chain comp (keys of pool)."""
-        lines = [pool[k][1] for k in comp]
-        # (solved with its free ends that join another part's moved onto those joints: _end_joins; the heights are
-        # per point, so the parts keep their own lines)
-        lines = _joined_lines(lines, self._end_joins_of(lines, [pool[k][0].width / 2 for k in comp], ground,
-                                                        levels=[pool[k][3] for k in comp]))
-        gl = [g for k, v in ground.items() if k[1] == "g" for g in v]
+        raw_lines = [pool[k][1] for k in comp]
+        specs = [pool[k][0] for k in comp]
+        joins = self._end_joins_of(raw_lines, [s.width / 2 for s in specs], ground,
+                                   levels=[pool[k][3] for k in comp])
+        lines = _weld_butt_lines(raw_lines, joins, specs=specs)
+        tl = getattr(self, "_obs_tl", None)
+        if tl is not None:
+            tl.welded = lines
+        # (branch/ramp joins solve with their free ends moved onto those joints while keeping their own xy)
+        lines = _joined_lines(lines, joins)
+        required = self._ground_crossings(lines, pool, comp, ground)
         rl = [g for k, v in ground.items() if k[1] == "r" for g in v]
-        cr = _crossings(lines, gl)
-        road_z = self._ground(np.array([c[2] for c in cr])) if cr else []
         # (the railways under the chain: the same headroom, given as their own clearance, so never a junction at
         # grade by an abutment as a road can be)
         rcr = _crossings(lines, rl) if rl else []
@@ -9079,7 +10825,6 @@ class BridgeProfiles:
         except Exception as ex:             # the share-of-span rule alone
             log.debug("nav clearance: %s: %s", type(ex).__name__, ex)
             nav = 0.0
-        required = [(c[0], c[1], z) for c, z in zip(cr, road_z)]
         depth = self._depth(lines) if bridge_profile_mode() == "curve" else None
         dd = self.__dict__.setdefault("depth", {})
         for k in comp:
@@ -9093,19 +10838,29 @@ class BridgeProfiles:
             water = self._gap(lines, nav, depth)
         rails = [(c[0], c[1], z, deck_road_clear(depth)) for c, z in zip(rcr, rail_z)]
         levels = [pool[k][3] for k in comp]
+        gl = [g for k, v in ground.items() if k[1] == "g" for g in v]
         pins = _ground_pins(lines, gl)          # (once: pure in lines and gl, which stay)
+        gw = [g for k, v in ground.items() if k[1] in ("g", "w", "t") for g in v]
+        ons = self._end_ons_of(lines, [pool[c][0].width / 2 for c in comp], levels, ground)
+        on_ends = {(int(k), 0 if int(at) == 0 else -1) for k, at, _j, _arc in ons}
+        free_ends = _free_deck_ends(lines, gw, pins=pins, end_ons=ons) if self.END_JOINS else frozenset()
+        unpinned_obs = on_ends | set(free_ends)
+        all_service = bool(comp) and all(
+            isinstance(getattr(pool[k][0], "cls", None), str) and pool[k][0].cls == "service" for k in comp)
+        max_grade = DECK_SERVICE_GRADE if all_service else None
 
         def solve(ground_fn):
             return deck_profile(lines, ground_fn, required + rails + water, clear=deck_road_clear(depth),
                                 levels=levels, widths=[pool[k][0].width for k in comp], pins=pins,
-                                ground_roads=gl if self.END_JOINS else None)
+                                ground_roads=gw if self.END_JOINS else None,
+                                end_ons=ons if self.END_JOINS else None, max_grade=max_grade)
         base = self._landing_ground(lines, gl)
+        base, ground_ends = self._approach_ground(lines, gl, base)
         zs = solve(base)
         # a free end standing on another deck: solved again with it at that deck's height as drawn (measured too:
         # _observed) (_end_ons)
         over = {}
-        ons = self._end_ons_of(lines, [pool[c][0].width / 2 for c in comp], levels, ground)
-        final = self._observed(comp, pool, lines, zs, pins=pins) if ons else zs
+        final = self._observed(comp, pool, lines, zs, pins=pins, end_on_ends=unpinned_obs, ground_ends=ground_ends) if ons else zs
         for k, at, j, arc in ons:
             lj = np.asarray(lines[j], np.float64)[:, :2]
             sj = np.r_[0.0, np.cumsum(np.hypot(*np.diff(lj, axis=0).T))]
@@ -9125,14 +10880,15 @@ class BridgeProfiles:
                 return z
             zs = solve(ground_on)
         deficits = _clearance_deficits(
-            lines, zs, required + [r[:3] for r in rails], depth,
+            lines, zs, [r[:3] for r in required] + [r[:3] for r in rails], depth,
             _deck_stacks(lines, levels, [pool[k][0].width for k in comp], pins=pins))
         if deficits:
             # (debug: a city has hundreds of such bridges, each solved again in every process and tile; as a warning it
             # filled players' consoles, GitHub #391, TGForever Discord 2026-10-28)
             log.debug("bridge clearance below %.1f m target: %s; abutment/grade or map constraints prevent full headroom",
                       MIN_BRIDGE_HEADROOM_M, [(comp[i], round(h, 2)) for i, h in deficits[:3]])
-        out = final if (ons and not over) else self._observed(comp, pool, lines, zs, pins=pins)
+        out = final if (ons and not over) else self._observed(
+            comp, pool, lines, zs, pins=pins, end_on_ends=unpinned_obs, ground_ends=ground_ends)
         widths = [pool[k][0].width for k in comp]
         hook = DECK_Z_HOOK
         if hook is not None:
@@ -9147,11 +10903,16 @@ class BridgeProfiles:
                 out = [g if g is not None else z for g, z in zip(got, out)]
                 if len(got) == len(out) == len(lines):
                     out = _agree_hook_joints(lines, out, got)
+        if ons:
+            out = _seat_end_ons(lines, out, ons, free_ends=free_ends)
         if len(lines) >= 2:
             out = _sync_fork_siblings(lines, out, widths)
         if self.END_JOINS and len(lines) >= 2 and levels is not None:
-            out = _hold_stack_sep(lines, out, levels, widths, DECK_ROAD_CLEAR, self._ground, pins,
-                                  ground_roads=gl)
+            stack_clear = max(DECK_ROAD_CLEAR, deck_road_clear(depth)) + 0.08
+            out = _hold_stack_sep(lines, out, levels, widths, stack_clear, self._ground, pins,
+                                  ground_roads=gw, end_ons=ons, free_ends=free_ends)
+            if ons:
+                out = _seat_end_ons(lines, out, ons, free_ends=free_ends)
         return _floor_deck_over_ground(lines, out, widths, self._ground)
 
     def _higher_near(self, xy, half, level, key, pool):
@@ -9196,7 +10957,7 @@ class BridgeProfiles:
             log.debug("higher deck cover: %s: %s", type(ex).__name__, ex)
         return out
 
-    def _observed(self, comp, pool, lines, zs, level=1, pins=None):
+    def _observed(self, comp, pool, lines, zs, level=1, pins=None, end_on_ends=None, ground_ends=None):
         """The chain's deck heights where a source measured them (roadz.py: IGN BD TOPO, NVDB, US lidar), the solved
         ones (the inference) elsewhere. Each joint ends up at one height: an abutment (a joint no other part of the
         chain shares) at the solved one (the graded road it meets), a joint between parts at the mean of their measured
@@ -9311,11 +11072,23 @@ class BridgeProfiles:
             import grading
             graded_elev = hasattr(self.elev, "_planner")
             zd = self._dem_at(xy)
+            g_ends = self._ground(xy[[0, -1]]) if (not graded_elev and len(xy) >= 2 and np.isfinite(zd).any()) else None
+            g0 = float(g_ends[0]) if g_ends is not None else float("nan")
+            g1 = float(g_ends[1]) if g_ends is not None else float("nan")
+            if ground_ends is not None:
+                g0 = ground_ends.get((k, 0), g0)
+                g1 = ground_ends.get((k, -1), g1)
+            raised0 = (np.isfinite(zd[0]) and float(z[0]) > float(zd[0]) + grading.ABUT_AGREE_M
+                       and np.isfinite(g0) and abs(float(z[0]) - g0) <= grading.ABUT_AGREE_M)
+            raised1 = (np.isfinite(zd[-1]) and float(z[-1]) > float(zd[-1]) + grading.ABUT_AGREE_M
+                       and np.isfinite(g1) and abs(float(z[-1]) - g1) <= grading.ABUT_AGREE_M)
             zl0 = float(o[0]) if o is not None and end_obs[k][0] and np.isfinite(o[0]) else float("nan")
             zl1 = float(o[-1]) if o is not None and end_obs[k][1] and np.isfinite(o[-1]) else float("nan")
-            t0 = (float(z[0]) if graded_elev else grading.abutment_z(float(z[0]), zl0, float(zd[0]))) \
+            on0 = end_on_ends is not None and (k, 0) in end_on_ends
+            on1 = end_on_ends is not None and (k, -1) in end_on_ends
+            t0 = (float(z[0]) if (graded_elev or on0 or raised0) else grading.abutment_z(float(z[0]), zl0, float(zd[0]))) \
                 if deg[a] == 1 else target.get(a, z[0])
-            t1 = (float(z[-1]) if graded_elev else grading.abutment_z(float(z[-1]), zl1, float(zd[-1]))) \
+            t1 = (float(z[-1]) if (graded_elev or on1 or raised1) else grading.abutment_z(float(z[-1]), zl1, float(zd[-1]))) \
                 if deg[b] == 1 else target.get(b, z[-1])
             if o is None and t0 == z[0] and t1 == z[-1]:
                 out.append(z)
@@ -9485,26 +11258,42 @@ class BridgeProfiles:
                 log.debug("chain %s from its owner: %s: %s", key, type(ex).__name__, ex)
         tl = self.__dict__.setdefault("_obs_tl", threading.local())
         tl.measured = set()
+        tl.welded = None
         zs = self._solve(comp, pool, ground)
+        use_lines = tl.welded if tl.welded is not None else [pool[k][1] for k in comp]
         gl = [g for k, v in ground.items() if k[1] == "g" for g in v] if self.END_JOINS else None
-        specs = (_trim_parallel_widths([pool[k][1] for k in comp], zs, [pool[k][0] for k in comp],
+        gw = [g for k, v in ground.items() if k[1] in ("g", "w") for g in v] if self.END_JOINS else None
+        specs = (_trim_parallel_widths(use_lines, zs, [pool[k][0] for k in comp],
                                        [pool[k][3] for k in comp])
                  if self.END_JOINS else [pool[k][0] for k in comp])
-        zs = _tie_beside([pool[k][1] for k in comp], zs, specs,     # (ramps beside their road)
-                         [k in tl.measured for k in comp], gl)
+        if self.END_JOINS:
+            zs = _tie_beside(use_lines, zs, specs,     # (ramps beside their road)
+                             [k in tl.measured for k in comp], gl)
         if self.END_JOINS and comp:
-            raw_lines = [pool[k][1] for k in comp]
+            raw_lines = use_lines
+            joined_post = _joined_lines(raw_lines, self._end_joins_of(
+                raw_lines, [pool[k][0].width / 2 for k in comp], ground, levels=[pool[k][3] for k in comp]))
             widths_post = [sp.width for sp in specs]
             levels_post = [pool[k][3] for k in comp]
-            pins_post = _ground_pins(raw_lines, gl or [])
+            pins_post = _ground_pins(joined_post, gl or [])
             zs = _seat_approach_ends(raw_lines, zs, gl, self._ground)
+            ons_post = self._end_ons_of(raw_lines, [w / 2.0 for w in widths_post], levels_post, ground)
+            free_post = _free_deck_ends(joined_post, gw, pins=pins_post, end_ons=ons_post)
+            if ons_post:
+                zs = _seat_end_ons(raw_lines, zs, ons_post, free_ends=free_post)
             if len(raw_lines) >= 2 and levels_post is not None:
+                dd_map = self.__dict__.get("depth", {})
+                clear_post = max([DECK_ROAD_CLEAR] + [deck_road_clear(dd_map.get(k, DECK_FULL_DEPTH)) for k in comp]) + 0.08
                 zs = _hold_stack_sep(raw_lines, zs, levels_post, widths_post,
-                                     DECK_ROAD_CLEAR, self._ground, pins_post, ground_roads=gl)
+                                     clear_post, self._ground, pins_post, ground_roads=gw, end_ons=ons_post,
+                                     free_ends=free_post)
+                if ons_post:
+                    zs = _seat_end_ons(raw_lines, zs, ons_post, free_ends=free_post)
+                zs = _seat_approach_ends(raw_lines, zs, gl, self._ground)
             zs = _floor_deck_over_ground(raw_lines, zs, widths_post, self._ground)
         with self.lock:
-            for k, z, spec in zip(comp, zs, specs):
-                _sp0, xy, lon = pool[k][:3]
+            for k, xy, z, spec in zip(comp, use_lines, zs, specs):
+                _sp0, _raw_xy, lon = pool[k][:3]
                 old = self.done.get(k)
                 # the first solve of a part is kept, and what goes with it, unless this one saw more of it
                 if old is None or len(xy) > len(old[1]):
@@ -9527,9 +11316,11 @@ class BridgeProfiles:
                 if spans:
                     self.__dict__.setdefault("span_zones", {})[ck] = spans
                 self._drop_lower_cages(chain, beams, ck)
+                self._clear_trusses_over(chain, skip=ck)
                 self._drop_span_piers()
         else:
             with self.lock:
+                self._clear_trusses_over(chain, skip=ck)
                 self._drop_span_piers(comp)
         return got
 
@@ -9610,11 +11401,16 @@ class BridgeProfiles:
                 rs = road_specs(feats)
                 for i in range(len(feats)):
                     fid = str(feats.ids[i])
-                    if rs[i] is not None:
+                    sp = rs[i]
+                    if sp is None:
+                        hc = home_copy(feats, i)
+                        if hc is not None:
+                            sp = road_specs(hc[0])[hc[1]]
+                    if sp is not None:
                         lines = [np.stack(mapgeom.enu_xy(feats, self.frame, ring), axis=1)
                                  for ring in ground_parts(feats, i)]
                         if lines:
-                            entries.append(((fid, "g"), lines, float(rs[i].width) / 2.0))
+                            entries.append(((fid, "g"), lines, float(sp.width) / 2.0))
                     elif include_rail and _rail_drawn(feats, i):
                         import railways
                         lines = [np.stack(mapgeom.enu_xy(feats, self.frame, ring), axis=1)
@@ -9623,7 +11419,7 @@ class BridgeProfiles:
                             entries.append(((fid, "r"), lines, None))
             for item in entries:
                 gk, lines, half = item[0], item[1], item[2]
-                if not include_rail and gk[1] != "g":
+                if gk[1] != "g" and not (include_rail and gk[1] == "r"):
                     continue
                 npts = sum(len(ln) for ln in lines)
                 old = by_key.get(gk)
@@ -9634,8 +11430,10 @@ class BridgeProfiles:
     def _commit(self, k, ground=None):
         """Under self.lock: part k's solve was kept: its piers (pier_sites; TunnelProfiles keeps its sections)."""
         spec, xy, z, _lon = self.done[k]
-        by_key = {gk: (v, self._road_half.get(gk)) for gk, v in (ground or {}).items()}
-        for gk, rlines, half in self._bbox_ground_roads(xy, pad=self.PIER_CELL_MARGIN_M, include_rail=True):
+        xy_arr = np.asarray(xy, np.float64)[:, :2]
+        z_arr = np.asarray(z, np.float64)
+        by_key = {gk: (v, self._road_half.get(gk)) for gk, v in (ground or {}).items() if gk[1] in ("g", "t", "w", "r")}
+        for gk, rlines, half in self._bbox_ground_roads(xy_arr, pad=self.PIER_CELL_MARGIN_M, include_rail=True):
             if gk not in by_key:
                 by_key[gk] = (rlines, half)
         lines, halves = [], []
@@ -9643,8 +11441,25 @@ class BridgeProfiles:
             for ln in v:
                 lines.append(ln)
                 halves.append(half)
+        if len(xy_arr) >= 2 and len(z_arr):
+            pad_d = self.PIER_CELL_MARGIN_M
+            lo_xy, hi_xy = xy_arr.min(0) - pad_d, xy_arr.max(0) + pad_d
+            z_hi_max = float(np.max(z_arr))
+            for ok, (osp, oxy, oz, _olon) in self.done.items():
+                if ok == k:
+                    continue
+                oxy2 = np.asarray(oxy, np.float64)[:, :2]
+                oz_arr = np.asarray(oz, np.float64)
+                if len(oxy2) < 2 or not len(oz_arr):
+                    continue
+                if (oxy2.max(0) < lo_xy).any() or (oxy2.min(0) > hi_xy).any():
+                    continue
+                if z_hi_max - float(np.min(oz_arr)) >= 2.0:
+                    ow = float(getattr(osp, "width", 0.0) or 0.0)
+                    lines.append(oxy2)
+                    halves.append(0.5 * ow if ow > 0.0 else None)
         try:
-            self.piers[k] = pier_sites(np.asarray(xy, np.float64), np.asarray(z, np.float64), spec.width,
+            self.piers[k] = pier_sites(np.asarray(xy, np.float64), z_arr, spec.width,
                                        self._ground, lines, self._wet_at, self.__dict__.get("depth", {}).get(k),
                                        road_halves=halves)
         except Exception as ex:             # no piers rather than no bridge
@@ -9705,6 +11520,23 @@ class BridgeProfiles:
                 kept.append(b)
             self.trusses[ck] = kept
 
+    def _clear_trusses_over(self, chain, skip=None):
+        """Under self.lock: drop previously stored overhead members that intrude into newly committed decks."""
+        if not chain or not self.trusses:
+            return
+        import bridgetypes
+        c_pts = np.concatenate([np.asarray(xy, np.float64)[:, :2] for xy, _, _ in chain if len(xy)])
+        if not len(c_pts):
+            return
+        lo_c, hi_c = c_pts.min(0) - 60.0, c_pts.max(0) + 60.0
+        for ck, old in list(self.trusses.items()):
+            if ck == skip or not old:
+                continue
+            b_pts = np.asarray([b[0][:2] for b in old] + [b[1][:2] for b in old], np.float64)
+            if (b_pts.max(0) < lo_c).any() or (b_pts.min(0) > hi_c).any():
+                continue
+            self.trusses[ck] = bridgetypes._clear_of_decks(old, (), other_decks=chain)
+
     def _drop_span_piers(self, keys=None):
         """Under self.lock: drop intermediate pier_sites wall piers inside bridgetypes clear spans."""
         zones = [z for v in self.__dict__.get("span_zones", {}).values() for z in v]
@@ -9743,6 +11575,23 @@ class BridgeProfiles:
             if higher:
                 return [], [], []
             parts = list(chain) + lower
+            part_ids = {id(xy) for xy, _, _ in parts}
+            with self.lock:
+                dd_map = self.__dict__.get("depth", {})
+                done_depth = {id(v[1]): float(dd_map[k]) for k, v in self.done.items() if k in dd_map}
+                snap = list(self.done.values())
+            part_depths = [done_depth.get(id(xy), DECK_FULL_DEPTH) for xy, _, _ in parts]
+            all_pts = np.concatenate([np.asarray(xy, np.float64)[:, :2] for xy, _, _ in parts]) if parts else np.zeros((0, 2))
+            other_decks = []
+            if len(all_pts):
+                lo_c, hi_c = all_pts.min(0) - 60.0, all_pts.max(0) + 60.0
+                for sp_o, xy_o, z_o, _ in snap:
+                    if id(xy_o) in part_ids or len(xy_o) < 2:
+                        continue
+                    p_o = np.asarray(xy_o, np.float64)[:, :2]
+                    if (p_o.max(0) < lo_c).any() or (p_o.min(0) > hi_c).any():
+                        continue
+                    other_decks.append((xy_o, z_o, float(sp_o.width)))
             infra = []
             if self.infra_fn is not None:
                 pts = np.concatenate([np.asarray(xy, np.float64) for xy, _, _ in parts])
@@ -9755,7 +11604,7 @@ class BridgeProfiles:
                 if pylons is None and info.get("type") in (bridgetypes.NBI_SUSPENSION, bridgetypes.NBI_STAYED):
                     pylons = bridgetypes.pylon_sites(self.frame, infra, self._ground) if infra else []
                 b, p = bridgetypes.structure_members(parts, info, self._ground, wet, road_lines=self._roads_near,
-                                                     pylons=pylons or ())
+                                                     pylons=pylons or (), depths=part_depths, other_decks=other_decks)
                 spans += bridgetypes.structure_spans(parts, info, self._ground, wet, pylons=pylons or ())
                 beams += b
                 piers += p
@@ -9808,6 +11657,8 @@ class BridgeProfiles:
             allp = [p for v in self.piers.values() for p in v]
             done = list(self.done.values())
         piers = [p for p in allp if box_owns(box, p[0], p[1])]
+        if not piers:
+            return []
         pad = 80.0
         decks = []
         for spec, xy, z, _lon in done:
@@ -9820,6 +11671,19 @@ class BridgeProfiles:
             w = float(getattr(spec, "width", 0.0) or 0.0)
             if w > 0.0:
                 decks.append((xy, np.asarray(z, np.float64), w))
+        for _gk, rlines, half in self._bbox_ground_roads(np.array([[x0, y0], [x1, y1]], np.float64),
+                                                         pad=pad, include_rail=True):
+            w_g = 2.0 * float(half) if half is not None and half > 0.0 else 6.0
+            for ln in rlines:
+                gxy = np.asarray(ln, np.float64)[:, :2]
+                if len(gxy) < 2:
+                    continue
+                if (gxy[:, 0].max() < x0 - pad or gxy[:, 0].min() > x1 + pad
+                        or gxy[:, 1].max() < y0 - pad or gxy[:, 1].min() > y1 + pad):
+                    continue
+                gz = np.asarray(self._ground(gxy), np.float64)
+                if len(gz) == len(gxy) and np.isfinite(gz).all():
+                    decks.append((gxy, gz, w_g))
         return pier_portals(piers, decks)
 
     @staticmethod
@@ -9848,8 +11712,10 @@ def tunnel_sections(s, g, open_cover=None, full_cover=None, min_m=SECTION_MIN_M)
 
 def _shallow_full_low(s, g, floor, kinds):
     """kinds with each full-tunnel run (2) shorter than FULL_MIN_M and nowhere FULL_DEEP_M under the ground a low arch
-    (1). Pure."""
+    (1), plus shallow (< TUNNEL_H + ARCH_SOIL_MIN) shoulders peeled off both ends of remaining full runs. Pure."""
     kinds = np.array(kinds, np.int64)
+    cov = np.asarray(g, np.float64) - np.asarray(floor, np.float64)
+    thresh = roadmesh.TUNNEL_H + ARCH_SOIL_MIN
     i, n = 0, len(kinds)
     while i < n:
         if kinds[i] != 2:
@@ -9858,10 +11724,62 @@ def _shallow_full_low(s, g, floor, kinds):
         j = i
         while j + 1 < n and kinds[j + 1] == 2:
             j += 1
-        if s[j] - s[i] < FULL_MIN_M and float(np.max(g[i:j + 1] - floor[i:j + 1])) < FULL_DEEP_M:
+        if s[j] - s[i] < FULL_MIN_M and float(np.max(cov[i:j + 1])) < FULL_DEEP_M:
             kinds[i:j + 1] = 1
+        else:
+            a = i
+            while a <= j and cov[a] < thresh:
+                a += 1
+            if a < j and a > 0 and cov[a - 1] < thresh and (kinds[i - 1] == 1 or a > i):
+                a += 1
+            if a > i and (a > j or (i > 0 and kinds[i - 1] == 1) or (s[a - 1] - s[i] >= SECTION_MIN_M)
+                          or float(np.min(cov[i:a])) < roadmesh.TUNNEL_H):
+                kinds[i:a] = 1
+            else:
+                a = i
+            b = j
+            while b >= a and cov[b] < thresh:
+                b -= 1
+            if b < j and ((j + 1 < n and kinds[j + 1] == 1) or (s[j] - s[b + 1] >= SECTION_MIN_M)
+                          or float(np.min(cov[b + 1:j + 1])) < roadmesh.TUNNEL_H):
+                kinds[b + 1:j + 1] = 1
         i = j + 1
     return floor, kinds
+
+
+def open_tunnel_lines(feats, i, spec, frame, elev_fn, step=4.0, over=None):
+    """ENU centreline polylines (k, 2) of the open-cut (kind == 0) runs of tunnel feature i.
+    Shared by bridge crossing detection and approach grading so open sunken roads count as underpasses."""
+    if spec is None or frame is None or elev_fn is None:
+        return []
+    out = []
+    for ring in tunnel_parts(feats, i):
+        ll = np.asarray(ring, np.float64)
+        if len(ll) < 2:
+            continue
+        e, n = mapgeom.enu_xy(feats, frame, ll)
+        xy = densify(_dedupe(np.stack([e, n], axis=1)), float(step))
+        if len(xy) < 2:
+            continue
+        s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+        if s[-1] <= 0.0:
+            continue
+        la, lo, _ = frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+        g = np.asarray(elev_fn(la, lo), np.float64)
+        floor, kinds = tunnel_sections(s, g)
+        kinds = portal_cover(kinds, g - floor, spec, s)
+        if over is not None and over[0]:
+            kinds = cover_roads(xy, s, kinds, *over, cover=g - floor)
+        i0 = 0
+        while i0 < len(kinds):
+            i1 = i0
+            while i1 + 1 < len(kinds) and kinds[i1 + 1] == kinds[i0]:
+                i1 += 1
+            a = max(0, i0 - 1)
+            if int(kinds[i0]) == 0 and i1 > a:
+                out.append(xy[a:i1 + 1])
+            i0 = i1 + 1
+    return out
 
 
 class TunnelProfiles(BridgeProfiles):
@@ -10047,7 +11965,7 @@ class TunnelProfiles(BridgeProfiles):
             else:
                 floor, kinds = tunnel_sections(s, g)
                 kinds = portal_cover(kinds, g - floor, pool[k][0], s)
-                kinds = self._cover_roads(xy, s, kinds, ground)
+                kinds = self._cover_roads(xy, s, kinds, ground, g - floor)
             secs, i = [], 0
             while i < len(kinds):
                 j = i
@@ -10160,7 +12078,7 @@ class TunnelProfiles(BridgeProfiles):
             if rs[i] is not None:
                 self._hw[(str(feats.ids[i]), "g")] = rs[i].width / 2
 
-    def _cover_roads(self, xy, s, kinds, ground):
+    def _cover_roads(self, xy, s, kinds, ground, cover=None):
         """kinds with each covered section carried on until the ground roads crossing over it are covered (their
         carriageway and TUNNEL_ROAD_CLEAR_M past it): earthfast.tunnel_cover_roads (GitHub #450)."""
         lines, halves = [], []
@@ -10173,7 +12091,7 @@ class TunnelProfiles(BridgeProfiles):
                 if len(ln) >= 2:
                     lines.append(ln)
                     halves.append(hw)
-        return cover_roads(xy, s, kinds, lines, halves)
+        return cover_roads(xy, s, kinds, lines, halves, cover=cover)
 
     def _road_caps(self, xy, floor, th, ups, mouths, width, ground):
         """A low arch's stone tops (roadmesh.LOW_CAP_M back from each portal face over its mouth) and face reaches where
@@ -10217,7 +12135,7 @@ class TunnelProfiles(BridgeProfiles):
                 depth = max(0.0, float(ds[i // 3]) - ROAD_CAP_GAP_M)
                 road_z = float(self._ground(np.array([[hx, hy]]))[0])
                 top = road_z + ROAD_CAP_OVER_M - float(floor[at]) - th
-                ups[e] = float(max(roadmesh.LOW_PORTAL_UP, min(ups[e], top)))
+                ups[e] = float(max(0.15, min(ups[e], top)))
             if depth is not None:
                 caps[e], any_ = depth, True
         return (tuple(caps) if any_ else None), ups
@@ -10531,12 +12449,16 @@ class ChainView:
         out, seen = [], set()
         decks = []
         pad = 80.0
-        for st in self._stores():
+        stores = self._stores()
+        for st in stores:
             for q in self._mapped_piers(st)[0]:
                 k = (round(q[0], 3), round(q[1], 3))
                 if box_owns(box, q[0], q[1]) and k not in seen:
                     seen.add(k)
                     out.append(q)
+        if not out:
+            return []
+        for st in stores:
             mp = _Mapper(st.frame, self.frame)
             rev = _Mapper(self.frame, st.frame)
             box_st = rev.pts(np.array([[x0 - pad, y0 - pad, 0.0], [x1 + pad, y0 - pad, 0.0],
@@ -10561,6 +12483,24 @@ class ChainView:
                         or pts[:, 1].max() < y0 - pad or pts[:, 1].min() > y1 + pad):
                     continue
                 decks.append((pts[:, :2], pts[:, 2], w))
+            for _gk, rlines, half in st._bbox_ground_roads(np.array([[sx0, sy0], [sx1, sy1]], np.float64),
+                                                           pad=0.0, include_rail=True):
+                w_g = 2.0 * float(half) if half is not None and half > 0.0 else 6.0
+                for ln in rlines:
+                    gxy = np.asarray(ln, np.float64)[:, :2]
+                    if len(gxy) < 2:
+                        continue
+                    if (gxy[:, 0].max() < sx0 or gxy[:, 0].min() > sx1
+                            or gxy[:, 1].max() < sy0 or gxy[:, 1].min() > sy1):
+                        continue
+                    gz = np.asarray(st._ground(gxy), np.float64)
+                    if len(gz) != len(gxy) or not np.isfinite(gz).all():
+                        continue
+                    pts = mp.pts(np.c_[gxy, gz])
+                    if (pts[:, 0].max() < x0 - pad or pts[:, 0].min() > x1 + pad
+                            or pts[:, 1].max() < y0 - pad or pts[:, 1].min() > y1 + pad):
+                        continue
+                    decks.append((pts[:, :2], pts[:, 2], w_g))
         return pier_portals(out, decks)
 
     def beams_in(self, box):
@@ -10583,6 +12523,30 @@ class ChainView:
             with st.lock:
                 ds += [d for k, d in st.__dict__.get("depth", {}).items() if st._part_id(k) == fid and d is not None]
         return max(ds) if ds else DECK_FULL_DEPTH
+
+    def _approach_ground(self, lines, gl, base):
+        """Wrap `base` so loose abutment endpoints sitting on a grading cutoff cliff return the
+        extrapolated joined approach road height instead of the raw cliff drop."""
+        ground_ends = {}
+        if not self.END_JOINS or not gl or not lines:
+            return base, ground_ends
+        cliffs = _joined_approach_cliffs(lines, gl, self._ground)
+        keep = []
+        for k, ek, p, _gp, _g15, target_z, has_cliff in cliffs:
+            ground_ends[(k, ek)] = float(target_z)
+            if has_cliff:
+                keep.append((float(p[0]), float(p[1]), float(target_z)))
+        if not keep:
+            return base, ground_ends
+        ks = np.asarray(keep, np.float64)
+
+        def ground(xy):
+            z = np.asarray(base(xy), np.float64)
+            xy = np.asarray(xy, np.float64).reshape(-1, 2)
+            for px, py, zt in ks:
+                z = np.where((np.abs(xy[:, 0] - px) < 1e-6) & (np.abs(xy[:, 1] - py) < 1e-6), zt, z)
+            return z
+        return ground, ground_ends
 
     def _ground(self, xy):
         xy = np.asarray(xy, np.float64)
@@ -10677,11 +12641,29 @@ def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
             mask |= mouth_mask
         # the Rust kernel: the samples over the part between its floor and vault (a low arch: its mouths only)
         m0, m1 = (mouths or {}).get(_fid, (True, True))
+        if not low and not m0 and not m1:
+            continue
+        part_mask = mask if (low or (m0 and m1)) else np.zeros(u.shape, bool)
         # (a low arch: the squares from its flat mouth band, LOW_HOLE_M, up to the soil over its vault)
-        fast._ef.tunnel_holes(mask, u, float(x0), float(y0), float(square), np.ascontiguousarray(xy),
+        fast._ef.tunnel_holes(part_mask, u, float(x0), float(y0), float(square), np.ascontiguousarray(xy),
                               np.ascontiguousarray(z), float(hw), float(th), bool(low), bool(m0), bool(m1),
                               float(TUNNEL_HOLE_MARGIN), float(LOW_HOLE_M if low else LOW_HOLE_M + LOW_HOLE_STEP),
                               float(ARCH_SIDE_M + 1.0), not low)
+        if part_mask is not mask:
+            # Clear shallow transition-seam holes within reach of a closed (mouth=False) interior seam end.
+            seam_r2 = (hw + square) ** 2 + (LOW_HOLE_M + LOW_HOLE_STEP + square) ** 2
+            iy_h, ix_h = np.nonzero(part_mask)
+            if len(iy_h):
+                hx = x0 + (ix_h + 0.5) * square
+                hy = y0 + (iy_h + 0.5) * square
+                clear = np.zeros(len(iy_h), dtype=bool)
+                if not m0:
+                    clear |= (hx - xy[0, 0]) ** 2 + (hy - xy[0, 1]) ** 2 <= seam_r2
+                if not m1:
+                    clear |= (hx - xy[-1, 0]) ** 2 + (hy - xy[-1, 1]) ** 2 <= seam_r2
+                if clear.any():
+                    part_mask[iy_h[clear], ix_h[clear]] = False
+            mask |= part_mask
     return mask
 
 
@@ -10710,8 +12692,20 @@ def arch_raise(parts, heights, px, py, z, mouths=None):
         if len(xy) < 2 or not np.isfinite(zf).all():
             continue
         hw = spec.width / 2 + roadmesh.TUNNEL_SHOULDER + ARCH_SIDE_M
-        # the Rust kernel (per part) on the points in its box
+        # the Rust kernel (per part) on the points in its box; extend closed seams slightly so ENU roundoff never drops
         m0, m1 = (mouths or {}).get(fid, (True, True))
+        if (not m0 or not m1) and len(xy) >= 2:
+            xy = np.array(xy, np.float64, copy=True)
+            if not m0:
+                d = xy[0] - xy[1]
+                nrm = float(np.hypot(d[0], d[1]))
+                if nrm > 0.0:
+                    xy[0] = xy[0] + (0.05 / nrm) * d
+            if not m1:
+                d = xy[-1] - xy[-2]
+                nrm = float(np.hypot(d[0], d[1]))
+                if nrm > 0.0:
+                    xy[-1] = xy[-1] + (0.05 / nrm) * d
         lo, hi = xy.min(0) - hw, xy.max(0) + hw
         k = np.flatnonzero((px >= lo[0]) & (px <= hi[0]) & (py >= lo[1]) & (py <= hi[1]))
         if len(k):
@@ -10747,9 +12741,34 @@ def tunnel_floor_at(parts, x, y):
     return best
 
 
+def _other_ground_roads(parts, cells, frame):
+    """Ground carriageways [(fid, half_width, xy)] belonging to features other than parts and not joined to ends."""
+    own = {str(p[0]).split("#")[0] for p in parts}
+    ends = np.array([np.asarray(p[2], np.float64)[k, :2] for p in parts for k in (0, -1) if len(p[2])], np.float64)
+    others = []
+    for feats in cells:
+        if feats is None or len(feats) == 0:
+            continue
+        rs = road_specs(feats)
+        for i, sp in enumerate(rs):
+            fid = str(feats.ids[i])
+            if sp is None or sp.kind not in BUILT or fid in own:
+                continue
+            for ring in ground_parts(feats, i):
+                e, n = mapgeom.enu_xy(feats, frame, ring)
+                xy = np.c_[e, n]
+                if len(xy) < 2:
+                    continue
+                if len(ends) and min(float(np.min(np.hypot(*(ends - xy[0]).T))),
+                                     float(np.min(np.hypot(*(ends - xy[-1]).T)))) < HOLE_JOIN_M:
+                    continue            # (its approach: the mouth is cut into it)
+                others.append((fid, sp.width / 2, xy))
+    return others
+
+
 def block_arch_raise(tunnels, cell_fn, frame, la, lo, z, box):
     """arch_raise for ground heights at the points (la, lo) of a block in the anchor-frame box (x0, y0, x1, y1),
-    the tunnels from the map cells under it. z as it was when the cells are not at hand."""
+    the tunnels from the map cells under it. Spares crossing ground road carriageways from terrain berms."""
     try:
         x0, y0, x1, y1 = box
         cla, clo, _ = frame.enu_to_geodetic(np.array([x0, x1]), np.array([y0, y1]), np.zeros(2))
@@ -10764,8 +12783,23 @@ def block_arch_raise(tunnels, cell_fn, frame, la, lo, z, box):
         if not parts or not tunnels.heights:
             return z
         e, n, _ = frame.geodetic_to_enu(np.asarray(la, np.float64).ravel(), np.asarray(lo, np.float64).ravel(), 0.0)
-        return arch_raise(parts, tunnels.heights, np.asarray(e), np.asarray(n),
-                          np.asarray(z, np.float64).ravel(), getattr(tunnels, "mouths", None)).reshape(np.shape(z))
+        e_arr, n_arr = np.asarray(e, np.float64), np.asarray(n, np.float64)
+        z_arr = np.asarray(z, np.float64).ravel()
+        out_arr = arch_raise(parts, tunnels.heights, e_arr, n_arr, z_arr, getattr(tunnels, "mouths", None))
+        changed = np.flatnonzero(out_arr != z_arr)
+        if len(changed):
+            others = _other_ground_roads(parts, cells, frame)
+            if others:
+                import fast
+                oth = fast.Others(others)
+                hmap = tunnels.heights
+                for idx in changed:
+                    px, py, zu = float(e_arr[idx]), float(n_arr[idx]), float(z_arr[idx])
+                    if _point_in_tunnel_bore(px, py, zu, parts, hmap):
+                        continue
+                    if not oth.clear((px, py), None, HOLE_ROAD_MARGIN):
+                        out_arr[idx] = zu
+        return out_arr.reshape(np.shape(z))
     except Exception as ex:         # no raise rather than no block (a network error quietly; a bug where it shows)
         (log.debug if isinstance(ex, OSError) else log.warning)("arch raise: %s: %s", type(ex).__name__, ex)
         return z
@@ -10803,10 +12837,11 @@ def block_tunnel_holes(tunnels, cell_fn, frame, keep, cx, cy, square, rail_parts
         return None
     mask = None
     if parts:
-        mask = tunnel_hole_mask(parts, u, cx, cy, square, getattr(tunnels, "heights", None),
+        heights = getattr(tunnels, "heights", None)
+        mask = tunnel_hole_mask(parts, u, cx, cy, square, heights,
                                 getattr(tunnels, "mouths", None))
         if mask is not None and mask.any():
-            mask = spare_carriageways(mask, parts, cells, frame, cx, cy, square)
+            mask = spare_carriageways(mask, parts, cells, frame, cx, cy, square, u=u, heights=heights)
     if rail:
         import railways
         rm = railways.tunnel_hole_mask(rail, u, cx, cy, square)
@@ -10818,31 +12853,35 @@ HOLE_ROAD_MARGIN = 0.3      # m past another road's carriageway no tunnel hole i
 HOLE_JOIN_M = 3.0           # m: a road with an end this near a tunnel part's end is its approach (its mouth cut)
 
 
-def spare_carriageways(mask, parts, cells, frame, cx, cy, square):
+def _point_in_tunnel_bore(px, py, zu, parts, heights):
+    """True when (px, py) lies inside any tunnel part's carriageway with zu below its ceiling."""
+    for part in parts:
+        fid, spec, xy, zf = part[:4]
+        if len(xy) < 2:
+            continue
+        cw_half = 0.5 * float(spec.width)
+        ab = xy[1:] - xy[:-1]
+        l2 = ab[:, 0] ** 2 + ab[:, 1] ** 2
+        safe_l2 = np.where(l2 > 0.0, l2, 1.0)
+        t = np.where(l2 > 0.0, np.clip(((px - xy[:-1, 0]) * ab[:, 0] + (py - xy[:-1, 1]) * ab[:, 1]) / safe_l2, 0.0, 1.0), 0.0)
+        proj = xy[:-1] + t[:, None] * ab
+        d2 = (px - proj[:, 0]) ** 2 + (py - proj[:, 1]) ** 2
+        k = int(np.argmin(d2))
+        if float(d2[k]) <= cw_half * cw_half:
+            fz_at = float(zf[k] + t[k] * (zf[k + 1] - zf[k]))
+            th = float((heights or {}).get(fid, roadmesh.TUNNEL_H))
+            if float(zu) < fz_at + th - 0.1:
+                return True
+    return False
+
+
+def spare_carriageways(mask, parts, cells, frame, cx, cy, square, u=None, heights=None):
     """mask with the hole samples inside the carriageway of a ground road that is not the tunnel's (another feature, not
     an approach joined at a mouth) filled again: a portal's opening reaching into a road beside or over it left a hole in
     its lanes (GitHub #450, the A-7 near Málaga, a 2 m drop at the edge of a carriageway beside an underpass's mouth)."""
+    # Keep bore interiors below tunnel ceilings cut so parallel frontage shoulders never bury a portal.
     import fast
-    own = {str(p[0]).split("#")[0] for p in parts}
-    ends = np.array([np.asarray(p[2], np.float64)[k, :2] for p in parts for k in (0, -1) if len(p[2])], np.float64)
-    others = []
-    for feats in cells:
-        if feats is None or len(feats) == 0:
-            continue
-        rs = road_specs(feats)
-        for i, sp in enumerate(rs):
-            fid = str(feats.ids[i])
-            if sp is None or sp.kind not in BUILT or fid in own:
-                continue
-            for ring in ground_parts(feats, i):
-                e, n = mapgeom.enu_xy(feats, frame, ring)
-                xy = np.c_[e, n]
-                if len(xy) < 2:
-                    continue
-                if len(ends) and min(float(np.min(np.hypot(*(ends - xy[0]).T))),
-                                     float(np.min(np.hypot(*(ends - xy[-1]).T)))) < HOLE_JOIN_M:
-                    continue            # (its approach: the mouth is cut into it)
-                others.append((fid, sp.width / 2, xy))
+    others = _other_ground_roads(parts, cells, frame)
     if not others:
         return mask
     oth = fast.Others(others)
@@ -10850,7 +12889,10 @@ def spare_carriageways(mask, parts, cells, frame, cx, cy, square):
     x0, y0 = cx - n * square / 2, cy - n * square / 2
     out = mask.copy()
     for iy, ix in zip(*np.nonzero(mask)):
-        if not oth.clear((x0 + ix * square, y0 + iy * square), None, HOLE_ROAD_MARGIN):
+        px, py = x0 + ix * square, y0 + iy * square
+        if not oth.clear((px, py), None, HOLE_ROAD_MARGIN):
+            if u is not None and _point_in_tunnel_bore(px, py, u[iy, ix], parts, heights):
+                continue
             out[iy, ix] = False
     return out
 
@@ -11359,27 +13401,32 @@ def retaining_walls(frame, roads, elev, exact, decks=()):
         if need:                    # the wall where the graded ground starts to climb (a sharp cutting: before the core's edge)
             gs = gsteps[k:k + len(xy) * len(steps)].reshape(len(steps), len(xy)).T
             k += len(xy) * len(steps)
+            rows_idx = np.arange(len(xy))
             up = gs - z[:, None] > WALL_STEP_UP_M
             first = np.argmax(up, axis=1)
-            # (the grading's flat strip in front of the climb: the terrain's 2 m lattice draws a step at an angle to it
-            # as teeth reaching up to a grid diagonal out, under the wall's top; its face in front of them)
-            face = np.where(up.any(axis=1), np.maximum(steps[first] - 1.0 - grading.WALL_FLAT_M, rh + 0.1), face)
+            p_up = np.maximum(first - 1, 0)
+            v0 = gs[rows_idx, p_up] - z
+            v1 = gs[rows_idx, first] - z
+            t_up = np.where(first > 0, np.clip((WALL_STEP_UP_M - v0) / np.maximum(v1 - v0, 1e-6), 0.0, 1.0), 0.0)
+            step_up = steps[p_up] + t_up * (steps[first] - steps[p_up])
+            # (the grading's flat strip in front of the climb: continuous sub-step crossing eliminates 1 m stair-stepping)
+            face = np.where(up.any(axis=1), np.maximum(step_up - 0.5 - grading.WALL_FLAT_M, rh + 0.1), face)
             # its top back to where the graded ground is up again (no trough behind it: a street above drove into one)
-            full = gs >= (z + WALL_FULL * (gg - z))[:, None]
-            back = np.argmax(full, axis=1)
+            thresh_full = z + WALL_FULL * (gg - z)
+            full_s = gs >= thresh_full[:, None]
+            back = np.argmax(full_s, axis=1)
+            p_bk = np.maximum(back - 1, 0)
+            b0, b1 = gs[rows_idx, p_bk], gs[rows_idx, back]
+            t_bk = np.where(back > 0, np.clip((thresh_full - b0) / np.maximum(b1 - b0, 1e-6), 0.0, 1.0), 0.0)
+            step_bk = steps[p_bk] + t_bk * (steps[back] - steps[p_bk])
             # (and a grid diagonal more: the terrain's lattice reaches the top that much later between its points)
-            thick = np.where(full.any(axis=1), np.clip(steps[back] - face + WALL_DIAG_M, WALL_THICK_MIN_M,
-                                                       WALL_THICK_MAX_M), thick)
+            thick = np.where(full_s.any(axis=1), np.clip(step_bk - face + WALL_DIAG_M, WALL_THICK_MIN_M,
+                                                         WALL_THICK_MAX_M), thick)
             # (its top over the highest graded ground under it, not the one probe's: the bank poked through it in
             # patches where that probe sat in a dip)
             under = steps[None, :] >= face[:, None]
             top_g = np.maximum(gg, np.where(under, gs, -np.inf).max(axis=1))
-            # (and never past where the ground behind falls away again: between a hairpin's legs the bank tops out
-            # and drops to the other leg, and the top hung out over that slope, its underside seen from the road
-            # above, the Stelvio Pass 2026-10-21)
-            # (only past the grading's own flat strip and its climb behind the face, grading.WALL_FLAT_M / WALL_T_M:
-            # that strip at the road's level read as the ground falling away and cut the top to its coping, a trench
-            # between the wall and the slope behind it, "they float in front of the terrain", the user 2026-10-31)
+            # (and never past where the ground behind falls away again)
             low = (gs < (top_g - WALL_SLAB_DZ)[:, None]) & (steps[None, :] > np.maximum(
                 face + 1.0, core + grading.WALL_FLAT_M + grading.WALL_T_M)[:, None])
             reach = np.where(low.any(axis=1), steps[np.argmax(low, axis=1)] - face, np.inf)
@@ -11395,8 +13442,6 @@ def retaining_walls(frame, roads, elev, exact, decks=()):
                     a_, b_ = w_["at"]
                     w_["base"] = w_["base"] + out_n[a_:b_] * hx[a_:b_, None]
             out.extend(par)
-        # (under a bridge deck: up to its underside, the wall of the cutting the deck spans, the real abutment's; it
-        # stood nowhere there, the ground beside the road bare under the deck, Assaku. None under a low deck.)
         if WALL_UNDER_DECK_ON:
             floor = _deck_floor(xy + out_n * face[:, None], z, decks)
             deck_ok = ~np.isfinite(floor) | (floor - z >= WALL_UNDER_MIN_H_M)
@@ -11404,56 +13449,77 @@ def retaining_walls(frame, roads, elev, exact, decks=()):
             floor = np.full(len(xy), np.inf)
             deck_ok = ~_under_decks(xy + out_n * core, z, decks)
         full = _wall_runs(gg - z) & deck_ok & ~bends
-        # (no face standing on a carriageway: a hairpin's other leg, the same road, the Stelvio Pass 2026-10-21)
         full &= ~_on_carriageways(xy + out_n * face[:, None], others, 0.0)
         # (its ends lowered over WALL_TAPER_M toward the road, the whole wall's ends, not a tile edge's)
         taper = _taper(xy, full)
         cut = full & inside
-        i = 0
-        while i < len(cut):
-            if not cut[i]:
-                i += 1
+        fa = 0
+        while fa < len(full):
+            if not full[fa]:
+                fa += 1
                 continue
-            j = i
-            while j + 1 < len(cut) and cut[j + 1]:
-                j += 1
-            if j > i:
-                sl = slice(i, j + 1)
-                # (its top's depth evened out along it: the 1 m probe steps drew a jagged back edge)
-                th = thick[sl]
-                th = np.maximum.reduce([np.r_[th[:1].repeat(m), th[:len(th) - m]] for m in range(WALL_EVEN_N + 1)]
-                                       + [np.r_[th[m:], th[-1:].repeat(m)] for m in range(1, WALL_EVEN_N + 1)])
-                base = xy[sl] + out_n[sl] * face[sl][:, None]
-                if not _cut_behind(base, out_n[sl], z[sl], ground):        # (a natural slope: no wall, WALL_STEEP)
-                    i = j + 1
+            fb = fa
+            while fb + 1 < len(full) and full[fb + 1]:
+                fb += 1
+            if fb > fa and cut[fa:fb + 1].any():
+                fsl = slice(fa, fb + 1)
+                fc_run = face[fsl].copy()
+                if len(fc_run) >= 3:
+                    fc_pad = np.r_[fc_run[:1], fc_run, fc_run[-1:]]
+                    fc_run = 0.25 * fc_pad[:-2] + 0.50 * fc_pad[1:-1] + 0.25 * fc_pad[2:]
+                th_run = thick[fsl]
+                th_run = np.maximum.reduce([np.r_[th_run[:1].repeat(m), th_run[:len(th_run) - m]]
+                                            for m in range(WALL_EVEN_N + 1)]
+                                           + [np.r_[th_run[m:], th_run[-1:].repeat(m)]
+                                              for m in range(1, WALL_EVEN_N + 1)])
+                if len(th_run) >= 3:
+                    th_pad = np.r_[th_run[:1], th_run, th_run[-1:]]
+                    th_run = 0.25 * th_pad[:-2] + 0.50 * th_pad[1:-1] + 0.25 * th_pad[2:]
+                base_run = xy[fsl] + out_n[fsl] * fc_run[:, None]
+                if not _cut_behind(base_run, out_n[fsl], z[fsl], ground):
+                    fa = fb + 1
                     continue
-                # (never over another road: a hairpin's wall top covered the road above, the Stelvio Pass, the user's
-                # report 2026-10-21)
-                th = np.minimum(th, _clear_depth(base, out_n[sl], th, others, fid))
-                # (no taller than that; under a deck up to its underside: no slope above the wall there to grade)
-                tp = np.minimum(top_g[sl], z[sl] + np.where(np.isfinite(floor[sl]), floor[sl] - z[sl], max_h)) + WALL_TOP_M
-                tp = z[sl] + WALL_TAPER_LOW_M + (tp - z[sl] - WALL_TAPER_LOW_M).clip(0) * taper[sl]
-                tp = np.minimum(tp, floor[sl])              # (under a deck: not through it)
-                # (rock faces only as an experiment, BNE_CLIFF_WALLS=on, for tall rural cuts: the Stelvio's hairpins are
-                # walled in dry stone, tall cuts too, Mapillary 2026-10-21; the user chose stone walls for passes)
-                tall = CLIFF_WALLS_ON and float(np.max(top_g[sl] - z[sl])) > CLIFF_MIN_CUT_M
-                top = np.maximum(tp, z[sl] + WALL_TAPER_LOW_M)
-                # (its top behind the coping rises to the graded ground at its back edge, never under the coping: the
-                # slope above goes on from the wall's top, held up by it; flat at the top's height, a band of grass
-                # standing out in front of the slope read as a thick freestanding wall, the user 2026-10-31)
-                back_top = top if ground_at is None else np.maximum(top, np.minimum(np.minimum(
-                    ground_at(face[sl] + th, range(i, j + 1)), z[sl] + max_h + BACK_TOP_OVER_M), floor[sl]))
-                out.append({"base": base, "top": top, "back_top": back_top, "foot": z[sl] - WALL_FOOT_M,
+                th_run = np.minimum(th_run, _clear_depth(base_run, out_n[fsl], th_run, others, fid))
+                tp_run = (np.minimum(top_g[fsl],
+                                     z[fsl] + np.where(np.isfinite(floor[fsl]), floor[fsl] - z[fsl], max_h))
+                          + WALL_TOP_M)
+                tp_run = z[fsl] + WALL_TAPER_LOW_M + (tp_run - z[fsl] - WALL_TAPER_LOW_M).clip(0) * taper[fsl]
+                tp_run = np.minimum(tp_run, floor[fsl])
+                top_run = np.maximum(tp_run, z[fsl] + WALL_TAPER_LOW_M)
+                bt_run = (top_run if ground_at is None else np.maximum(
+                    top_run, np.minimum(np.minimum(ground_at(fc_run + th_run, range(fa, fb + 1)),
+                                                   z[fsl] + max_h + BACK_TOP_OVER_M), floor[fsl])))
+                if len(bt_run) >= 3:
+                    bt_pad = np.r_[bt_run[:1], bt_run, bt_run[-1:]]
+                    bt_run = np.maximum(top_run, np.minimum(
+                        0.25 * bt_pad[:-2] + 0.50 * bt_pad[1:-1] + 0.25 * bt_pad[2:], floor[fsl]))
+                run_concrete = concrete or bool(WALL_UNDER_DECK_ON and np.isfinite(floor[fsl]).any())
+                run_tall = CLIFF_WALLS_ON and float(np.max(top_g[fsl] - z[fsl])) > CLIFF_MIN_CUT_M
+                i = fa
+                while i <= fb:
+                    if not cut[i]:
+                        i += 1
+                        continue
+                    j = i
+                    while j + 1 <= fb and cut[j + 1]:
+                        j += 1
+                    if j > i:
+                        sl = slice(i, j + 1)
+                        rsl = slice(i - fa, j + 1 - fa)
+                        base = base_run[rsl]
+                        out.append({
+                            "base": base, "top": top_run[rsl], "back_top": bt_run[rsl],
+                            "foot": z[sl] - WALL_FOOT_M,
                             "mountain": bool(mountain),
-                            "toward": -out_n[sl], "thick": th,
-                            # (a wall that runs under a deck is the abutment's concrete along its whole length, whatever
-                            # the road: a minor road's cutting is stone, a piece has one look)
-                            "concrete": concrete or bool(WALL_UNDER_DECK_ON and np.isfinite(floor[sl]).any()),
-                            "rock": rural and tall,
-                            "road_z": z[sl], "clear": _clear_depth(base, out_n[sl], np.full(len(base), CLIFF_REACH_M),
-                                                                   others, fid),
-                            "edge": xy[sl] + out_n[sl] * (rh + CLIFF_EDGE_M)})
-            i = j + 1
+                            "toward": -out_n[sl], "thick": th_run[rsl],
+                            "concrete": run_concrete,
+                            "rock": rural and run_tall,
+                            "road_z": z[sl],
+                            "clear": _clear_depth(base, out_n[sl], np.full(len(base), CLIFF_REACH_M), others, fid),
+                            "edge": xy[sl] + out_n[sl] * (rh + CLIFF_EDGE_M),
+                        })
+                    i = j + 1
+            fa = fb + 1
     return out
 
 
@@ -12225,7 +14291,6 @@ def deck_pads(decks, ground_roads, box, ground_fn, own=True):
         if own and not box_owns(box, float(q[0]), float(q[1])):
             continue
         groups = _pad_height_groups(incident)
-        attached = [[] for _ in groups]
         for line, half in gl:
             for at in (0, -1):
                 if np.hypot(*(line[at] - q)) < PAD_GROUND_M:
@@ -12246,8 +14311,7 @@ def deck_pads(decks, ground_roads, box, ground_fn, own=True):
                     if matches:
                         best_k = min(matches)[1]
                         groups[best_k].append((ln, zz, half))
-                        attached[best_k].append((line, half))
-        joints.extend((q, parts, all_decks + att) for parts, att in zip(groups, attached))
+        joints.extend((q, parts, all_decks) for parts in groups)
     for q, parts, seat_decks in joints:
         if len(parts) < 2:
             continue
