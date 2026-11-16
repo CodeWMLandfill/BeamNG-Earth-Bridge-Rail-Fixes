@@ -66,6 +66,7 @@ PIER_FOOT_M = 2.0           # m a pier reaches into the ground
 CROSSING_PAD_M = 0.5        # m past a crossing road's edge the track stops (rails.py's street track runs across the road
                             # from 0.3 m inside its edge: 1.5 left ~1.8 m of bare ground either side)
 CROSSING_DZ = 1.5           # m: a road this far over or under the bed passes it by (no level crossing)
+MOTORWAY_EXCLUDE_DZ = 4.5   # m: vertical envelope for excluding ground rail inside ground motorways (below 4.85 m bridge clear)
 VERTS_MAX = 60000           # under the engine's 16-bit indices: one shape's vertices (split_mesh cuts a bigger tile mesh)
 PARTS_MAX = 3               # shapes a tile's track is cut into ("rail", "rail2", "rail3": roads.RAIL_PARTS_MAX, the mod's list)
 TILE_VERTS_MAX = 150000     # a tile's whole track (past it the tracks of lowest rank are left out; cut into PARTS_MAX
@@ -175,7 +176,8 @@ def _flushed(frame, cells, box, rails, prof, ground, tunnels):
     return out
 
 
-def _beds(frame, rails, ground, underpasses, load=None, elev=None, raw=None):
+def _beds(frame, rails, ground, underpasses, load=None, elev=None, raw=None, levels=None,
+          cells=None, box=None, reach=REACH_M):
     """railways.profile of rails, its beds from railprofile's lattice of node profiles (the same bed in every tile and
     grading cell: plan 035) where load (key -> roads layer) and elev (the grader's DEM) are given; railways.profile's own
     where not, for a tram and for a point no node has. raw: ground(xy) -> the DEM's heights as they are (the grader's,
@@ -190,7 +192,9 @@ def _beds(frame, rails, ground, underpasses, load=None, elev=None, raw=None):
         else:
             new = railprofile.beds(frame, ("beds-dem", lat0, lon0), load, raw, rails)
     if new is None or any(np.isnan(z).any() for z in new):
-        old = profile(rails, ground, underpasses)
+        ctx = (_bridge_context(frame, cells, box, reach, rails, ground, levels=levels)
+               if cells is not None and box is not None else None)
+        old = profile(rails, ground, underpasses, levels=levels, context=ctx)
         if new is None:
             return old
         return [(np.where(np.isfinite(z), z, zb), zg) for z, (zb, zg) in zip(new, old)]
@@ -204,7 +208,8 @@ def grade_plans(frame, cells, box, elev, load=None):
     cells = list(cells)
     tunnels = road_underpasses(frame, cells, box, GRADE_REACH_M)
     worn = {}
-    rails = parts(frame, cells, box, reach=GRADE_REACH_M, clip=True, worn=worn, underpasses=tunnels)
+    part_levels = {}
+    rails = parts(frame, cells, box, reach=GRADE_REACH_M, clip=True, worn=worn, underpasses=tunnels, levels=part_levels)
     if not rails:
         return []
     ungraded = {fid for fid, w in worn.items() if w >= UNGRADED_WEAR}
@@ -229,7 +234,8 @@ def grade_plans(frame, cells, box, elev, load=None):
     pad = GRADE_HALF_M + 15.0
     out = []
     tunnels = tunnels + coarse_underpasses(frame, cells, box, rails, GRADE_REACH_M)
-    prof = _beds(frame, rails, ground, tunnels, load, elev, raw=ground)
+    prof = _beds(frame, rails, ground, tunnels, load, elev, raw=ground,
+                 levels=part_levels, cells=cells, box=box, reach=GRADE_REACH_M)
     if railxing.ENABLED:        # (the bed flush with the road at a level crossing: the ground is graded to it, else the
         prof = _flushed(frame, cells, box, rails, prof, ground, tunnels)     # ballast and sleepers lay under the ground)
     for (fid, _c, kind, xy), (zb, _zg) in zip(rails, prof):
@@ -267,9 +273,10 @@ def _is(col, values):
     return np.isin(np.asarray(col).astype(str), list(values))
 
 
-def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, underpasses=None):
+def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, underpasses=None, levels=None):
     """[(fid, class, kind, xy (k, 2))]: the rail parts ("ground" / "bridge"; tunnels left out) of the lines drawn
-    (drawn(); worn: a dict given here gets {fid: wear} of the worn ones, gauges {fid: m} OSM's gauge where tagged)
+    (drawn(); worn: a dict given here gets {fid: wear} of the worn ones, gauges {fid: m} OSM's gauge where tagged,
+    levels: optional dict receiving {id(xy): bridge_level} for remaining bridge parts)
     within reach of box (x0, y0, x1, y1), resampled every STEP_M from each part's start, each feature once (by id).
     Each part must intersect that window: a feature's bbox can cover far-away bridges or a long bend around it.
     clip: the ground parts cut to their points within reach of box (a segment of line runs on for km, and every one of
@@ -279,6 +286,7 @@ def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, 
     near = (box[0] - reach, box[1] - reach, box[2] + reach, box[3] + reach)
     seen, out = set(), []
     wear_of = worn if worn is not None else {}
+    lv_by_id = {}
     for feats in cells:
         if feats is None or len(feats) == 0 or "subtype" not in feats.attrs:
             continue
@@ -297,7 +305,8 @@ def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, 
                 g = osm_gauge(feats, i)
                 if g:
                     gauges[fid] = g
-            for kind, rings in _pieces(feats, i):
+            pieces_list, ring_lv = _pieces_with_levels(feats, i)
+            for kind, rings in pieces_list:
                 if c == "tram" and kind != "bridge":
                     continue                    # street track stays draped in rails.py, never terrain grading
                 for ring in rings:
@@ -311,7 +320,10 @@ def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, 
                     if got[3] is None:
                         got[3] = _resample(got[1], STEP_M)
                     if len(got[3]) >= 2:
-                        out.append((fid, c, kind, got[3].copy()))
+                        xy = got[3].copy()
+                        if kind == "bridge" and levels is not None:
+                            lv_by_id[id(xy)] = ring_lv.get(id(ring), 1.0)
+                        out.append((fid, c, kind, xy))
     out.sort(key=lambda p: (p[0], p[2], float(p[3][0, 0]), float(p[3][0, 1])))
     if any(kind == "ground" and wear_of.get(fid) for fid, _c, kind, _xy in out):
         out = _cut_worn_at_motorways(out, wear_of, motorway_crossings(frame, cells, box, reach))
@@ -319,7 +331,12 @@ def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, 
     out = level_bridges(frame, cells, out, near)
     out = _bridge_over_motorways(out, _motorway_ground(frame, cells, box, reach), wear_of)
     out = _span_underpasses(out, road_underpasses(frame, cells, box, reach) if underpasses is None else underpasses)
-    return _clip(out, near) if clip else out
+    res = _clip(out, near) if clip else out
+    if levels is not None:
+        for _fid, _c, kind, xy in res:
+            if kind == "bridge":
+                levels[id(xy)] = lv_by_id.get(id(xy), 1.0)
+    return res
 
 
 
@@ -940,25 +957,37 @@ def osm_gauge(feats, i):
     return mm / 1000.0 if 381 <= mm <= 1676 else None
 
 
+def _pieces_with_levels(feats, i):
+    """(got, {id(ring): level}) companion to _pieces(feats, i), tracking bridge layer levels across splits."""
+    rngs = roads.level_ranges(feats, i)
+    # (remembered on the layer per feature and its ranges, which are asked every time (the lidar rule's revisit fault
+    # with them): every node window of railprofile's lattice cut the same lines again, ~150 times a line in a city)
+    memo = feats.__dict__.setdefault("_rail_pieces", {})
+    lv_memo = feats.__dict__.setdefault("_rail_piece_levels", {})
+    key = (i, tuple(tuple(r) for r in rngs), TUNNELS_ON)
+    got = memo.get(key)
+    if got is None:
+        ring_lv = {}
+        if rngs:
+            base = _pieces_of(feats, i, rngs, bridge_lvs=ring_lv)
+        else:
+            base = [("ground", list(roads.ground_parts(feats, i)))]
+        memo[key] = base                 # a ground_parts re-entry takes the unpromoted rings, not another scan
+        lv_memo[key] = ring_lv
+        got = memo[key] = _promote_ground_rings(feats, i, base)
+    return got, lv_memo.get(key, {})
+
+
 def _pieces(feats, i):
     """[("ground" | "bridge" | "tunnel", [lon/lat polylines])] of feature i: its level ranges with the short tunnels
     (SHORT_TUNNEL_M) on the ground and the long ones left out (BNE_RAIL_TUNNELS: a part of their own, kind "tunnel").
     An active ground rail that crosses a ground motorway in this layer is a bridge across that window
     (_promote_ground_rings): grading's rail_ground is these ground rings."""
-    rngs = roads.level_ranges(feats, i)
-    # (remembered on the layer per feature and its ranges, which are asked every time (the lidar rule's revisit fault
-    # with them): every node window of railprofile's lattice cut the same lines again, ~150 times a line in a city)
-    memo = feats.__dict__.setdefault("_rail_pieces", {})
-    key = (i, tuple(tuple(r) for r in rngs), TUNNELS_ON)
-    got = memo.get(key)
-    if got is None:
-        base = _pieces_of(feats, i, rngs) if rngs else [("ground", list(roads.ground_parts(feats, i)))]
-        memo[key] = base                 # a ground_parts re-entry takes the unpromoted rings, not another scan
-        got = memo[key] = _promote_ground_rings(feats, i, base)
+    got, _ring_lv = _pieces_with_levels(feats, i)
     return [(kind, list(rings)) for kind, rings in got]
 
 
-def _pieces_of(feats, i, rngs):
+def _pieces_of(feats, i, rngs, bridge_lvs=None):
     L = roads._feature_length_m(feats, i)
     min_frac = min(roads.MIN_PART, 1.0 / max(L, 1.0))
     off = [(a, b, k) for a, b, k in rngs if not (k == "tunnel" and (b - a) * L < SHORT_TUNNEL_M)]
@@ -969,18 +998,48 @@ def _pieces_of(feats, i, rngs):
         at = max(at, b)
     if 1.0 - at > min_frac:
         ground.append((at, 1.0))
+    has_bridge = any(k == "bridge" for _a, _b, k in off)
+    t_lv = feats.rules.get("level")
+    lv_rows = list(t_lv.rows(i)) if has_bridge and t_lv is not None and len(t_lv.feature) else []
+    if has_bridge and lv_rows:
+        got_lv = roads._bridge_level_spans(feats, i, rngs=rngs)
+        bridge_spans = []
+        for a, b, k in off:
+            if k != "bridge":
+                continue
+            sub = [(sa, sb, slv) for sa, sb, slv in got_lv if sb > a + 1e-9 and sa < b - 1e-9]
+            if sub:
+                bridge_spans.extend(sub)
+            else:
+                mid = 0.5 * (a + b)
+                lv_val = 1.0
+                for rj in lv_rows:
+                    if float(t_lv.start[rj]) <= mid <= float(t_lv.end[rj]):
+                        try:
+                            lv_val = float(str(t_lv.value[rj]))
+                        except ValueError:
+                            pass
+                        break
+                bridge_spans.append((a, b, lv_val))
+    elif has_bridge:
+        bridge_spans = [(a, b, 1.0) for a, b, k in off if k == "bridge"]
+    else:
+        bridge_spans = []
     out = {"ground": [], "bridge": [], "tunnel": []}
     for part in feats.parts(i):
         for ring in part:
             if len(ring) < 2:
                 continue
-            for kind, spans in (("ground", ground), ("bridge", [(a, b) for a, b, k in off if k == "bridge"]),
-                                ("tunnel", [(a, b) for a, b, k in off if k == "tunnel"] if TUNNELS_ON else [])):
-                for a, b in spans:
+            for kind, spans in (("ground", [(a, b, None) for a, b in ground]),
+                                ("bridge", bridge_spans),
+                                ("tunnel", [(a, b, None) for a, b, k in off if k == "tunnel"] if TUNNELS_ON else [])):
+                for a, b, lv in spans:
                     if b - a > min_frac:
                         r = ring if (a, b) == (0.0, 1.0) else roads.sub_polyline(ring, a, b)
                         if len(r) >= 2:
                             out[kind].append(r)
+                            if kind == "bridge" and bridge_lvs is not None and lv is not None:
+                                bridge_lvs[id(r)] = float(lv)
     return list(out.items())
 
 
@@ -1031,6 +1090,11 @@ def _road_crossings(frame, cells, box, specs_fn, parts_fn, reach=REACH_M):
 def bridge_crossings(frame, cells, box, reach=REACH_M):
     """[(xy (k, 2), half width)]: mapped road bridge carriageways near box (to keep piers clear of them)."""
     return _crossings(frame, cells, box, reach=reach, parts_fn=roads.bridge_parts, specs_fn=roads.bridge_specs)
+
+
+def tunnel_crossings(frame, cells, box, reach=REACH_M):
+    """[(xy (k, 2), half width)]: all mapped road tunnel bores near box regardless of length (to keep piers clear)."""
+    return _crossings(frame, cells, box, reach=reach, parts_fn=roads.tunnel_parts, specs_fn=roads.tunnel_specs)
 
 
 # GitHub #579: a road's sidewalks and kerbs stop where a railway crosses it at grade (the ballast runs across them)
@@ -1502,10 +1566,10 @@ SEED_LIFT_MAX_M = 20.0    # m a propagated deck height may lift a ground track o
                             # deck must not poison kilometres of connected line, and the graded embankment with it)
 
 
-def deck_heights(s, z_ground, z_start, z_end):
+def deck_heights(s, z_ground, z_start, z_end, grade=GRADE):
     """A bridge's bed line: straight from z_start to z_end (the bed at its ends: a line keeps its grade over what it
     crosses, the stream or road under it goes down, and the bare-earth DEM has that dip), raised only where the ground
-    under it stands higher than the track itself (bad data, a ridge), climbing at most GRADE. Pure. (A required 6 m
+    under it stands higher than the track itself (bad data, a ridge), climbing at most grade. Pure. (A required 6 m
     clearance stood an 8 m culvert's track 6.8 m up on 4.5 m ramps, 2026-10-25.)"""
     s = np.asarray(s, np.float64)
     L = max(float(s[-1]), 1e-9)
@@ -1515,7 +1579,7 @@ def deck_heights(s, z_ground, z_start, z_end):
     # raise the whole deck: over a real valley the chord already stands over the floor, so only the raise over the
     # chord is capped (seen as a ~100 m deck hump with piers and graded embankment from one bad sample under it).
     req = np.minimum(req, chord + DECK_RAISE_MAX_M)
-    return _envelope(s, req)
+    return _envelope(s, req, grade=grade)
 
 
 # A bridge's mapped ends often lie part way down the slopes of what it crosses (a cutting, a valley's sides): the
@@ -1578,9 +1642,277 @@ def approach_levels_many(xys, ground, grades=None):
     return [(found[2 * j], found[2 * j + 1]) for j in range(len(xys))]
 
 
-def profile(rails, ground, underpasses=()):
-    """Per part: bed and ground heights. Underpasses reserve clearance above their lower road mouths.
-    ground(xy (n, 2)) -> z. The resulting deck heights propagate along connected approach ramps.
+SHARED_CORRIDOR_COS = 0.65         # |cos(angle)| for parallel same-level shared road-rail bridge deck
+SHARED_CORRIDOR_EXTRA_M = 10.0    # m lateral allowance past both deck half-widths on wide decks
+SHARED_CORRIDOR_MIN_M = 30.0      # m minimum parallel overlap along rail span
+SHARED_CORRIDOR_MIN_SHARE = 0.35  # minimum fraction of rail bridge span overlapping shared road deck
+_NON_VEHICULAR_ROAD_CLASSES = frozenset({
+    "footway", "cycleway", "path", "pedestrian", "steps", "bridleway", "corridor",
+})
+
+
+def _box_pad_overlap(a, b, pad):
+    return not (a[2] + pad < b[0] or a[0] - pad > b[2] or a[3] + pad < b[1] or a[1] - pad > b[3])
+
+
+def _polyline_overlap(xy, line):
+    """Per-point closest distance, arc length along line, and |cos(angle)| relative to line."""
+    xy = np.asarray(xy, np.float64)[:, :2]
+    line = np.asarray(line, np.float64)[:, :2]
+    s = _arc(line)
+    dist = np.full(len(xy), np.inf)
+    along_s = np.zeros(len(xy))
+    cos_a = np.zeros(len(xy))
+    t_rail = np.gradient(xy, axis=0) if len(xy) >= 2 else np.zeros_like(xy)
+    t_rail_n = np.maximum(np.linalg.norm(t_rail, axis=1), 1e-9)
+    for j, (a, b) in enumerate(zip(line[:-1], line[1:])):
+        d = b - a
+        length = float(np.hypot(*d))
+        if length < 1e-6:
+            continue
+        t = np.clip((xy - a) @ d / (length * length), 0.0, 1.0)
+        dd = np.linalg.norm(xy - (a + t[:, None] * d), axis=1)
+        take = dd < dist
+        dist[take] = dd[take]
+        along_s[take] = s[j] + t[take] * length
+        u = d / length
+        cos_a[take] = np.abs(t_rail[take, 0] * u[0] + t_rail[take, 1] * u[1]) / t_rail_n[take]
+    return dist, along_s, cos_a
+
+
+def _shared_corridor_mask(xy, s_rail, rail_half, road_xy, road_hw):
+    """Return (par_mask, s_on_road) when rail xy runs parallel along a same-level road bridge."""
+    dist, s_on, cos_a = _polyline_overlap(xy, road_xy)
+    par = (cos_a >= SHARED_CORRIDOR_COS) & (dist <= road_hw + rail_half + SHARED_CORRIDOR_EXTRA_M)
+    if int(par.sum()) < 2:
+        return None
+    spans = par[:-1] | par[1:]
+    cov_len = float(np.sum(np.diff(s_rail)[spans]))
+    L = max(float(s_rail[-1]), 1e-9)
+    if cov_len < min(SHARED_CORRIDOR_MIN_M, 0.5 * L) or cov_len < SHARED_CORRIDOR_MIN_SHARE * L:
+        return None
+    return par, s_on
+
+
+def _collect_road_bridges(frame, cells):
+    """Collect deduped mapped road bridge parts (xy, half_width, level, vehicular) from cells."""
+    seen = set()
+    out = []
+    for feats in cells:
+        if feats is None or len(feats) == 0:
+            continue
+        bs = roads.bridge_specs(feats)
+        for i in range(len(feats)):
+            sp = bs[i]
+            if sp is None:
+                continue
+            fid = str(feats.ids[i])
+            if fid in seen:
+                continue
+            seen.add(fid)
+            parts_ll = roads.bridge_parts(feats, i)
+            lvs = roads.bridge_levels(feats, i)
+            if len(lvs) != len(parts_ll):
+                lvs = [1.0] * len(parts_ll)
+            hw = float(sp.width) / 2.0
+            veh = str(getattr(sp, "cls", "") or "") not in _NON_VEHICULAR_ROAD_CLASSES
+            for ring, lv in zip(parts_ll, lvs):
+                e, n = mapgeom.enu_xy(feats, frame, ring)
+                xy = np.column_stack((e, n))
+                if len(xy) >= 2:
+                    out.append((xy, hw, float(lv), veh))
+    return out
+
+
+def _road_comp_water_reqs(frame, comp_lines, ground):
+    """Generate navigation-channel water requirements for a shared/lower road bridge component."""
+    import bridgetypes
+    try:
+        nav = float(bridgetypes.nav_clearance(frame, comp_lines))
+    except Exception:
+        nav = 0.0
+    if not nav > 0.0:
+        return []
+    try:
+        channel = float(bridgetypes.nav_span(frame, comp_lines))
+    except Exception:
+        channel = 0.0
+    gs = [np.asarray(ground(ln[:, :2]), np.float64).ravel() for ln in comp_lines]
+    if not gs or not all(len(g) for g in gs):
+        return []
+    lo = min(float(g.min()) for g in gs)
+    top = max(max(float(g[0]), float(g[-1])) for g in gs)
+    if lo > top - roads.GAP_DIP_M:
+        return []
+    out = []
+    under = roads.DECK_FULL_DEPTH
+    for k, (ln, g) in enumerate(zip(comp_lines, gs)):
+        if len(ln) < 2:
+            continue
+        xy = np.asarray(ln, np.float64)[:, :2]
+        s = _arc(xy)
+        w = g <= lo + roads.GAP_LOW_M
+        if not w.any():
+            continue
+        la, lo_deg, _ = frame.enu_to_geodetic(xy[:, 0], xy[:, 1], 0.0)
+        sea = np.asarray(frame.geodetic_to_enu(la, lo_deg, np.zeros(len(la)))[2], np.float64)
+        base = np.maximum(g, sea)
+        ds = float(s[1] - s[0])
+        i = 0
+        while i < len(w):
+            if not w[i]:
+                i += 1
+                continue
+            j = i
+            while j + 1 < len(w) and w[j + 1]:
+                j += 1
+            run = float(s[j] - s[i])
+            if run >= roads.WATER_SMALL_M:
+                c = nav + under if run >= roads.NAV_RUN_M else min(roads.water_clear(run + ds), nav + under)
+                c_low = min(c, roads.water_clear(run + ds))
+                if channel > 0.0 and 3.0 * channel < run:
+                    seg = np.arange(i, j + 1)
+                    mid = float(s[seg[int(np.argmin(g[seg]))]])
+                    mid = float(np.clip(mid, s[i] + channel / 2.0, s[j] - channel / 2.0))
+                    c0, c1 = mid - channel / 2.0, mid + channel / 2.0
+                else:
+                    c0, c1 = s[i] + run / 4.0, s[j] - run / 4.0
+                for sc in np.arange(s[i], s[j] + 1e-6, roads.WATER_STEP_M):
+                    out_by = max(0.0, c0 - sc, sc - c1)
+                    cc = max(c_low, c - roads.DECK_DESIGN_GRADE * out_by)
+                    out.append((k, float(sc), float(np.interp(sc, s, base)), cc))
+            i = j + 1
+    return out
+
+
+def _solve_road_bridge_components(frame, cells, road_bridges, seed_idxs, ground):
+    """Solve connected road bridge components referenced by seed_idxs via roads.deck_profile."""
+    if not seed_idxs:
+        return ()
+    _nodes, edges, adj = roads._chain_graph([rb[0] for rb in road_bridges])
+    edge_at_node = {}
+    for idx, (a, b, _s) in enumerate(edges):
+        edge_at_node.setdefault(a, []).append(idx)
+        edge_at_node.setdefault(b, []).append(idx)
+    visited = set()
+    solved = []
+    for seed in sorted(seed_idxs):
+        if seed in visited:
+            continue
+        comp = {seed}
+        stk = [edges[seed][0], edges[seed][1]]
+        seen_nodes = set(stk)
+        while stk:
+            nd = stk.pop()
+            for nb, _w in adj[nd]:
+                if nb not in seen_nodes:
+                    seen_nodes.add(nb)
+                    stk.append(nb)
+            for ei in edge_at_node.get(nd, ()):
+                if ei not in comp:
+                    comp.add(ei)
+        visited |= comp
+        idxs = sorted(comp)
+        comp_lines = [roads.densify(road_bridges[k][0], STEP_M) for k in idxs]
+        comp_hws = [road_bridges[k][1] for k in idxs]
+        comp_lvs = [road_bridges[k][2] for k in idxs]
+        comp_vehs = [road_bridges[k][3] for k in idxs]
+        all_pts = np.vstack(comp_lines)
+        comp_box = (float(all_pts[:, 0].min()), float(all_pts[:, 1].min()),
+                    float(all_pts[:, 0].max()), float(all_pts[:, 1].max()))
+        gl = [ln for ln, _hw in crossings(frame, cells, comp_box, reach=50.0)]
+        rcr = roads._crossings(comp_lines, gl) if gl else []
+        r_reqs = []
+        if rcr:
+            gz = np.asarray(ground(np.array([pt for _, _, pt in rcr], np.float64)), np.float64).ravel()
+            r_reqs = [(pi, float(arc), float(z)) for (pi, arc, _pt), z in zip(rcr, gz)]
+        water = _road_comp_water_reqs(frame, comp_lines, ground)
+        pins = roads._ground_pins(comp_lines, gl) if gl else []
+        zs = roads.deck_profile(
+            comp_lines, ground, r_reqs + water, clear=roads.DECK_ROAD_CLEAR,
+            levels=comp_lvs, widths=[2.0 * hw for hw in comp_hws], pins=pins, ground_roads=gl,
+        )
+        for ln, hw, lv, veh, z_arr in zip(comp_lines, comp_hws, comp_lvs, comp_vehs, zs):
+            z_vec = np.asarray(z_arr, np.float64).ravel()
+            if len(z_vec) == len(ln):
+                solved.append((ln, _arc(ln), hw, lv, veh, z_vec))
+    return tuple(solved)
+
+
+def _bridge_context(frame, cells, box, reach, rails, ground, levels=None):
+    """Collect and solve road bridge decks that either underlie higher rail bridges or share a level deck."""
+    bridge_indices = [n for n, (_f, _c, k, _xy) in enumerate(rails) if k == "bridge"]
+    if not bridge_indices or cells is None:
+        return None
+    cells = list(cells)
+    road_bridges = _collect_road_bridges(frame, cells)
+    if not road_bridges:
+        return None
+    rb_boxes = np.array([[float(xy[:, 0].min()), float(xy[:, 1].min()),
+                          float(xy[:, 0].max()), float(xy[:, 1].max())] for xy, *_ in road_bridges], np.float64)
+    rail_boxes = _rail_boxes(rails)
+    seed_idxs = set()
+    for n in bridge_indices:
+        _fid, cls, _k, xy = rails[n]
+        rail_half = TRAM_DECK_HALF_M if cls == "tram" else DECK_HALF_M
+        lv_rail = round(float(levels.get(id(xy), 1.0)), 3) if levels is not None else 1.0
+        rb = rail_boxes[n]
+        s_rail = _arc(xy)
+        for j, (r_xy, r_hw, r_lv, r_veh) in enumerate(road_bridges):
+            if r_lv < lv_rail - 0.5:
+                if _box_pad_overlap(rb, rb_boxes[j], r_hw + rail_half + 1.0):
+                    dist, _, _ = _polyline_overlap(xy, r_xy)
+                    if (dist <= r_hw + rail_half + 0.5).any():
+                        seed_idxs.add(j)
+            elif r_veh and abs(r_lv - lv_rail) < 0.5:
+                if _box_pad_overlap(rb, rb_boxes[j], r_hw + rail_half + SHARED_CORRIDOR_EXTRA_M + 1.0):
+                    if _shared_corridor_mask(xy, s_rail, rail_half, r_xy, r_hw) is not None:
+                        seed_idxs.add(j)
+    return _solve_road_bridge_components(frame, cells, road_bridges, seed_idxs, ground)
+
+
+def _build_graded_graph(rails, edges, part_lv, edge_grade):
+    """Build integer-indexed adjacency over tagged nodes so different bridge levels never leak at 2D joints."""
+    node_bridge_lvs = {}
+    for n, ((_f, _c, kind, _xy), (a, b, _s)) in enumerate(zip(rails, edges)):
+        if kind == "bridge":
+            lv = part_lv[n]
+            node_bridge_lvs.setdefault(a, set()).add(lv)
+            node_bridge_lvs.setdefault(b, set()).add(lv)
+    idx_of = {}
+    raw_node = []
+
+    def gid(k):
+        i = idx_of.get(k)
+        if i is None:
+            i = len(idx_of)
+            idx_of[k] = i
+            raw_node.append(k[0])
+        return i
+
+    edge_keys = []
+    pairs = []
+    for n, ((_f, _c, kind, _xy), (a, b, s)) in enumerate(zip(rails, edges)):
+        tag = ("b", part_lv[n]) if kind == "bridge" else "g"
+        ua, ub = gid((a, tag)), gid((b, tag))
+        edge_keys.append((ua, ub))
+        pairs.append((ua, ub, float(edge_grade[n]) * float(s[-1])))
+    for nd, lvs in node_bridge_lvs.items():
+        if len(lvs) == 1:
+            lv = next(iter(lvs))
+            pairs.append((gid((nd, "g")), gid((nd, ("b", lv))), 0.0))
+    g_adj = [[] for _ in range(len(idx_of))]
+    for ua, ub, w in pairs:
+        g_adj[ua].append((ub, w))
+        g_adj[ub].append((ua, w))
+    return g_adj, edge_keys, raw_node
+
+
+def profile(rails, ground, underpasses=(), levels=None, context=None):
+    """Per part: bed and ground heights. Underpasses and lower-level bridges reserve clearance beneath decks;
+    same-level shared road bridges transfer their deck heights onto overlapping rail spans; resulting deck heights
+    propagate along connected approach ramps using per-class grade limits.
+    ground(xy (n, 2)) -> z.
     """
     if not rails:
         return []
@@ -1592,10 +1924,12 @@ def profile(rails, ground, underpasses=()):
         k += len(xy)
     lines = [xy for *_, xy in rails]
     nodes, edges, adj = roads._chain_graph(lines)
+    part_lv = [round(float(levels.get(id(xy), 1.0)), 3) if levels is not None else 1.0 for *_, xy in rails]
+    part_grade = [LINE_GRADE.get(cls, GRADE) for _f, cls, _k, _xy in rails]
     level = {}                                  # node -> (level, reach): the track's level beyond a bridge's end there
     decks = [n for n, (_, _, kind, _) in enumerate(rails) if kind == "bridge"]
     got_all = approach_levels_many([rails[n][3] for n in decks], ground,
-                                   [LINE_GRADE.get(rails[n][1], GRADE) for n in decks]) if decks else []
+                                   [part_grade[n] for n in decks]) if decks else []
     for n, ends_got in zip(decks, got_all):
         for node, got in zip(edges[n][:2], ends_got):
             if got is not None and got[0] > level.get(node, (-np.inf, 0.0))[0]:
@@ -1618,7 +1952,7 @@ def profile(rails, ground, underpasses=()):
         zb.append(bed_heights(lifted))
     # Read buried tunnels at their mouths (avoiding the embankment above); _SurfaceUnderpass roads sample along the polyline.
     boxes = _rail_boxes(rails) if underpasses else None
-    crossings = []
+    crossings_up = []
     for item in underpasses:
         line, half = item[0], item[1]
         is_surface = isinstance(item, _SurfaceUnderpass)
@@ -1627,17 +1961,15 @@ def profile(rails, ground, underpasses=()):
                                  min_sin=0.0 if is_surface else UNDERPASS_MIN_SIN,
                                  overlap=is_surface)
         if any(m.any() for m in masks):
-            crossings.append((line, half, masks, is_tunnel))
+            crossings_up.append((line, half, masks, is_tunnel))
     up_samples = []
-    for ln, _hw, _masks, is_tunnel in crossings:
+    for ln, _hw, _masks, is_tunnel in crossings_up:
         if is_tunnel:
             pts = ln[[0, -1]]
         else:
             s_ln = _arc(ln)
             pts = _resample(ln, STEP_M) if len(ln) >= 2 and float(np.diff(s_ln).max()) > STEP_M + 1e-6 else ln
-        up_samples.append(_arc(pts) / max(float(_arc(pts)[-1]), 1e-9))
-        # keep pts alongside normalized arc
-        up_samples[-1] = (pts, up_samples[-1])
+        up_samples.append((pts, _arc(pts) / max(float(_arc(pts)[-1]), 1e-9)))
     if up_samples:
         all_up = np.concatenate([pts for pts, _t in up_samples])
         z_up_all = np.asarray(ground(all_up), np.float64).ravel()
@@ -1652,51 +1984,118 @@ def profile(rails, ground, underpasses=()):
         if kind == "ground":
             ends.setdefault(a, []).append(zb[n][0])
             ends.setdefault(b, []).append(zb[n][-1])
-    seeds = {}                                  # node -> the deck's height at it
-    for n, ((_, cls, kind, xy), (a, b, _)) in enumerate(zip(rails, edges)):
+    for n, ((_, _, kind, xy), (a, b, _)) in enumerate(zip(rails, edges)):
         if kind == "tunnel":                    # (straight between its portals' beds, whatever the hill above it)
             g = zgs[n]
             sx = _arc(xy)
             za = float(np.mean(ends[a])) if a in ends else float(g[0])
             zb_ = float(np.mean(ends[b])) if b in ends else float(g[-1])
             zb[n] = za + (zb_ - za) * sx / max(float(sx[-1]), 1e-9)
-            continue
-        if kind != "bridge":
-            continue
-        g = zgs[n]
-        za = float(np.mean(ends[a])) if a in ends else float(g[0])
-        zb_ = float(np.mean(ends[b])) if b in ends else float(g[-1])
-        za = max(za, level[a][0]) if a in level else za         # (the track's level beyond its ends)
-        zb_ = max(zb_, level[b][0]) if b in level else zb_
-        zb[n] = deck_heights(_arc(xy), g, za, zb_)
-        for (line, _half, masks, _is_tun), (t_pts, z_pts) in zip(crossings, up_z):
-            over = masks[n]
-            if over.any():
-                _distance, t = _underpass_distance(xy, line)
-                z_under = np.interp(t[over], t_pts, z_pts)
-                req = zb[n].copy()
-                req[over] = np.maximum(req[over], z_under + UNDERPASS_CLEAR_M + DECK_D - BALLAST_H)
-                zb[n] = _envelope(_arc(xy), req)
-        for node, h in ((a, zb[n][0]), (b, zb[n][-1])):
-            seeds[node] = max(seeds.get(node, -np.inf), float(h))
-    if seeds:                                   # the decks' heights out along the track, GRADE per metre down
+    road_decks = context or ()
+    road_deck_boxes = ([np.array([float(r_xy[:, 0].min()), float(r_xy[:, 1].min()),
+                                  float(r_xy[:, 0].max()), float(r_xy[:, 1].max())], np.float64)
+                        for r_xy, *_ in road_decks] if road_decks else [])
+    rail_boxes = _rail_boxes(rails) if decks else None
+    solved_rail_decks = []
+    shared_bridge = set()
+    edge_grade = list(part_grade)
+    for tier_lv in sorted({part_lv[n] for n in decks}):
+        tier = [n for n in decks if part_lv[n] == tier_lv]
+        for n in tier:
+            cls, xy = rails[n][1], rails[n][3]
+            rail_half = TRAM_DECK_HALF_M if cls == "tram" else DECK_HALF_M
+            a, b, s = edges[n]
+            g = zgs[n]
+            za = float(np.mean(ends[a])) if a in ends else float(g[0])
+            zb_ = float(np.mean(ends[b])) if b in ends else float(g[-1])
+            za = max(za, level[a][0]) if a in level else za     # (the track's level beyond its ends)
+            zb_ = max(zb_, level[b][0]) if b in level else zb_
+            req = deck_heights(s, g, za, zb_, grade=part_grade[n])
+            for (line, _half, masks, _is_tun), (t_pts, z_pts) in zip(crossings_up, up_z):
+                over = masks[n]
+                if over.any():
+                    _distance, t = _underpass_distance(xy, line)
+                    z_under = np.interp(t[over], t_pts, z_pts)
+                    req[over] = np.maximum(req[over], z_under + UNDERPASS_CLEAR_M + DECK_D - BALLAST_H)
+            for (r_xy, r_arc, r_hw, r_lv, r_veh, r_z), r_box in zip(road_decks, road_deck_boxes):
+                if r_lv < tier_lv - 0.5:
+                    if _box_pad_overlap(rail_boxes[n], r_box, r_hw + rail_half + 1.0):
+                        dist, s_on, _ = _polyline_overlap(xy, r_xy)
+                        over = dist <= r_hw + rail_half + 0.5
+                        if over.any():
+                            z_r_at = np.interp(s_on[over], r_arc, r_z)
+                            req[over] = np.maximum(req[over], z_r_at + UNDERPASS_CLEAR_M + DECK_D - BALLAST_H)
+                elif r_veh and abs(r_lv - tier_lv) < 0.5:
+                    if _box_pad_overlap(rail_boxes[n], r_box, r_hw + rail_half + SHARED_CORRIDOR_EXTRA_M + 1.0):
+                        got = _shared_corridor_mask(xy, s, rail_half, r_xy, r_hw)
+                        if got is not None:
+                            par, s_on = got
+                            z_r_at = np.interp(s_on[par], r_arc, r_z)
+                            req[par] = np.maximum(req[par], z_r_at - BALLAST_H)
+                            shared_bridge.add(n)
+            for l_xy, l_arc, l_hw, l_box, l_z in solved_rail_decks:
+                if _box_pad_overlap(rail_boxes[n], l_box, l_hw + rail_half + 1.0):
+                    dist, s_on, _ = _polyline_overlap(xy, l_xy)
+                    over = dist <= l_hw + rail_half + 0.5
+                    if over.any():
+                        z_l_at = np.interp(s_on[over], l_arc, l_z)
+                        req[over] = np.maximum(req[over], z_l_at + UNDERPASS_CLEAR_M + DECK_D)
+            if n in shared_bridge:
+                edge_grade[n] = max(part_grade[n], roads.DECK_MAX_GRADE)
+            zb[n] = _envelope(s, req, grade=edge_grade[n])
+        if len(tier) > 1:
+            t_idx = {}
+            for n in tier:
+                t_idx.setdefault(edges[n][0], len(t_idx))
+                t_idx.setdefault(edges[n][1], len(t_idx))
+            t_adj = [[] for _ in range(len(t_idx))]
+            t_seeds = {}
+            for n in tier:
+                a, b, s = edges[n]
+                ua, ub = t_idx[a], t_idx[b]
+                w = float(edge_grade[n]) * float(s[-1])
+                t_adj[ua].append((ub, w))
+                t_adj[ub].append((ua, w))
+                t_seeds[ua] = max(t_seeds.get(ua, -np.inf), float(zb[n][0]))
+                t_seeds[ub] = max(t_seeds.get(ub, -np.inf), float(zb[n][-1]))
+            t_top = max(t_seeds.values())
+            t_d = roads._dijkstra(t_adj, {nd: t_top - h for nd, h in t_seeds.items()})
+            for n in tier:
+                a, b, s = edges[n]
+                ua, ub = t_idx[a], t_idx[b]
+                g_n = edge_grade[n]
+                reach = np.maximum(t_top - t_d[ua] - g_n * s, t_top - t_d[ub] - g_n * (s[-1] - s))
+                zb[n] = _envelope(s, np.maximum(zb[n], reach), grade=g_n)
+        for n in tier:
+            rail_half = TRAM_DECK_HALF_M if rails[n][1] == "tram" else DECK_HALF_M
+            solved_rail_decks.append((rails[n][3], edges[n][2], rail_half, rail_boxes[n], zb[n]))
+    if decks:
+        g_adj, edge_keys, raw_node = _build_graded_graph(rails, edges, part_lv, edge_grade)
+        seeds = {}                              # graph node -> deck height at it
+        for n in decks:
+            ua, ub = edge_keys[n]
+            seeds[ua] = max(seeds.get(ua, -np.inf), float(zb[n][0]))
+            seeds[ub] = max(seeds.get(ub, -np.inf), float(zb[n][-1]))
         top = max(seeds.values())
-        d = roads._dijkstra(adj, {n: (top - h) / GRADE for n, h in seeds.items()})
-        # (a ground track: how far a deck stands over the track's own bed where they meet, run out at GRADE per metre
-        # on top of the bed, not the deck's height itself: on a mountain line climbing 10 % (a rack railway) a deck up
-        # the slope carried down at 2 % stood Andermatt's station 14 m over its own ground, GitHub #1051. On level ground
-        # the two are the same ramp.)
-        lifts = {node: h - float(np.mean(ends[node])) for node, h in seeds.items() if node in ends}
-        lifts = {node: v for node, v in lifts.items() if v > 0.0}
+        d = roads._dijkstra(g_adj, {nd: top - h for nd, h in seeds.items()})
+        lifts = {}
+        for nd, h in seeds.items():
+            raw_nd = raw_node[nd]
+            if raw_nd in ends:
+                v = h - float(np.mean(ends[raw_nd]))
+                if v > 0.0:
+                    lifts[nd] = max(lifts.get(nd, -np.inf), v)
         if lifts:
             ltop = max(lifts.values())
-            dl = roads._dijkstra(adj, {node: (ltop - v) / GRADE for node, v in lifts.items()})
+            dl = roads._dijkstra(g_adj, {nd: ltop - v for nd, v in lifts.items()})
         for n, (a, b, s) in enumerate(edges):
+            ua, ub = edge_keys[n]
+            g_n = edge_grade[n]
             if rails[n][2] == "bridge":         # (two decks end to end: still a straight run between their ends)
-                reach = np.maximum(top - GRADE * (d[a] + s), top - GRADE * (d[b] + s[-1] - s))
-                zb[n] = _envelope(s, np.maximum(zb[n], reach))
+                reach = np.maximum(top - d[ua] - g_n * s, top - d[ub] - g_n * (s[-1] - s))
+                zb[n] = _envelope(s, np.maximum(zb[n], reach), grade=g_n)
             elif lifts:                         # a ground track follows its own bed: a distant deck carries the
-                lift = np.maximum(ltop - GRADE * (dl[a] + s), ltop - GRADE * (dl[b] + s[-1] - s))     # ramps to it
+                lift = np.maximum(ltop - dl[ua] - g_n * s, ltop - dl[ub] - g_n * (s[-1] - s))   # ramps to it
                 zb[n] = zb[n] + np.clip(lift, 0.0, SEED_LIFT_MAX_M)
     return list(zip(zb, zgs))
 
@@ -1787,9 +2186,9 @@ def seam_crossers(xy, zb, roads_):
     return out
 
 
-def _blocked(xy, z, crossers, pad=CROSSING_PAD_M):
+def _blocked(xy, z, crossers, pad=CROSSING_PAD_M, dz=CROSSING_DZ):
     """Per point of xy (bed heights z): inside a crossing road's carriageway (+ pad) at grade: its nearest
-    segment's start within CROSSING_DZ of the bed (earthfast.near_crossers)."""
+    segment's start within dz of the bed (earthfast.near_crossers)."""
     import fast
     xy = np.asarray(xy, np.float64).reshape(-1, 2)
     pack = _crosser_pack(crossers, pad=pad)
@@ -1797,7 +2196,16 @@ def _blocked(xy, z, crossers, pad=CROSSING_PAD_M):
         return np.zeros(len(xy), bool)
     fast.require(74, "near_crossers")
     return np.asarray(fast._ef.near_crossers(np.ascontiguousarray(xy), np.ascontiguousarray(np.asarray(z, np.float64)),
-                                             *pack, float(CROSSING_DZ)), bool)
+                                             *pack, float(dz)), bool)
+
+
+def _mw_blocked(xy, z, zg, crossers, pad):
+    """True when xy sits horizontally inside a ground motorway (+ pad) within MOTORWAY_EXCLUDE_DZ of either the
+    motorway's centerline or the local ground at xy (catches sloped cuts where carriageway edge drops below centreline)."""
+    if not crossers or not len(xy):
+        return np.zeros(len(xy), bool)
+    dz = np.abs(np.asarray(z, np.float64) - np.asarray(zg, np.float64)) <= MOTORWAY_EXCLUDE_DZ
+    return _blocked(xy, z, crossers, pad=pad, dz=MOTORWAY_EXCLUDE_DZ) | (_blocked(xy, z, crossers, pad=pad, dz=1e9) & dz)
 
 
 _CROSSER_PACK = [(None, None, None)]  # [(the crossers list, pad, its packed arrays)]: reused across a tile's parts
@@ -1949,12 +2357,17 @@ def _sited(pr, crossers, ground):
     return c, along, across, np.minimum(z0, zg - PIER_FOOT_M), z1
 
 
-def _ballast_bed(mesh, p, uu, t, v, foot_l, foot_r, zl, zr, mat, tile=3.0):
+def _ballast_edges(p, uu, t, top_l, top_r):
+    tl = np.broadcast_to(np.asarray(top_l, np.float64), (len(p),))
+    tr = np.broadcast_to(np.asarray(top_r, np.float64), (len(p),))
+    return np.c_[p + uu * tl[:, None], t], np.c_[p - uu * tr[:, None], t]
+
+
+def _ballast_bed(mesh, p, uu, t, v, foot_l, foot_r, zl, zr, mat, tile=3.0, top_l=BALLAST_TOP_M, top_r=BALLAST_TOP_M):
     up = np.array([0.0, 0.0, 1.0])
     v = v * 3.0 / tile                  # (v: arc / 3 m)
     out_l = np.c_[uu, np.zeros(len(p))]
-    L = np.c_[p + uu * BALLAST_TOP_M, t]
-    R = np.c_[p - uu * BALLAST_TOP_M, t]
+    L, R = _ballast_edges(p, uu, t, top_l, top_r)
     Lf = np.c_[p + uu * foot_l[:, None], np.minimum(zl, t) - BALLAST_FOOT_M]
     Rf = np.c_[p - uu * foot_r[:, None], np.minimum(zr, t) - BALLAST_FOOT_M]
     mesh.strip(L, R, 0.0, 2 * BALLAST_TOP_M / tile, v, mat, up)
@@ -1962,11 +2375,10 @@ def _ballast_bed(mesh, p, uu, t, v, foot_l, foot_r, zl, zr, mat, tile=3.0):
     mesh.strip(R, Rf, 0.0, 0.8 * 3.0 / tile, v, mat, -out_l + up)
 
 
-def _ballast_flat(mesh, p, uu, t, v, mat, tile=3.0):
+def _ballast_flat(mesh, p, uu, t, v, mat, tile=3.0, top_l=BALLAST_TOP_M, top_r=BALLAST_TOP_M):
     up = np.array([0.0, 0.0, 1.0])
     v = v * 3.0 / tile
-    L = np.c_[p + uu * BALLAST_TOP_M, t]
-    R = np.c_[p - uu * BALLAST_TOP_M, t]
+    L, R = _ballast_edges(p, uu, t, top_l, top_r)
     mesh.strip(L, R, 0.0, 2 * BALLAST_TOP_M / tile, v, mat, up)
 
 
@@ -2645,7 +3057,7 @@ def _collider(mesh, p, uu, t, v, half_g, up):
         mesh.strip(np.c_[co, zl], np.c_[co, zt], 0.0, 0.05, v, coll, sg * out_l)
 
 
-def _foot_limits(xy, side, foot, others, crossers):
+def _foot_limits(xy, side, foot, others, crossers, floor=BALLAST_TOP_M + 0.01, road_clear=ROAD_FOOT_CLEAR_M):
     """Per vertex: the ballast foot's width, clipped at a road's carriageway edge or another track's deck so a fill's
     side is a wall there, not a slope over the road/track (the wide double-track embankment's foot ran over the road
     under it and the line beside it: a hollow overhang the player could drive into)."""
@@ -2667,14 +3079,14 @@ def _foot_limits(xy, side, foot, others, crossers):
         near = d[np.arange(len(p)), k]
         on = ((q[np.arange(len(p)), k] - p) * sd).sum(1) > 0.0
         edge = near - extra
-        ok = on & (edge > 0.0) & (edge < lim)
-        lim[ok] = edge[ok]
+        ok = on & ((edge > 0.0) | (floor <= 0.0)) & (edge < lim)
+        lim[ok] = np.maximum(edge[ok], 0.0)
 
     for line, half, _z in crossers:
-        clip(line, float(half) + ROAD_FOOT_CLEAR_M)
+        clip(line, float(half) + road_clear)
     for _fid, line in others:
         clip(line, DECK_HALF_M + RAIL_FOOT_CLEAR_M)
-    return np.maximum(lim, BALLAST_TOP_M + 0.01)
+    return np.maximum(lim, floor)
 
 
 def _shared_road_bridge(chain, bridge_lines):
@@ -2806,11 +3218,11 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
     tunnels = road_underpasses(frame, cells, box)
     ground = _mixed(ground, far_ground, box)
     ex = (box[0] - roads.OVERLAP, box[1] - roads.OVERLAP, box[2] + roads.OVERLAP, box[3] + roads.OVERLAP)
-    worn, gauges = {}, {}
-    rails = parts(frame, cells, box, clip=True, worn=worn, gauges=gauges, underpasses=tunnels)
+    worn, gauges, part_levels = {}, {}, {}
+    rails = parts(frame, cells, box, clip=True, worn=worn, gauges=gauges, underpasses=tunnels, levels=part_levels)
     walk = footbridges.parts(frame, cells, box) if FOOTBRIDGES_ON else []    # (and the walkways' bridges: GitHub #905)
     exs = (ex[0] - STEP_M, ex[1] - STEP_M, ex[2] + STEP_M, ex[3] + STEP_M)
-    if not any(_box_hit((xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()), exs) for *_, xy in rails):
+    if not any(roads.clip_polyline(xy, *exs) for *_, xy in rails):
         rails = []
     walk = [w for w in walk if _box_hit((w[1][:, 0].min(), w[1][:, 1].min(), w[1][:, 0].max(), w[1][:, 1].max()), exs)]
     if under is not None:
@@ -2818,7 +3230,8 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
     if not rails and not walk:
         return (None, []) if return_decks else None
     cu = coarse_underpasses(frame, cells, box, rails, elev=bed_elev, ground=far_ground or ground) if rails else []
-    prof = (_beds(frame, rails, ground, tunnels + cu, load, bed_elev) if rails else [])
+    prof = (_beds(frame, rails, ground, tunnels + cu, load, bed_elev,
+                  levels=part_levels, cells=cells, box=box, reach=REACH_M) if rails else [])
     keep = [n for n in range(len(rails)) if n not in _drop]
     if _drop:                                       # (a retry past the vertex budget: the tracks of lowest rank left out)
         rails, prof = [rails[n] for n in keep], [prof[n] for n in keep]
@@ -2832,7 +3245,8 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
     any_ground = any(kind == "ground" for _f, _c, kind, _xy in rails)
     all_cr = crossings(frame, cells, box, reach=50.0)
     bridge_cr = bridge_crossings(frame, cells, box, reach=50.0)
-    mw_cr = motorway_ground_crossings(frame, cells, box, reach=50.0) if any_ground else []
+    mw_cr = [(roads.densify(ln, max(STEP_M, 4.0)), hw)
+             for ln, hw in (motorway_ground_crossings(frame, cells, box, reach=50.0) if any_ground else [])]
     cr = (true_crossers(ground_lines, all_cr) if TRUE_CROSSERS_ON else all_cr) + tunnels
     worn_ground = any(worn.get(f, 0) >= 1 and k == "ground" for f, _c, k, _xy in rails)
     need_all_z = bool(walk) or (worn_ground and TRUE_CROSSERS_ON)
@@ -2861,7 +3275,8 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
         for n_part, ((_fid, cls, kind, xy), (zb, _zg), gone) in enumerate(zip(rails, prof, carried))
         if kind == "bridge" and not gone
     ]
-    base_pier_crossers = [(ln, hw, None) for ln, hw in all_cr + tunnels + bridge_cr]
+    tunnel_cr = tunnel_crossings(frame, cells, box, reach=50.0)
+    base_pier_crossers = [(ln, hw, None) for ln, hw in all_cr + tunnels + bridge_cr + tunnel_cr]
     switch = _switch_masks(rails)
     mesh = _Mesh((box[0], box[1], 0.0))
     ballast, concrete, steel = mesh.mat(BALLAST), mesh.mat(CONCRETE), mesh.mat(STEEL)
@@ -2890,9 +3305,11 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
                 zb = _flush(s, zb, blk, np.asarray(ground(xy[blk]), np.float64))
                 top = zb + BALLAST_H
                 finals[n_part] = zb
-            # Suppress all ground railway mesh (including parallel/tangent tracks and colliders) inside motorways.
-            mw_mask = _blocked(xy, zb, mw_crossers, pad=BALLAST_TOP_M + 0.2) if mw_crossers else np.zeros(len(xy), bool)
+            # Suppress ground railway mesh inside motorways and trim motorway-facing ballast/fill shoulders.
+            mw_mask = _mw_blocked(xy, zb, zg, mw_crossers, half_g - RAIL_HEAD / 2 + COLLIDER_W + 0.01)
             cut = blk | mw_mask | ~inside
+            over_mw = (_blocked(xy, zb, mw_crossers, pad=BALLAST_TOP_M, dz=1e9)
+                       & ~cut & (zb > zg + MOTORWAY_EXCLUDE_DZ)) if mw_crossers else None
             # the ballast's sides to the ground beside: wider where the bed stands high (a ramp's embankment)
             near = BALLAST_TOP_M + BALLAST_SLOPE * (BALLAST_H + BALLAST_FOOT_M)
             feet = []
@@ -2909,30 +3326,53 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
             others = [(f2, xy2) for f2, _c2, _k2, xy2 in rails if f2 != fid]
             for k, sg in enumerate((1, -1)):
                 foot, zs = feet[k]
-                lim = _foot_limits(xy, sg * u, foot, others, part_crossers_blk + mw_crossers)
+                lim = _foot_limits(xy, sg * u, foot, others, part_crossers_blk)
+                if mw_crossers:
+                    lim = np.minimum(lim, _foot_limits(xy, sg * u, foot, (), mw_crossers,
+                                                       floor=0.0, road_clear=0.25))
                 if np.any(lim < foot):
                     foot = lim
                     zs = np.asarray(ground(xy + sg * u * foot[:, None]), np.float64)
                     feet[k] = (foot, zs)
+            top_l = np.minimum(BALLAST_TOP_M, np.maximum(0.0, feet[0][0] - 0.02))
+            top_r = np.minimum(BALLAST_TOP_M, np.maximum(0.0, feet[1][0] - 0.02))
         else:
             mw_mask = None
+            over_mw = None
             cut = ~inside
+        if kind == "ground":
+            bed_cut = (cut | over_mw) if over_mw is not None else cut
+            (fl, zl), (fr, zr) = feet
+            bmat = mesh.mat(BALLAST_STONE) if railxing.ENABLED and w == 0 else ballast_w
+            btile = BALLAST_TILE_M if railxing.ENABLED and w == 0 else 3.0
+            for bi, bj in _runs(bed_cut):
+                bsl = slice(bi, bj + 1)
+                bkm = _thin_run(xy[bsl], stride)
+                bp, buu, bt, bv = xy[bsl][bkm], u[bsl][bkm], top[bsl][bkm], s[bsl][bkm] / 3.0
+                if flat_ballast:
+                    _ballast_flat(mesh, bp, buu, bt, bv, bmat, btile, top_l[bsl][bkm], top_r[bsl][bkm])
+                else:
+                    _ballast_bed(mesh, bp, buu, bt, bv, fl[bsl][bkm], fr[bsl][bkm],
+                                 zl[bsl][bkm], zr[bsl][bkm], bmat, btile, top_l[bsl][bkm], top_r[bsl][bkm])
+            if over_mw is not None and np.any(over_mw):
+                deck_mask = over_mw.copy()
+                deck_mask[:-1] |= over_mw[1:]
+                deck_mask[1:] |= over_mw[:-1]
+                for di, dj in _runs(cut | ~deck_mask):
+                    dsl = slice(di, dj + 1)
+                    dkm = _thin_run(xy[dsl], stride)
+                    dp, duu, dt, dv = xy[dsl][dkm], u[dsl][dkm], top[dsl][dkm], s[dsl][dkm] / 3.0
+                    if cls == "tram":
+                        _tram_deck(mesh, dp, duu, dt, dv, concrete)
+                    else:
+                        _deck(mesh, dp, duu, dt, dv, ballast_w, concrete)
         for i, j in _runs(cut):
             sl = slice(i, j + 1)
             km = _thin_run(xy[sl], stride)
             p, uu, t, v = xy[sl][km], u[sl][km], top[sl][km], s[sl][km] / 3.0
-            if kind == "ground":
-                (fl, zl), (fr, zr) = feet
-                fl_k, fr_k, zl_k, zr_k = fl[sl][km], fr[sl][km], zl[sl][km], zr[sl][km]
-                bmat = mesh.mat(BALLAST_STONE) if railxing.ENABLED and w == 0 else ballast_w
-                btile = BALLAST_TILE_M if railxing.ENABLED and w == 0 else 3.0
-                if flat_ballast:
-                    _ballast_flat(mesh, p, uu, t, v, bmat, btile)
-                else:
-                    _ballast_bed(mesh, p, uu, t, v, fl_k, fr_k, zl_k, zr_k, bmat, btile)
-            elif kind == "tunnel":
+            if kind == "tunnel":
                 _tunnel(mesh, p, uu, t, v, ballast_w, concrete, i == 0, j == len(xy) - 1)
-            else:
+            elif kind != "ground":
                 if cls == "tram":
                     _tram_deck(mesh, p, uu, t, v, concrete)
                 else:
@@ -2958,6 +3398,10 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
                 mesh.strip(np.c_[b, st], np.c_[b, st + RAIL_H], 0.0, 0.05, v, steel_w, -out_l)
             if cls != "tram" and emit_sleepers:
                 sp = _sleepers(s, xy, u, top, i, j, SLEEPERS_GONE[w])
+                if sp is not None and kind == "ground" and mw_crossers:
+                    sp_z = 0.5 * (sp[3] + sp[4])
+                    sp_keep = ~_mw_blocked(sp[0], sp_z, ground(sp[0]), mw_crossers, SLEEPER_L / 2 + 0.01)
+                    sp = tuple(a[sp_keep] for a in sp) if np.any(sp_keep) else None
                 if sp is not None:
                     small.append((sp, SLEEPER_W / 2, SLEEPER_L / 2, mesh.mat(SLEEPER_WORN[w])))
         if cls != "tram" and emit_collider:       # (the rails' physics, on straight through a level crossing)
@@ -3002,7 +3446,7 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
     ]
     footbridges.add(mesh, walk, ground, walk_crossers, ex, concrete, small, road_bridges=bridge_cr)
     _add_bridge_structures(frame, box, rails, prof, carried,
-                           [ln for ln, _hw, _z in base_pier_crossers if ln is not None],
+                           [(ln, hw) for ln, hw, _z in base_pier_crossers if ln is not None],
                            ground, mesh, small, concrete, infra=infra, infra_fn=infra_fn,
                            bridge_lines=bridge_crossings(frame, cells, box, reach=REACH_M))
     sleeper_mats = {mesh.mat(m) for m in SLEEPER_WORN if m in mesh.mats}

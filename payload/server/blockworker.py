@@ -18,7 +18,16 @@ import json
 import math
 import logging
 import os
+import sys as _brf_sys
 import queue
+
+_BRF_ADDON_REV = "0.3.0"
+if not os.environ.get("BNE_BRF_ADDON_REV_PIN") and os.environ.get("BNE_BRF_ADDON_REV") != _BRF_ADDON_REV:
+    os.environ["BNE_BRF_ADDON_REV"] = _BRF_ADDON_REV
+    _brf_revisit = _brf_sys.modules.get("revisit")
+    if _brf_revisit is not None:
+        getattr(_brf_revisit, "_code", []).clear()
+        getattr(_brf_revisit, "_switches", []).clear()
 import threading
 import time
 
@@ -1250,13 +1259,6 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
         if DECK_SENTINEL_STRICT:
             raise RuntimeError(msg)
     mark("deck_mesh")
-    import fences
-    try:                            # the mapped stone walls (GitHub #938), in the retaining walls' stone
-        rwalls = rwalls + fences.stone_walls(frame, infra_fn, box, elev, roads=near_roads)
-    except Exception as ex:
-        log.warning("stone walls: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
-    P.tmesh = roadmeshmod.tunnel(chunks, (x0, y0, 0.0), rwalls)
-    mark("tunnel_mesh")
     import railways
     rcells = [cell_fn(k) for k in roadsmod.cells_of_tile(frame, tx, ty, railways.REACH_M)]
     rground = railways.point_ground(frame, elev, rkey)
@@ -1298,6 +1300,18 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
     if rail_props:
         props = (props or []) + rail_props
     mark("railways")
+    import fences
+    all_decks = guardrail_decks + rail_decks
+    try:                            # the mapped stone walls (GitHub #938), in the retaining walls' stone
+        rwalls = rwalls + fences.stone_walls(frame, infra_fn, box, elev, roads=near_roads)
+    except Exception as ex:
+        log.warning("stone walls: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
+    try:                            # continuous grade-following concrete noise barriers
+        rwalls = rwalls + fences.noise_walls(frame, infra_fn, box, elev, decks=all_decks, roads=near_roads)
+    except Exception as ex:
+        log.warning("noise walls: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
+    P.tmesh = roadmeshmod.tunnel(chunks, (x0, y0, 0.0), rwalls)
+    mark("tunnel_mesh")
     bld = None
     garage_sound = ()
     oil_wells = []
@@ -1324,9 +1338,9 @@ def _tile_parts(mark, frame, tile, zoom, g, buildings, left_hand, mph, gas_stati
                                decks=guardrail_decks)
         import fences
         try:
-            props.extend(fences.rows(frame, infra_fn, box, elev, decks=[{"n": np.column_stack((xy, z)), "w": spec.width}
-                                                                        for _f, spec, xy, z, _l in deck_parts] + rail_decks,
-                                     roads=near_roads, french=frontage_country == "FR"))
+            props.extend(fences.rows(frame, infra_fn, box, elev, decks=all_decks,
+                                     roads=near_roads, french=frontage_country == "FR",
+                                     include_noisewalls=False))
         except Exception as ex:
             log.warning("fences: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
         import picnic

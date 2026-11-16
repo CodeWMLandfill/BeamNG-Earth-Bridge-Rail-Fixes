@@ -5,9 +5,17 @@ local M = {}
 
 M.LEVEL_ID = 'beamng_earth'
 M.ADDON_ID = 'beamng-earth-bridge-rail-fixes'
-M.ADDON_VERSION = '0.2.0'
+M.ADDON_VERSION = '0.3.0'
 M.DIR = 'beamngEarth/bridge_rail_reports/'
 M.POLL_TIMEOUT_S = 22
+M.FIX_NOTIFY_SETTLE_S = 3.0
+M.FIX_TOAST_DURATION_S = 14.0
+M.UPDATE_TOAST_DURATION_S = 14.0
+M.PENDING_FIXES_FILE = M.DIR .. 'pending_fix_notifications.json'
+M.PENDING_UPDATE_FILE = M.DIR .. 'pending_update_notification.json'
+M.DISMISSED_UPDATE_FILE = M.DIR .. 'dismissed_update.json'
+M.ALLOWED_ISSUE_URL_PREFIX = 'https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/'
+M.ALLOWED_RELEASE_URL_PREFIX = 'https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/releases/'
 
 local im = nil
 local ourLevel = false
@@ -15,16 +23,33 @@ local seq = 0
 local pending = nil      -- { rel = ..., deadline = ... }
 local toast, toastUntil = nil, 0
 local delayedToast, delayedAt = nil, nil
+local readySince = nil
+local fixCheckAttempts = 0
+local nextFixCheckAt = 0
+local fixToast = nil     -- { items = { ... }, untilT = ... }
+local updateCheckAttempts = 0
+local nextUpdateCheckAt = 0
+local updateToast = nil  -- { latestVersion = ..., currentVersion = ..., tagName = ..., releaseUrl = ..., untilT = ... }
 
 local wallMs = require('beamngEarth/stopwatch').clock()
 local function now() return wallMs() / 1000 end
 
 local function onLevel()
   ourLevel = rawget(_G, 'getCurrentLevelIdentifier') ~= nil and getCurrentLevelIdentifier() == M.LEVEL_ID
+  readySince = nil
+  fixCheckAttempts = 0
+  nextFixCheckAt = 0
+  updateCheckAttempts = 0
+  nextUpdateCheckAt = 0
 end
 
 M.onClientStartMission = onLevel
-function M.onClientEndMission() ourLevel = false end
+function M.onClientEndMission()
+  ourLevel = false
+  readySince = nil
+  fixToast = nil
+  updateToast = nil
+end
 function M.onExtensionLoaded() if scenetree and scenetree.MissionGroup then onLevel() end end
 
 local function showToast(msg, dur)
@@ -202,11 +227,200 @@ end
 
 M._inspectLoadingState = inspectLoadingState
 
+local function isAllowedIssueUrl(url)
+  if type(url) ~= 'string' then return false end
+  local pre = M.ALLOWED_ISSUE_URL_PREFIX
+  if url:sub(1, #pre) ~= pre then return false end
+  local tail = url:sub(#pre + 1)
+  return tail ~= '' and tail:match('^%d+$') ~= nil
+end
+
+local function isAllowedReleaseUrl(url)
+  if type(url) ~= 'string' then return false end
+  local pre = M.ALLOWED_RELEASE_URL_PREFIX
+  if url:sub(1, #pre) ~= pre then return false end
+  local tail = url:sub(#pre + 1)
+  return tail ~= '' and not url:match('%s')
+end
+
+local function normalizeVer(v)
+  if type(v) ~= 'string' then return nil end
+  local s = v:gsub('^v', '')
+  if s:match('^%d+%.%d+%.%d+[A-Za-z0-9%.%-]*$') then return s end
+  return nil
+end
+
+local function readDismissedUpdateVersion()
+  if not FS or not FS:fileExists(M.DISMISSED_UPDATE_FILE) then return nil end
+  local txt = readFile(M.DISMISSED_UPDATE_FILE)
+  local okD, doc = pcall(jsonDecode, txt or '')
+  if okD and type(doc) == 'table' then
+    return normalizeVer(tostring(doc.skippedVersion or ''))
+  end
+  return nil
+end
+
+local function writeDismissedUpdateVersion(ver)
+  local norm = normalizeVer(ver)
+  if not norm then return end
+  local okEnc, encoded = pcall(jsonEncode, {
+    skippedVersion = norm,
+    skippedAt = os.time(),
+  })
+  if okEnc and encoded then
+    pcall(writeFile, M.DISMISSED_UPDATE_FILE, encoded)
+  end
+end
+
+local function clearPendingFile(path, emptyJson)
+  if FS and type(FS.removeFile) == 'function' then
+    pcall(FS.removeFile, FS, path)
+  end
+  if FS and FS:fileExists(path) then
+    pcall(writeFile, path, emptyJson)
+  end
+end
+
+local function isSafeReportDir(dir)
+  if type(dir) ~= 'string' then return false end
+  if dir:sub(1, #M.DIR) ~= M.DIR then return false end
+  if dir:find('..', 1, true) or dir:find('\\', 1, true) then return false end
+  return dir:sub(-1) == '/'
+end
+
+local function markItemNotified(item)
+  if type(item) ~= 'table' then return end
+  local dirs = {}
+  local seen = {}
+  if isSafeReportDir(item.dir) then
+    dirs[#dirs + 1] = item.dir
+    seen[item.dir] = true
+  end
+  if type(item.dirs) == 'table' then
+    for _, d in ipairs(item.dirs) do
+      if isSafeReportDir(d) and not seen[d] then
+        dirs[#dirs + 1] = d
+        seen[d] = true
+      end
+    end
+  end
+  local okEnc, encoded = pcall(jsonEncode, {
+    notifiedAt = os.time(),
+    reportNumber = item.issueNumber,
+    fixedIn = tostring(item.fixedIn or '0.2.0'),
+  })
+  if not okEnc or not encoded then return end
+  for _, d in ipairs(dirs) do
+    pcall(writeFile, d .. 'notified_fixed.json', encoded)
+  end
+end
+
+local function clearPendingFixesFile()
+  clearPendingFile(M.PENDING_FIXES_FILE, '{"version":1,"items":[]}')
+end
+
+local function clearPendingUpdateFile()
+  clearPendingFile(M.PENDING_UPDATE_FILE, '{}')
+end
+
+local function tryLoadUpdateNotification(t)
+  if not FS or not FS:fileExists(M.PENDING_UPDATE_FILE) then return false end
+  local txt = readFile(M.PENDING_UPDATE_FILE)
+  clearPendingUpdateFile()
+  local okD, doc = pcall(jsonDecode, txt or '')
+  if not okD or type(doc) ~= 'table' then return true end
+  local latest = normalizeVer(tostring(doc.latestVersion or doc.tagName or ''))
+  local installed = normalizeVer(tostring(doc.currentVersion or M.ADDON_VERSION)) or M.ADDON_VERSION
+  if not latest or latest == normalizeVer(M.ADDON_VERSION) then return true end
+  if not isAllowedReleaseUrl(doc.releaseUrl) then return true end
+  if readDismissedUpdateVersion() == latest then return true end
+  updateToast = {
+    latestVersion = latest,
+    currentVersion = installed,
+    tagName = tostring(doc.tagName or ('v' .. latest)),
+    releaseUrl = doc.releaseUrl,
+    untilT = t + M.UPDATE_TOAST_DURATION_S,
+  }
+  return true
+end
+
+local function tryLoadFixNotifications(t)
+  if not FS or not FS:fileExists(M.PENDING_FIXES_FILE) then return false end
+  local txt = readFile(M.PENDING_FIXES_FILE)
+  local okD, doc = pcall(jsonDecode, txt or '')
+  if not okD or type(doc) ~= 'table' or type(doc.items) ~= 'table' then
+    clearPendingFixesFile()
+    return true
+  end
+
+  local valid = {}
+  for _, it in ipairs(doc.items) do
+    if type(it) == 'table' and type(it.issueNumber) == 'number' and it.issueNumber >= 1
+        and isSafeReportDir(it.dir) then
+      local num = math.floor(it.issueNumber)
+      local already = FS:fileExists(it.dir .. 'notified_fixed.json')
+      if not already and type(it.dirs) == 'table' then
+        for _, d in ipairs(it.dirs) do
+          if isSafeReportDir(d) and FS:fileExists(d .. 'notified_fixed.json') then
+            already = true
+            break
+          end
+        end
+      end
+      if not already then
+        local url = isAllowedIssueUrl(it.issueUrl) and it.issueUrl or (M.ALLOWED_ISSUE_URL_PREFIX .. tostring(num))
+        local fixedIn = tostring(it.fixedIn or '0.2.0'):gsub('^v', '')
+        local lat = (type(it.lat) == 'number' and it.lat >= -90 and it.lat <= 90) and it.lat or nil
+        local lon = (type(it.lon) == 'number' and it.lon >= -180 and it.lon <= 180) and it.lon or nil
+        valid[#valid + 1] = {
+          dir = it.dir,
+          dirs = type(it.dirs) == 'table' and it.dirs or { it.dir },
+          issueNumber = num,
+          fixedIn = fixedIn,
+          issueUrl = url,
+          lat = lat,
+          lon = lon,
+          kind = sanitizeCategory(it.kind),
+        }
+      end
+    end
+  end
+
+  clearPendingFixesFile()
+  if #valid > 0 then
+    for _, entry in ipairs(valid) do
+      markItemNotified(entry)
+    end
+    fixToast = {
+      items = valid,
+      untilT = t + M.FIX_TOAST_DURATION_S,
+    }
+  end
+  return true
+end
+
 function M.status()
+  local ft = (fixToast and now() < fixToast.untilT and fixToast.items and fixToast.items[1]) or nil
+  local ut = (updateToast and now() < updateToast.untilT) and updateToast or nil
   return {
     ourLevel = ourLevel,
     pending = pending ~= nil,
     toast = (toast and now() < toastUntil) and toast or nil,
+    fixToast = ft and {
+      issueNumber = ft.issueNumber,
+      fixedIn = ft.fixedIn,
+      issueUrl = ft.issueUrl,
+      lat = ft.lat,
+      lon = ft.lon,
+      kind = ft.kind,
+      count = #fixToast.items,
+    } or nil,
+    updateToast = ut and {
+      latestVersion = ut.latestVersion,
+      currentVersion = ut.currentVersion,
+      tagName = ut.tagName,
+      releaseUrl = ut.releaseUrl,
+    } or nil,
   }
 end
 
@@ -286,6 +500,8 @@ function M.captureSilent()
 
   -- Clear any visible toast and take the screenshot cleanly before drawing status feedback.
   toast, toastUntil = nil, 0
+  fixToast = nil
+  updateToast = nil
   if type(createScreenshot2) == 'function' then
     pcall(createScreenshot2, { filename = rel .. 'screenshot', writeJPG = true, superSampling = 1 })
   end
@@ -361,9 +577,134 @@ function M.onUpdate()
     end
   end
 
+  local opts = addonOptions()
+  if opts.notifyFixedReports == false then
+    fixToast = nil
+  elseif fixToast and t >= fixToast.untilT then
+    fixToast = nil
+  end
+  if opts.notifyAddonUpdates == false then
+    updateToast = nil
+  elseif updateToast and t >= updateToast.untilT then
+    updateToast = nil
+  end
+
+  local needFixCheck = (opts.notifyFixedReports ~= false) and (not fixToast) and (fixCheckAttempts < 2)
+  local needUpdCheck = (opts.notifyAddonUpdates ~= false) and (not updateToast) and (updateCheckAttempts < 2)
+  if ourLevel and (needFixCheck or needUpdCheck) then
+    local api = rawget(_G, 'beamngEarth_api')
+    local core = rawget(_G, 'beamngEarth_core')
+    local worldReady = false
+    if api and type(api.ready) == 'function' then
+      local okR, r = pcall(api.ready)
+      if okR and r == true and blackFrameBlocker(core, nil) == nil then
+        worldReady = true
+      end
+    end
+    if not worldReady then
+      readySince = nil
+    else
+      readySince = readySince or t
+      if (t - readySince) >= M.FIX_NOTIFY_SETTLE_S then
+        if needFixCheck and t >= nextFixCheckAt then
+          fixCheckAttempts = fixCheckAttempts + 1
+          if tryLoadFixNotifications(t) then
+            fixCheckAttempts = 2
+          else
+            nextFixCheckAt = t + 5.0
+          end
+        end
+        if needUpdCheck and t >= nextUpdateCheckAt then
+          updateCheckAttempts = updateCheckAttempts + 1
+          if tryLoadUpdateNotification(t) then
+            updateCheckAttempts = 2
+          else
+            nextUpdateCheckAt = t + 5.0
+          end
+        end
+      end
+    end
+  end
+
   im = im or rawget(_G, 'ui_imgui')
-  if not im or not toast or t >= toastUntil then return end
-  im.SetNextWindowPos(im.ImVec2(20, 150), im.Cond_Always)
+  if not im then return end
+
+  local noticeFlags = (im.WindowFlags_NoDecoration or 0)
+    + (im.WindowFlags_AlwaysAutoResize or 0)
+    + (im.WindowFlags_NoSavedSettings or 0)
+    + (im.WindowFlags_NoFocusOnAppearing or 0)
+    + (im.WindowFlags_NoNav or 0)
+
+  local showFix = fixToast and t < fixToast.untilT and fixToast.items and fixToast.items[1]
+  if showFix then
+    if type(im.SetNextWindowBgAlpha) == 'function' then
+      pcall(im.SetNextWindowBgAlpha, 0.84)
+    end
+    im.SetNextWindowPos(im.ImVec2(20, 88), im.Cond_Always)
+    if im.Begin('##bngeBridgeRailFixedToast', nil, noticeFlags) then
+      local cur = fixToast.items[1]
+      local extra = (#fixToast.items > 1) and string.format(' (+%d more)', #fixToast.items - 1) or ''
+      im.TextUnformatted(string.format('Spot report #%d (%s) fixed in v%s!%s',
+        cur.issueNumber, cur.kind, cur.fixedIn, extra))
+      if im.Button('View Report') then
+        if isAllowedIssueUrl(cur.issueUrl) then
+          local openFn = rawget(_G, 'openWebBrowser')
+          if openFn ~= nil then pcall(openFn, cur.issueUrl) end
+        end
+        fixToast = nil
+      end
+      if type(cur.lat) == 'number' and type(cur.lon) == 'number' then
+        if im.SameLine ~= nil then im.SameLine() end
+        if im.Button('Teleport There') then
+          local api = rawget(_G, 'beamngEarth_api')
+          if api and api.teleport ~= nil then
+            pcall(api.teleport, cur.lat, cur.lon, 'Spot Report #' .. tostring(cur.issueNumber))
+          end
+          fixToast = nil
+        end
+      end
+      if im.SameLine ~= nil then im.SameLine() end
+      if im.Button('Dismiss') then
+        fixToast = nil
+      end
+    end
+    im.End()
+  end
+
+  local showUpdate = updateToast and t < updateToast.untilT
+  if showUpdate then
+    if type(im.SetNextWindowBgAlpha) == 'function' then
+      pcall(im.SetNextWindowBgAlpha, 0.84)
+    end
+    local updY = (fixToast and t < fixToast.untilT) and 152 or 88
+    im.SetNextWindowPos(im.ImVec2(20, updY), im.Cond_Always)
+    if im.Begin('##bngeBridgeRailUpdateToast', nil, noticeFlags) then
+      local ut = updateToast
+      im.TextUnformatted(string.format('Bridge & Rail Fixes v%s available (installed: v%s)',
+        ut.latestVersion, ut.currentVersion or M.ADDON_VERSION))
+      if im.Button('Get Update') then
+        if isAllowedReleaseUrl(ut.releaseUrl) then
+          local openFn = rawget(_G, 'openWebBrowser')
+          if openFn ~= nil then pcall(openFn, ut.releaseUrl) end
+        end
+        updateToast = nil
+      end
+      if im.SameLine ~= nil then im.SameLine() end
+      if im.Button('Later') then
+        updateToast = nil
+      end
+      if im.SameLine ~= nil then im.SameLine() end
+      if im.Button(string.format('Skip v%s', ut.latestVersion)) then
+        writeDismissedUpdateVersion(ut.latestVersion)
+        updateToast = nil
+      end
+    end
+    im.End()
+  end
+
+  if not toast or t >= toastUntil then return end
+  local toastY = (updateToast and t < updateToast.untilT) and 216 or ((fixToast and t < fixToast.untilT) and 152 or 150)
+  im.SetNextWindowPos(im.ImVec2(20, toastY), im.Cond_Always)
   if im.Begin('##bngeBridgeRailToast', nil,
       im.WindowFlags_NoDecoration + im.WindowFlags_AlwaysAutoResize + im.WindowFlags_NoInputs) then
     im.TextUnformatted(toast)

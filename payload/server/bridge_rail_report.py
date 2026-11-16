@@ -17,10 +17,36 @@ import zlib
 log = logging.getLogger("earthd.bridge_rail_report")
 
 DEFAULT_ENDPOINT = "https://beamng-earth-bridge-rail-fixes.yourlocalpcgamer.workers.dev/report"
+FIXED_REPORTS_URL = (
+    "https://raw.githubusercontent.com/CodeWMLandfill/"
+    "BeamNG-Earth-Bridge-Rail-Fixes/reports/proofs/fixed_reports.json"
+)
+ALLOWED_ISSUE_URL_PREFIX = "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/"
+MAX_FIXED_REPORTS_BYTES = 65536
+LATEST_RELEASE_API_URL = (
+    "https://api.github.com/repos/CodeWMLandfill/"
+    "BeamNG-Earth-Bridge-Rail-Fixes/releases/latest"
+)
+ALLOWED_RELEASE_URL_PREFIX = (
+    "https://github.com/CodeWMLandfill/"
+    "BeamNG-Earth-Bridge-Rail-Fixes/releases/"
+)
+MAX_RELEASE_JSON_BYTES = 65536
 ADDON_ID = "beamng-earth-bridge-rail-fixes"
-ADDON_VERSION = "0.2.0"
+ADDON_VERSION = "0.3.0"
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
 ALLOWED_KINDS = ("bridge", "rail", "road", "other")
+BUNDLED_FIXED_REPORTS = {
+    str(num): {
+        "fixedIn": "0.2.0",
+        "issueUrl": f"{ALLOWED_ISSUE_URL_PREFIX}{num}",
+        "kind": "bridge",
+    }
+    for num in (2, 4, 5, 6, 10)
+}
+_VERSION_RE = re.compile(r"^v?([0-9]+\.[0-9]+\.[0-9]+(?:[-.][A-Za-z0-9]+)*)$")
+_FIXED_CHECK_LOCK = threading.Lock()
+_FIXED_CHECKED_KEYS = set()
 ALLOWED_KEYS = frozenset({
     "lat", "lon", "kind", "summary", "note", "earthVersion", "addonVersion",
     "headingDeg", "altM", "speedMs", "anchorId", "camera", "nearest", "screenshot",
@@ -401,6 +427,353 @@ def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait
     else:
         log.warning("bridge_rail_report: upload failed (%s)", result.get("error"))
     return result
+
+
+def _parse_positive_int(val):
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val if 1 <= val <= 999999 else None
+    if isinstance(val, str) and val.strip().isdigit():
+        num = int(val.strip())
+        return num if 1 <= num <= 999999 else None
+    return None
+
+
+def _normalize_fixed_entry(num, raw_entry):
+    entry = raw_entry if isinstance(raw_entry, dict) else {}
+    raw_ver = str(entry.get("fixedIn") or "0.2.0").strip()
+    m = _VERSION_RE.match(raw_ver)
+    fixed_in = m.group(1) if m else "0.2.0"
+    expected_url = f"{ALLOWED_ISSUE_URL_PREFIX}{num}"
+    raw_url = entry.get("issueUrl")
+    issue_url = raw_url if (isinstance(raw_url, str) and raw_url == expected_url) else expected_url
+    kind = str(entry.get("kind") or "bridge").lower()
+    if kind not in ALLOWED_KINDS:
+        kind = "bridge"
+    return {
+        "fixedIn": fixed_in,
+        "issueUrl": issue_url,
+        "kind": kind,
+    }
+
+
+def _normalize_fixed_reports_map(raw_doc):
+    merged = {k: dict(v) for k, v in BUNDLED_FIXED_REPORTS.items()}
+    if isinstance(raw_doc, dict):
+        inner = raw_doc.get("issues") if isinstance(raw_doc.get("issues"), dict) else raw_doc
+        if isinstance(raw_doc.get("reports"), list):
+            for item in raw_doc["reports"]:
+                if isinstance(item, dict):
+                    num = _parse_positive_int(item.get("issueNumber"))
+                    if num is not None:
+                        merged[str(num)] = _normalize_fixed_entry(num, item)
+        else:
+            for k, v in inner.items():
+                num = _parse_positive_int(k)
+                if num is not None and isinstance(v, dict):
+                    merged[str(num)] = _normalize_fixed_entry(num, v)
+    elif isinstance(raw_doc, list):
+        for item in raw_doc:
+            if isinstance(item, dict):
+                num = _parse_positive_int(item.get("issueNumber"))
+                if num is not None:
+                    merged[str(num)] = _normalize_fixed_entry(num, item)
+    return merged
+
+
+def fetch_fixed_reports(fixed_url=FIXED_REPORTS_URL, timeout_s=4.0):
+    """Fetch the static fixed_reports.json manifest once, falling back cleanly when offline."""
+    if not fixed_url:
+        return _normalize_fixed_reports_map(None)
+    try:
+        req = urllib.request.Request(
+            fixed_url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"BeamNG-Earth-Bridge-Rail-Fixes/{ADDON_VERSION}",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read(MAX_FIXED_REPORTS_BYTES + 1)
+        if len(raw) > MAX_FIXED_REPORTS_BYTES:
+            raise ValueError("fixed_reports manifest exceeds size cap")
+        doc = json.loads(raw.decode("utf-8"))
+        return _normalize_fixed_reports_map(doc)
+    except Exception as err:
+        log.debug("bridge_rail_report: using bundled fixed_reports fallback (%s)", err)
+        return _normalize_fixed_reports_map(None)
+
+
+def check_fixed_reports(user_dir, fixed_url=FIXED_REPORTS_URL, timeout_s=4.0, options=None):
+    """Match local uploaded reports against fixed_reports.json and stage pending_fix_notifications.json."""
+    if not user_dir:
+        return []
+    opts = options if options is not None else _read_addon_options()
+    reports_root = Path(user_dir).resolve() / "beamngEarth" / "bridge_rail_reports"
+    pending_path = reports_root / "pending_fix_notifications.json"
+
+    def _clear_pending():
+        try:
+            if pending_path.exists():
+                pending_path.unlink()
+        except OSError:
+            pass
+
+    if opts.get("notifyFixedReports") is False:
+        _clear_pending()
+        return []
+    if not reports_root.is_dir():
+        return []
+
+    candidates = []
+    try:
+        entries = sorted(reports_root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+
+    for sub in entries:
+        if not sub.is_dir() or ".." in sub.name or "/" in sub.name or "\\" in sub.name:
+            continue
+        if (sub / "notified_fixed.json").is_file():
+            continue
+        up_path = sub / "uploaded.json"
+        if not up_path.is_file():
+            continue
+        try:
+            up_doc = json.loads(up_path.read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(up_doc, dict) or up_doc.get("ok") is not True:
+            continue
+        num = _parse_positive_int(up_doc.get("issueNumber"))
+        if num is not None:
+            candidates.append((num, sub))
+
+    if not candidates:
+        _clear_pending()
+        return []
+
+    fixed_map = fetch_fixed_reports(fixed_url=fixed_url, timeout_s=timeout_s)
+    grouped = {}
+    for num, sub in sorted(candidates, key=lambda pair: (pair[0], pair[1].name)):
+        fixed_entry = fixed_map.get(str(num))
+        if not fixed_entry:
+            continue
+        rel_dir = f"beamngEarth/bridge_rail_reports/{sub.name}/"
+        bucket = grouped.get(num)
+        if bucket is None:
+            lat_val = None
+            lon_val = None
+            kind_val = fixed_entry["kind"]
+            rep_path = sub / "report.json"
+            if rep_path.is_file():
+                try:
+                    rep_doc = json.loads(rep_path.read_text(encoding="utf-8-sig"))
+                    if isinstance(rep_doc, dict):
+                        rlat = rep_doc.get("lat")
+                        rlon = rep_doc.get("lon")
+                        if (
+                            isinstance(rlat, (int, float))
+                            and not isinstance(rlat, bool)
+                            and isinstance(rlon, (int, float))
+                            and not isinstance(rlon, bool)
+                            and math.isfinite(float(rlat))
+                            and math.isfinite(float(rlon))
+                            and -90.0 <= float(rlat) <= 90.0
+                            and -180.0 <= float(rlon) <= 180.0
+                        ):
+                            lat_val = round(float(rlat), 6)
+                            lon_val = round(float(rlon), 6)
+                        rkind = str(rep_doc.get("kind") or "").lower()
+                        if rkind in ALLOWED_KINDS:
+                            kind_val = rkind
+                except (OSError, ValueError):
+                    pass
+            grouped[num] = {
+                "dir": rel_dir,
+                "dirs": [rel_dir],
+                "issueNumber": num,
+                "fixedIn": fixed_entry["fixedIn"],
+                "issueUrl": fixed_entry["issueUrl"],
+                "lat": lat_val,
+                "lon": lon_val,
+                "kind": kind_val,
+            }
+        else:
+            if rel_dir not in bucket["dirs"]:
+                bucket["dirs"].append(rel_dir)
+
+    items = [grouped[k] for k in sorted(grouped)]
+    if not items:
+        _clear_pending()
+        return []
+
+    try:
+        _atomic_write_json(pending_path, {"version": 1, "items": items})
+    except OSError as err:
+        log.debug("bridge_rail_report: failed writing pending_fix_notifications.json (%s)", err)
+    return items
+
+
+def _parse_version_tuple(ver_str):
+    if not isinstance(ver_str, str):
+        return None
+    m = _VERSION_RE.match(ver_str.strip())
+    if not m:
+        return None
+    norm = m.group(1)
+    core_part, _, pre_part = norm.partition("-")
+    parts = tuple(int(p) for p in core_part.split("."))
+    return parts, bool(pre_part), norm
+
+
+def _sanitize_release_url(url):
+    if not isinstance(url, str):
+        return None
+    cleaned = url.strip()
+    if not cleaned.startswith(ALLOWED_RELEASE_URL_PREFIX):
+        return None
+    tail = cleaned[len(ALLOWED_RELEASE_URL_PREFIX):]
+    if not tail or any(ch.isspace() or ord(ch) < 0x20 for ch in cleaned):
+        return None
+    return cleaned
+
+
+def check_addon_update(
+    user_dir,
+    release_url=LATEST_RELEASE_API_URL,
+    timeout_s=4.0,
+    options=None,
+    current_version=ADDON_VERSION,
+):
+    """Fetch latest GitHub release metadata once at launch and stage pending_update_notification.json when newer."""
+    if not user_dir:
+        return None
+    opts = options if options is not None else _read_addon_options()
+    reports_root = Path(user_dir).resolve() / "beamngEarth" / "bridge_rail_reports"
+    pending_path = reports_root / "pending_update_notification.json"
+    dismissed_path = reports_root / "dismissed_update.json"
+
+    def _clear_pending():
+        try:
+            if pending_path.exists():
+                pending_path.unlink()
+        except OSError:
+            pass
+
+    if opts.get("notifyAddonUpdates") is False or os.environ.get("BNE_TELEMETRY", "").strip().lower() == "off":
+        _clear_pending()
+        return None
+    if not release_url:
+        _clear_pending()
+        return None
+
+    cur = _parse_version_tuple(current_version)
+    if cur is None:
+        _clear_pending()
+        return None
+
+    try:
+        req = urllib.request.Request(
+            release_url,
+            headers={
+                "Accept": "application/vnd.github+json",
+                "User-Agent": f"BeamNG-Earth-Bridge-Rail-Fixes/{ADDON_VERSION}",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            raw = resp.read(MAX_RELEASE_JSON_BYTES + 1)
+        if len(raw) > MAX_RELEASE_JSON_BYTES:
+            raise ValueError("release payload exceeds size cap")
+        doc = json.loads(raw.decode("utf-8"))
+    except Exception as err:
+        log.debug("bridge_rail_report: addon update check skipped (%s)", err)
+        _clear_pending()
+        return None
+
+    if not isinstance(doc, dict) or doc.get("draft") is True or doc.get("prerelease") is True:
+        _clear_pending()
+        return None
+
+    tag_name = str(doc.get("tag_name") or "").strip()
+    rel = _parse_version_tuple(tag_name)
+    if rel is None or rel[1]:
+        _clear_pending()
+        return None
+    if rel[0] < cur[0] or (rel[0] == cur[0] and not cur[1]):
+        _clear_pending()
+        return None
+
+    safe_url = _sanitize_release_url(doc.get("html_url"))
+    if not safe_url:
+        _clear_pending()
+        return None
+
+    if dismissed_path.is_file():
+        try:
+            dis_doc = json.loads(dismissed_path.read_text(encoding="utf-8-sig"))
+            if isinstance(dis_doc, dict):
+                skipped_ver = str(dis_doc.get("skippedVersion") or "").strip().lstrip("v")
+                if skipped_ver == rel[2]:
+                    _clear_pending()
+                    return None
+        except (OSError, ValueError):
+            pass
+
+    item = {
+        "version": 1,
+        "latestVersion": rel[2],
+        "currentVersion": cur[2],
+        "tagName": tag_name,
+        "releaseUrl": safe_url,
+    }
+    try:
+        _atomic_write_json(pending_path, item)
+    except OSError as err:
+        log.debug("bridge_rail_report: failed writing pending_update_notification.json (%s)", err)
+        return None
+    return item
+
+
+def check_fixed_reports_async(
+    server,
+    user_path=None,
+    fixed_url=FIXED_REPORTS_URL,
+    release_url=LATEST_RELEASE_API_URL,
+):
+    """Run check_fixed_reports and check_addon_update at most once per (server, user_dir) on one daemon thread."""
+    target_dir = None
+    if isinstance(user_path, str) and user_path.strip() and os.path.isdir(user_path.strip()):
+        target_dir = os.path.normpath(user_path.strip())
+    else:
+        srv_dir = getattr(server, "user_dir", None)
+        if srv_dir:
+            target_dir = str(srv_dir)
+    if not target_dir:
+        return None
+
+    dedup_key = (id(server), os.path.normcase(os.path.abspath(target_dir)))
+    with _FIXED_CHECK_LOCK:
+        if dedup_key in _FIXED_CHECKED_KEYS:
+            return None
+        _FIXED_CHECKED_KEYS.add(dedup_key)
+
+    def _worker():
+        try:
+            check_fixed_reports(target_dir, fixed_url=fixed_url)
+        except Exception as err:
+            log.debug("bridge_rail_report: fixed check skipped (%s)", err)
+        try:
+            check_addon_update(target_dir, release_url=release_url)
+        except Exception as err:
+            log.debug("bridge_rail_report: update check skipped (%s)", err)
+
+    t = threading.Thread(target=_worker, name="bridge-rail-fix-check", daemon=True)
+    t.start()
+    return t
 
 
 def submit(server, msg, endpoint=DEFAULT_ENDPOINT):

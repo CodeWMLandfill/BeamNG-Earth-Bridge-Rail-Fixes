@@ -6,18 +6,18 @@ Fixes broken bridges, ramps, piers, divided highways, railway crossings, and lan
 
 ## Global Feature & Archetype Completion Metrics
 
-Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-15T04:02:10Z`):
+Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-16T00:57:16Z`):
 
 - **Global Shard Coverage:** `128 / 128` shards (`100.0%`) - **8,949,779** structures categorized worldwide
-- **Archetype Elimination Progress:** `0 / 234` structural archetypes cleared (`0` structures eliminated by archetype, `240,613` directly verified clean)
-- **Overall Feature Completion:** `240,613 / 8,949,779` (`2.69%`)
+- **Archetype Elimination Progress:** `11 / 234` structural archetypes cleared (`116,243` structures eliminated by archetype, `1,153,504` directly verified clean)
+- **Overall Feature Completion:** `1,269,747 / 8,949,779` (`14.19%`)
 
 | Category | Categorized | Verified Clean | Archetypes Cleared | Completion % |
 | --- | ---: | ---: | ---: | ---: |
-| Bridges | 5,838,327 | 126,578 | 0 / 91 | 2.17% |
-| Railways | 1,934,028 | 58,295 | 0 / 51 | 3.01% |
-| Tunnels | 1,177,424 | 55,740 | 0 / 92 | 4.73% |
-| **Combined Total** | **8,949,779** | **240,613** | **0 / 234** | **2.69%** |
+| Bridges | 5,838,327 | 478,786 | 1 / 91 | 10.19% |
+| Railways | 1,934,028 | 388,635 | 7 / 51 | 20.09% |
+| Tunnels | 1,177,424 | 286,083 | 3 / 92 | 24.30% |
+| **Combined Total** | **8,949,779** | **1,153,504** | **11 / 234** | **14.19%** |
 
 ## Before & After
 
@@ -58,7 +58,7 @@ Keeps elevated bridge decks and lane markings continuous across cross-streets an
 
 ## Report a Bad Spot (`Ctrl+Shift+B`)
 
-Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screenshot and map location without pausing the game. You can change the default category (`bridge`, `rail`, `road`, `other`) or turn the hotkey off in **Add-ons -> Options**.
+Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screenshot and map location without pausing the game. When a spot you reported is fixed in a later update, a quiet one-time corner notice lets you open the report or teleport straight there. You can change the default category (`bridge`, `rail`, `road`, `other`), turn fix notices off, or disable the hotkey in **Add-ons -> Options**.
 
 ## Privacy
 
@@ -69,4 +69,4 @@ Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screensh
 ## Requirements
 
 - **Windows 10 or 11** (64-bit).
-- **BeamNG.Earth v1.9.1-beta.dev.424** or newer (older versions are skipped safely with a clear notice).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.0-beta.dev.456** or newer (older versions are skipped safely with a clear notice).

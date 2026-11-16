@@ -1043,6 +1043,18 @@ class RoadClearance:
         ed = edge[keep]
         return bool((((u @ u.T) <= min_cos) & ((ed[:, None] + ed[None, :]) < float(max_gap))).any())
 
+    def post_clear(self, row, gap=ROAD_PROP_GAP_M):
+        """True if row clears carriageways, overhead decks (with headroom), and narrow gore wedges."""
+        if self.in_gore(row[1], row[2], row[3]) or not self.clear(row):
+            return False
+        if row[0] in COLLISION_BOXES and gap == ROAD_PROP_GAP_M:
+            return True
+        import roads
+        headroom = roads.MIN_BRIDGE_HEADROOM_M + roads.BRIDGE_HEADROOM_MARGIN_M
+        mast = np.array([[-0.15, -0.15, 0.0, 0.15, 0.15, float(row[6])]], np.float64)
+        return bool(self._fast.clear(float(row[1]), float(row[2]), float(row[3]),
+                                     math.radians(float(row[4])), mast, float(gap), float(headroom)))
+
 
 def lamp_lenses(rows):
     """A lens row [G_LENS, x, y, z, yaw, 1, 1, 0] under each head of every lamp row (LAMP_HEADS, MAPPED_LAMP_HEADS: a
@@ -1105,9 +1117,8 @@ DECK_THROUGH_PAD_M = 1.0   # m below a deck's structure that still counts as cut
 DECK_THROUGH_ABOVE_M = 6.0 # m above a deck surface that still counts as cutting it
 
 
-def _normalize_decks(decks):
-    """[(points (k, 3), half width, structural depth m)]. A dict is blockworker's {"n", "w": full width}.
-    A tuple is (points, half width) or (points, half width, depth). Depth falls back to roads.deck_depth."""
+def _normalize_decks_ex(decks):
+    """[(points (k, 3), half width, structural depth m, explicit depth bool)]."""
     import roads
     out = []
     for d in decks or ():
@@ -1125,10 +1136,17 @@ def _normalize_decks(decks):
             continue
         if pts.shape[1] == 2:
             pts = np.column_stack([pts, np.zeros(len(pts))])
-        if depth is None:
+        explicit = depth is not None
+        if not explicit:
             depth = roads.deck_depth(roads.geom_span([pts]))
-        out.append((pts[:, :3], half, float(depth)))
+        out.append((pts[:, :3], half, float(depth), explicit))
     return out
+
+
+def _normalize_decks(decks):
+    """[(points (k, 3), half width, structural depth m)]. A dict is blockworker's {"n", "w": full width}.
+    A tuple is (points, half width) or (points, half width, depth). Depth falls back to roads.deck_depth."""
+    return [(pts, half, depth) for pts, half, depth, _ in _normalize_decks_ex(decks)]
 
 
 def _deck_levels(items):
@@ -1154,43 +1172,117 @@ def _wire_array(w):
     return np.asarray(w[0] if isinstance(w, tuple) else w, np.float64)
 
 
+def _wire_sample_xyz(arr, step=0.5):
+    """Return contiguous (xs, ys, zs) sampling vertices and segment interiors."""
+    pts = np.asarray(arr[:, :3], np.float64)
+    if len(pts) < 2:
+        return (np.ascontiguousarray(pts[:, 0]), np.ascontiguousarray(pts[:, 1]),
+                np.ascontiguousarray(pts[:, 2]))
+    chunks = [pts]
+    for a, b in zip(pts[:-1], pts[1:]):
+        dist = float(np.linalg.norm(b - a))
+        if dist <= 0.1:
+            continue
+        count = max(2, int(np.ceil(dist / step)))
+        ts = np.linspace(0.0, 1.0, count + 1)[1:-1]
+        if len(ts):
+            chunks.append(a[None, :] + ts[:, None] * (b - a)[None, :])
+    all_pts = np.vstack(chunks) if len(chunks) > 1 else pts
+    return (np.ascontiguousarray(all_pts[:, 0]), np.ascontiguousarray(all_pts[:, 1]),
+            np.ascontiguousarray(all_pts[:, 2]))
+
+
+_DECK_POLE_GROUPS = _POLE_GROUPS | {"pylon"}
+
+
+def _deck_probe_arrays(rows):
+    """Sample points (center plus rotated COLLISION_BOXES perimeters) for vectorized DeckLevels.blocked queries."""
+    xs, ys, z0s, z1s, owners, is_pole = [], [], [], [], [], []
+    for idx, q in enumerate(rows):
+        group = str(q[0])
+        pole = group in _DECK_POLE_GROUPS
+        ox, oy, oz = float(q[1]), float(q[2]), float(q[3])
+        h = float(q[6])
+        z0 = oz - 1.0 if pole else oz
+        xs.append(ox)
+        ys.append(oy)
+        z0s.append(z0)
+        z1s.append(oz + h)
+        owners.append(idx)
+        is_pole.append(pole)
+        shape = COLLISION_BOXES.get(q[0])
+        if shape is None:
+            continue
+        scale = max(0.3, min(2.5, h / shape[0]))
+        yaw = math.radians(float(q[4]))
+        c, s = math.cos(yaw), math.sin(yaw)
+        for bx0, by0, bz0, bx1, by1, bz1 in shape[1]:
+            lx0, ly0, lx1, ly1 = bx0 * scale, by0 * scale, bx1 * scale, by1 * scale
+            lxm, lym = 0.5 * (lx0 + lx1), 0.5 * (ly0 + ly1)
+            bz_lo = z0 if pole else max(oz, oz + bz0 * scale)
+            bz_hi = oz + bz1 * scale
+            for lx, ly in ((lx0, ly0), (lx0, ly1), (lx1, ly0), (lx1, ly1),
+                           (lxm, ly0), (lxm, ly1), (lx0, lym), (lx1, lym)):
+                xs.append(ox + c * lx - s * ly)
+                ys.append(oy + s * lx + c * ly)
+                z0s.append(bz_lo)
+                z1s.append(bz_hi)
+                owners.append(idx)
+                is_pole.append(pole)
+    return (np.asarray(xs, np.float64), np.asarray(ys, np.float64),
+            np.asarray(z0s, np.float64), np.asarray(z1s, np.float64),
+            np.asarray(owners, np.int64), np.asarray(is_pole, bool))
+
+
 def under_decks(rows, decks, wires=None):
     """rows without the props that would reach up into a bridge deck above them (a road's lamps and poles
     under a motorway bridge stood 9 m tall through its deck: a car hit one at 75 mph on I-80, 2026-10-15).
     decks: [(points (k, 3) of the deck's centreline, half width)] or [{"n", "w": full width}]. wires: removed
     in place where one passes under a deck closer than the headroom. A pole whose top does not reach the old
-    0.5 m headroom but whose wires would (or which stands into the slab) is removed too: otherwise the wires
-    went and the bare pole stayed under the deck."""
-    norm = _normalize_decks(decks)
+    0.5 m headroom but whose wires would (or which stands into or overhangs the slab/parapet) is removed too."""
+    norm = _normalize_decks_ex(decks)
     if not norm:
         return rows
-    levels = _deck_levels([(pts, half) for pts, half, _d in norm])
+    levels = _deck_levels([(pts, half) for pts, half, _d, _e in norm])
     if levels is None:
         return rows
     out = rows
     if rows:
-        r = np.asarray([[q[1], q[2], q[3], q[3] + q[6]] for q in rows], np.float64)
-        hit = np.asarray(levels.blocked(np.ascontiguousarray(r[:, 0]), np.ascontiguousarray(r[:, 1]),
-                                        np.ascontiguousarray(r[:, 2]), np.ascontiguousarray(r[:, 3]),
-                                        float(DECK_HEADROOM_M)), bool)
-        # A utility pole whose top misses the 0.5 m headroom still loses its wires, so remove the bare pole
-        # under the deck too. Only poles: a streetlight that clears a short deck's
-        # real soffit is not this case.
-        pole = np.fromiter((str(q[0]) in _POLE_GROUPS for q in rows), bool, len(rows))
-        if pole.any():
-            groups = {}
-            for pts, half, depth in norm:
-                groups.setdefault(round(depth, 3), []).append((pts, half))
-            for depth, items in groups.items():
-                sub = _deck_levels(items)
-                if sub is None:
-                    continue
-                # z_deck > z_base + 1 and z_deck - depth < z_top + DECK_WIRE_M
+        hit = np.zeros(len(rows), bool)
+        px, py, pz0, pz1, owners, pole = _deck_probe_arrays(rows)
+        nonpole = ~pole
+        groups = {}
+        for pts, half, depth, explicit in norm:
+            groups.setdefault((round(depth, 3), explicit), []).append((pts, half, depth, explicit))
+        for (_rdepth, explicit), items in groups.items():
+            sub = _deck_levels([(pts, half) for pts, half, _d, _e in items])
+            if sub is None:
+                continue
+            depth = items[0][2]
+            if nonpole.any():
+                # Explicit structural depth blocks lamps/masts hitting girders; 2-tuple fallback keeps DECK_HEADROOM_M.
+                headroom = (float(depth) + DECK_HEADROOM_M) if explicit else float(DECK_HEADROOM_M)
+                blocked = np.asarray(sub.blocked(np.ascontiguousarray(px[nonpole]), np.ascontiguousarray(py[nonpole]),
+                                                 np.ascontiguousarray(pz0[nonpole]), np.ascontiguousarray(pz1[nonpole]),
+                                                 headroom), bool)
+                np.logical_or.at(hit, owners[nonpole], blocked)
+            if pole.any():
+                # Utility poles and pylons never stand inside or on a deck slab/parapet; clear wires too.
                 headroom = float(depth) + DECK_WIRE_M
-                z0 = np.ascontiguousarray(r[:, 2] + 1.0)
-                extra = np.asarray(sub.blocked(np.ascontiguousarray(r[:, 0]), np.ascontiguousarray(r[:, 1]),
-                                               z0, np.ascontiguousarray(r[:, 3]), headroom), bool)
-                hit |= extra & pole
+                blocked = np.asarray(sub.blocked(np.ascontiguousarray(px[pole]), np.ascontiguousarray(py[pole]),
+                                                 np.ascontiguousarray(pz0[pole]), np.ascontiguousarray(pz1[pole]),
+                                                 headroom), bool)
+                np.logical_or.at(hit, owners[pole], blocked)
+        blocked_poles = [(float(rows[i][1]), float(rows[i][2]), float(rows[i][3]))
+                         for i in np.flatnonzero(hit) if rows[i][0] in _POLE_GROUPS]
+        if blocked_poles:
+            bp = np.asarray(blocked_poles, np.float64)
+            for i, r in enumerate(rows):
+                if r[0] == G_POLELAMP and not hit[i]:
+                    dz = float(r[3]) - POLE_LAMP_Z - bp[:, 2]
+                    d2 = (bp[:, 0] - float(r[1])) ** 2 + (bp[:, 1] - float(r[2])) ** 2
+                    if ((d2 <= 0.15 ** 2) & (np.abs(dz) <= 1.5)).any():
+                        hit[i] = True
         out = [q for q, h in zip(rows, hit) if not h]
     if wires is not None:
         keep = []
@@ -1200,8 +1292,8 @@ def under_decks(rows, decks, wires=None):
             if arr.ndim != 2 or arr.shape[1] < 3 or not len(arr):
                 keep.append(entry)
                 continue
-            if not levels.wire_hit(np.ascontiguousarray(arr[:, 0]), np.ascontiguousarray(arr[:, 1]),
-                                   np.ascontiguousarray(arr[:, 2]), float(DECK_WIRE_M), float(DECK_HEADROOM_M)):
+            xs, ys, zs = _wire_sample_xyz(arr)
+            if not levels.wire_hit(xs, ys, zs, float(DECK_WIRE_M), float(DECK_HEADROOM_M)):
                 keep.append(entry)
         wires[:] = keep
     return out
@@ -1217,23 +1309,22 @@ def _drop_wires_through(wires, decks):
         groups.setdefault(round(depth, 3), []).append((pts, half, depth))
     if not groups:
         return
+    level_groups = []
+    for items in groups.values():
+        levels = _deck_levels([(pts, half) for pts, half, _d in items])
+        if levels is not None:
+            level_groups.append((levels, float(items[0][2]) + DECK_THROUGH_PAD_M))
+    if not level_groups:
+        return
     keep = []
     for w in wires:
         arr = _wire_array(w)
         if arr.ndim != 2 or arr.shape[1] < 3 or not len(arr):
             keep.append(w)
             continue
-        hit = False
-        for depth, items in groups.items():
-            levels = _deck_levels([(pts, half) for pts, half, _d in items])
-            if levels is None:
-                continue
-            below = float(items[0][2]) + DECK_THROUGH_PAD_M
-            if levels.wire_hit(np.ascontiguousarray(arr[:, 0]), np.ascontiguousarray(arr[:, 1]),
-                               np.ascontiguousarray(arr[:, 2]), below, float(DECK_THROUGH_ABOVE_M)):
-                hit = True
-                break
-        if not hit:
+        xs, ys, zs = _wire_sample_xyz(arr)
+        if not any(levels.wire_hit(xs, ys, zs, below, float(DECK_THROUGH_ABOVE_M))
+                   for levels, below in level_groups):
             keep.append(w)
     wires[:] = keep
 
@@ -1275,6 +1366,47 @@ def off_buildings(rows, rings, groups=(G_STREET_TREE,), clear=STREET_TREE_WALL_M
         return rows
     drop = {pick[j] for j in np.flatnonzero(bad)}
     return [r for i, r in enumerate(rows) if i not in drop]
+
+
+def _walk_entries(walks):
+    """Precompute segment geometry and bounding boxes for mapped sidewalk runs."""
+    out = []
+    for wk in walks or ():
+        src = wk["disc"]["ring"] if "disc" in wk else wk["corner"]["arc"] if "corner" in wk else wk.get("pts", ())
+        pts = np.asarray(src, np.float64)
+        if len(pts) < 2:
+            continue
+        seg = pts[1:, :2] - pts[:-1, :2]
+        out.append((wk.get("fid"), float(wk.get("w", 2.5)) / 2.0, pts, pts[:-1, :2], seg,
+                    np.maximum((seg * seg).sum(1), 1e-12), pts[:, :2].min(0), pts[:, :2].max(0)))
+    return out
+
+
+def _on_walk(x, y, z, walk_entries, clear_m=0.45, skip_fid=None, z_band=2.5):
+    """True if (x, y, z) lands on or within clear_m of a coplanar mapped sidewalk."""
+    if not walk_entries:
+        return False
+    px, py, pz = float(x), float(y), float(z)
+    q = np.array([px, py], np.float64)
+    has_z = math.isfinite(pz)
+    for fid, half, pts, a, seg, l2, lo, hi in walk_entries:
+        if skip_fid is not None and fid == skip_fid:
+            continue
+        r = half + float(clear_m)
+        if px < lo[0] - r or px > hi[0] + r or py < lo[1] - r or py > hi[1] + r:
+            continue
+        t = np.clip(((q - a) * seg).sum(1) / l2, 0.0, 1.0)
+        p = a + t[:, None] * seg
+        d2 = ((q - p) ** 2).sum(1)
+        k = int(d2.argmin())
+        if d2[k] >= r * r:
+            continue
+        if not has_z or pts.shape[1] < 3 or not (math.isfinite(pts[k, 2]) and math.isfinite(pts[k + 1, 2])):
+            return True
+        wz = float(pts[k, 2] + t[k] * (pts[k + 1, 2] - pts[k, 2]))
+        if abs(pz - wz) <= z_band:
+            return True
+    return False
 
 
 def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=False, decks=(),
@@ -1331,6 +1463,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
 
     def on_bed(q):              # is q on (or by) an obstacle's ground?
         return bed is not None and not bed.clear(np.array([q[0], q[1]]), None, CLEAR_OTHER_M)
+    walk_entries = _walk_entries(walks)
     rows = []
     lit = set()
     for wk in walks:
@@ -1389,7 +1522,10 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                 ph = _h01(fid, "tphase") * TOWN_POLE_SPACING
                 for p, out, _ in _stations(run, line, TOWN_POLE_SPACING, ph, END_CLEAR_M, side):
                     q = p[:2] - out * (w / 2 - 0.6)
-                    if on_bed(q):
+                    if on_bed(q) or _on_walk(q[0], q[1], float(p[2]), walk_entries, clear_m=0.15, skip_fid=fid):
+                        if wires is not None and len(run_poles) > 1:
+                            wires.extend(_own_spans(run_poles, box))
+                        run_poles = []
                         continue
                     yaw = _yaw(out[0], out[1])
                     pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
@@ -1484,7 +1620,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             n = np.array([-d[1], d[0]]) * side
             q = p[:2] + n * (spec.width / 2 + (POLE_OFF_M if poles else LAMP_EDGE_M))
             inside = _owns(box, q[0], q[1])
-            if on_bed(q):
+            if on_bed(q) or (poles and _on_walk(q[0], q[1], float(p[2]), walk_entries, clear_m=0.45)):
                 if len(run) > 1 and wires is not None:
                     wires.extend(_own_spans(run, box))
                 run = []
@@ -1517,26 +1653,36 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                                  round(float(p[2]) + POLE_LAMP_Z, 2), round(yaw, 1), 1.0, 1.1, 0.0])
         if len(run) > 1 and wires is not None:
             wires.extend(_own_spans(run, box))
+    _post_clear = clearance.post_clear
+
     # Poles were checked before joining their wire runs; signs before selecting their relocated spot.
-    rows = [r for r in rows if r[0] in (G_POLE, G_SIGNAL, G_STOP, G_YIELD) or clearance.clear(r)]
+    rows = [r for r in rows if r[0] in (G_POLE, G_SIGNAL, G_STOP, G_YIELD)
+            or (clearance.clear(r) and (r[0] not in LAMP_HEADS or not clearance.in_gore(r[1], r[2], r[3])))]
     if poleprofiles.kit_enabled(pole_profile):
         import regionalmarkers
         country_at=poleprofiles.country_selector(pole_profile,pole_frame)
-        rows.extend(regionalmarkers.place(roads, box, country_at, lighting=lighting))
+        rows.extend(r for r in regionalmarkers.place(roads, box, country_at, lighting=lighting) if _post_clear(r))
         import regionalstops
         rows=regionalstops.localize(rows,pole_profile,pole_frame,country_at)
         import regionaltraffic
         rows=regionaltraffic.localize(rows,country_at)
-        rows.extend(regionaltraffic.place(roads,box,country_at))
+        rows.extend(r for r in regionaltraffic.place(roads,box,country_at) if _post_clear(r))
         import euguardrails
         if euguardrails.enabled() and not defer_gore:
             import frgore
             rows.extend(frgore.place(pole_frame,roads,box,country_at,
                                     ground=sign_obstacles.ground if sign_obstacles is not None else None,decks=decks))
     # (the tile's own, at their mapped points: not moved off the clearance like a guessed one)
-    rows += [list(r) for r in mapped_lamps if _owns(box, r[1], r[2])]
+    # Mapped OSM street lamps and localized European lamps (wider arms/higher colmesh than G_LAMP) must also
+    # clear carriageways, gores, and deck undersides before lenses are attached.
+    mapped_rows = [list(r) for r in mapped_lamps if _owns(box, r[1], r[2])]
     rows = citylamps.localize(rows, poleprofiles.lamp_country_selector(pole_profile, pole_frame))
-    return under_decks(rows + lamp_lenses(rows), list(decks), wires)
+    mapped_rows = citylamps.localize(mapped_rows, poleprofiles.lamp_country_selector(pole_profile, pole_frame))
+    localized = set(citylamps.GROUPS)
+    rows = [r for r in rows if r[0] not in localized or _post_clear(r)]
+    rows.extend(r for r in mapped_rows if _post_clear(r))
+    rows = under_decks(rows, list(decks), wires)
+    return rows + under_decks(lamp_lenses(rows), list(decks))
 
 
 def _own_spans(run, box):

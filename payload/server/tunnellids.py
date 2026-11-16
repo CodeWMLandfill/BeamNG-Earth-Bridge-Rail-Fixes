@@ -341,12 +341,21 @@ class Lids:
                 if rs[i] is None or (cls is not None and str(cls[i]) in NOT_MOTOR):
                     continue
                 fid = str(nf.ids[i])
-                if fid in seen:
-                    continue
-                seen.add(fid)
                 for r in roadsmod.ground_parts(nf, i):
-                    if len(r) >= 2:
-                        roads.append((xy(r), rs[i].width / 2))
+                    if len(r) < 2:
+                        continue
+                    sig = (
+                        fid,
+                        round(float(r[0][0]), 6),
+                        round(float(r[0][1]), 6),
+                        round(float(r[-1][0]), 6),
+                        round(float(r[-1][1]), 6),
+                        len(r),
+                    )
+                    if sig in seen:
+                        continue
+                    seen.add(sig)
+                    roads.append((xy(r), rs[i].width / 2))
 
         def z_at(p):
             p = np.asarray(p, np.float64)

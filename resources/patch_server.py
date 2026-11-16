@@ -21,8 +21,8 @@ import tempfile
 import uuid
 import zlib
 
-VERSION = "0.2.0"
-MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_2_0"
+VERSION = "0.3.0"
+MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_3_0"
 TAG = "earthBridgeRailFixes"
 COOKIE = struct.Struct("!8sIIII64s")
 ENTRY = struct.Struct("!IIIIBc")
@@ -34,7 +34,9 @@ SERVER_MODULES = (
     "blockworker",
     "bridgetypes",
     "carriageways",
+    "delineators",
     "earthd",
+    "fences",
     "footbridges",
     "furniture",
     "grading",
@@ -49,7 +51,21 @@ SERVER_MODULES = (
     "roadmesh",
     "roads",
     "tunnellids",
+    "vegetation",
 )
+
+# Optional server modules wired automatically when staged in payload/server/.
+OPTIONAL_SERVER_MODULES = ()
+
+
+def effective_server_modules(payload_dir=None):
+    mods = list(SERVER_MODULES)
+    if payload_dir is not None:
+        srv = Path(payload_dir) / "server"
+        for opt in OPTIONAL_SERVER_MODULES:
+            if opt not in mods and (srv / f"{opt}.py").is_file():
+                mods.append(opt)
+    return tuple(mods)
 
 # Upstream helper modules introduced in the 1.9.1-beta.dev.* cycle (verified
 # against v1.9.1-beta.dev.424). Older builds such as v1.9.1-beta (2026-11-10)
@@ -418,11 +434,11 @@ def _incompatible_message(missing, earth_version="", is_source=False):
     )
 
 
-def validate_pyz_compatibility(toc, earth_version=""):
+def validate_pyz_compatibility(toc, earth_version="", extra_modules=()):
     missing = [m for m in REQUIRED_UPSTREAM_MODULES if m not in toc]
     if missing:
         raise PatchError(_incompatible_message(missing, earth_version=earth_version, is_source=False))
-    for mod in SERVER_MODULES:
+    for mod in list(SERVER_MODULES) + [m for m in extra_modules if m not in SERVER_MODULES]:
         if mod not in toc:
             raise PatchError(f"Executable does not contain expected server module '{mod}'")
 
@@ -444,16 +460,49 @@ def validate_source_compatibility(root):
         patch_roads_lua_bytes(roads_raw)
 
 
+_CACHE_REV_MODULES = ("earthd", "blockworker", "plancache", "roads")
+
+
+def _server_cache_rev(payload_dir):
+    """Deterministic add-on cache revision across patched solver/server modules."""
+    if payload_dir is None:
+        return VERSION
+    payload_root = Path(payload_dir)
+    h = hashlib.sha256()
+    for mod in effective_server_modules(payload_dir):
+        src_path = payload_root / "server" / f"{mod}.py"
+        if src_path.is_file():
+            h.update(mod.encode("utf-8") + b"\0")
+            h.update(src_path.read_bytes() + b"\0")
+    return f"{VERSION}-{h.hexdigest()[:12]}"
+
+
+def _stamp_addon_rev(src_text, cache_rev):
+    out = []
+    stamped = False
+    for line in src_text.splitlines(keepends=True):
+        if not stamped and line.startswith("_BRF_ADDON_REV = "):
+            nl = "\r\n" if line.endswith("\r\n") else ("\n" if line.endswith("\n") else "")
+            out.append(f"_BRF_ADDON_REV = {cache_rev!r}{nl}")
+            stamped = True
+        else:
+            out.append(line)
+    return "".join(out)
+
+
 def _compile_server_payload(payload_dir, existing_filenames, apply_fixes, enable_reporter):
     """Return {module_name: compressed_marshal_bytes} to replace/add in PYZ."""
     payload_server = Path(payload_dir) / "server"
     compiled = {}
     if apply_fixes:
-        for mod in SERVER_MODULES:
+        cache_rev = _server_cache_rev(payload_dir)
+        for mod in effective_server_modules(payload_dir):
             src_path = payload_server / f"{mod}.py"
             if not src_path.is_file():
                 raise PatchError(f"Packaged add-on payload is missing {mod}.py")
             src = src_path.read_text(encoding="utf-8")
+            if mod in _CACHE_REV_MODULES:
+                src = _stamp_addon_rev(src, cache_rev)
             if mod == "earthd" and not enable_reporter:
                 # Reporter still harmlessly present in earthd if disabled in options,
                 # or skip injecting bugreport.lua on mod side; earthd always keeps handler clean.
@@ -491,10 +540,11 @@ def patch_pyz(data, payload_dir, apply_fixes=True, enable_reporter=True, earth_v
     if len(data) < 12 or data[:4] != b"PYZ\x00" or data[4:8] != importlib.util.MAGIC_NUMBER:
         raise PatchError("Embedded Python version does not match; run setup through BeamNG.Earth's --run-addon")
     offset, raw_toc, toc = _read_pyz_toc(data)
-    validate_pyz_compatibility(toc, earth_version=earth_version)
+    active_mods = effective_server_modules(payload_dir)
+    validate_pyz_compatibility(toc, earth_version=earth_version, extra_modules=active_mods)
 
     existing_filenames = {}
-    for mod in SERVER_MODULES:
+    for mod in active_mods:
         kind, pos, length = toc[mod]
         if kind != 0 or pos < 12 or pos + length > offset:
             raise PatchError(f"Unsupported PYZ entry layout for '{mod}'")
@@ -828,9 +878,13 @@ def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter):
     payload_root = Path(payload_dir)
     desired = {}
     if apply_fixes:
-        for mod in SERVER_MODULES:
+        cache_rev = _server_cache_rev(payload_dir)
+        for mod in effective_server_modules(payload_dir):
             rel = f"server/{mod}.py"
-            desired[rel] = (payload_root / rel).read_bytes()
+            raw_bytes = (payload_root / rel).read_bytes()
+            if mod in _CACHE_REV_MODULES:
+                raw_bytes = _stamp_addon_rev(raw_bytes.decode("utf-8"), cache_rev).encode("utf-8")
+            desired[rel] = raw_bytes
         fallback_roads = (payload_root / MOD_ROADS_LUA).read_bytes() if (payload_root / MOD_ROADS_LUA).is_file() else None
         desired[MOD_ROADS_LUA] = patch_roads_lua_bytes(_read_pristine(root, MOD_ROADS_LUA), fallback_bytes=fallback_roads)
     if enable_reporter:
@@ -846,7 +900,18 @@ def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter):
                 '            import bridge_rail_report\n'
                 '            bridge_rail_report.submit(self.s, msg)\n'
             )
-            desired["server/earthd.py"] = raw_earthd.replace(anchor, hook + anchor, 1).encode("utf-8")
+            patched_earthd = raw_earthd.replace(anchor, hook + anchor, 1)
+            hello_anchor = '            self.s.check_user_dir(self, msg.get("userPath"))\n'
+            if hello_anchor in patched_earthd:
+                hello_hook = (
+                    '            try:\n'
+                    '                import bridge_rail_report\n'
+                    '                bridge_rail_report.check_fixed_reports_async(self.s, user_path=msg.get("userPath"))\n'
+                    '            except Exception:\n'
+                    '                pass\n'
+                )
+                patched_earthd = patched_earthd.replace(hello_anchor, hello_anchor + hello_hook, 1)
+            desired["server/earthd.py"] = patched_earthd.encode("utf-8")
         desired[MOD_BUGREPORT_LUA] = (payload_root / MOD_BUGREPORT_LUA).read_bytes()
         desired[MOD_ACTIONS_JSON] = patch_actions_json_bytes(_read_pristine(root, MOD_ACTIONS_JSON))
         desired[MOD_KEYMAP_JSON] = patch_keymap_json_bytes(_read_pristine(root, MOD_KEYMAP_JSON))

@@ -478,12 +478,21 @@ def _junction_surfaces(chunks, context=()):
     return out
 
 
+def _clamp_pad_ring(ring, centre):
+    """Return a copy of pad ring (k, 3) with elevations bounded within JUNCTION_JOIN_Z_M of centre."""
+    out = np.asarray(ring, np.float64).copy()
+    if len(out):
+        cz = float(centre[2])
+        out[:, 2] = cz + np.clip(out[:, 2] - cz, -JUNCTION_JOIN_Z_M, JUNCTION_JOIN_Z_M)
+    return out
+
+
 class _PadSurface(_JunctionSurface):
     """A pad follows its adjoining deck surface; away from it the existing approach heights stay. The overlap
     includes a grid-cell margin so the pad's triangles cannot interpolate an old approach height through a deck."""
     def __init__(self, ring, centre, ribbons_, junctions):
-        self.ring = np.asarray(ring, np.float64)
         self.centre = np.asarray(centre, np.float64)
+        self.ring = _clamp_pad_ring(ring, self.centre)
         self.ribbons = []
         for (left, right, _v, _m, _layer, z), c in ribbons_:
             if c.get('fid') not in junctions:
@@ -551,9 +560,9 @@ class _PadSurface(_JunctionSurface):
             hit = gap < distance
             hh = (field.at(xy) if field is not None else z[j] + f * (z[j + 1] - z[j])) - PAD_DROP
             target[hit], distance[hit] = hh[hit], gap[hit]
-        weight = np.clip((2 * JUNCTION_CELL_M + 2.5 - distance) / 2.5, 0, 1)
-        weight = weight * weight * (3 - 2 * weight)
-        return weight * target + (1 - weight) * original
+        d_out = np.maximum(distance - 2 * JUNCTION_CELL_M, 0.0)
+        slope_cap = 0.14 * d_out
+        return target + np.clip(original - target, -slope_cap, slope_cap)
 
 
 def _pad_without_ground(p, t, uv, material, origin, ground, centre):
@@ -619,54 +628,25 @@ def _pad_without_ground(p, t, uv, material, origin, ground, centre):
     return p[used], inverse.reshape(-1, 3), uv[used], material
 
 
-def _ribbon_cutter_batch(L, R, chunk=None, origin=(0.0, 0.0, 0.0), expand=0.002, end_inset=0.001):
-    """Outward-expanded convex triangle pairs covering slab strip `(L, R)` for `_cut_coplanar_tops`."""
-    if len(L) < 2:
+def _mesh_cutter_batch(p, t, material, top_mi):
+    """Exact XY+Z triangle cutter batch built from already-emitted `top_mi` triangles (post-field and clip)."""
+    if not len(t) or not len(material):
         return None
-    lat = L[:, :2] - R[:, :2]
-    w = np.hypot(lat[:, 0], lat[:, 1])
-    if float(w.max()) <= 1e-3:
+    m = np.asarray(material) == top_mi
+    if not m.any():
         return None
-    u = lat / np.maximum(w, 1e-9)[:, None]
-    li = L[:, :2] + u * float(expand)
-    ri = R[:, :2] - u * float(expand)
-    zi = 0.5 * (L[:, 2] + R[:, 2])
-    if end_inset > 0.0:
-        for edge in (li, ri):
-            d0 = edge[1] - edge[0]
-            n0 = float(np.hypot(d0[0], d0[1]))
-            if n0 > 4.0 * end_inset:
-                edge[0] = edge[0] + d0 * (float(end_inset) / n0)
-            d1 = edge[-2] - edge[-1]
-            n1 = float(np.hypot(d1[0], d1[1]))
-            if n1 > 4.0 * end_inset:
-                edge[-1] = edge[-1] + d1 * (float(end_inset) / n1)
-    box = None
-    if chunk is not None and chunk.get("deck_seam") and chunk.get("deck_box") is not None:
-        ox, oy = float(origin[0]), float(origin[1])
-        x0, y0, x1, y1 = chunk["deck_box"]
-        box = (x0 - ox, y0 - oy, x1 - ox, y1 - oy)
-    tris, zs = [], []
-    for k in range(len(li) - 1):
-        q = np.array([li[k], ri[k], ri[k + 1], li[k + 1]], np.float64)
-        if box is not None:
-            if q[:, 0].max() < box[0] or q[:, 0].min() > box[2] or q[:, 1].max() < box[1] or q[:, 1].min() > box[3]:
-                continue
-        zc = 0.5 * float(zi[k] + zi[k + 1])
-        for a, b, c in ((0, 1, 2), (0, 2, 3)):
-            tri = q[[a, b, c]]
-            area2 = float((tri[1, 0] - tri[0, 0]) * (tri[2, 1] - tri[0, 1]) -
-                          (tri[1, 1] - tri[0, 1]) * (tri[2, 0] - tri[0, 0]))
-            if abs(area2) >= 1e-4:
-                tris.append(tri)
-                zs.append(zc)
-    if not tris:
+    tv = np.asarray(p, np.float64)[np.asarray(t)[m]]
+    xy = tv[:, :, :2].copy()
+    area2 = (xy[:, 1, 0] - xy[:, 0, 0]) * (xy[:, 2, 1] - xy[:, 0, 1]) - (
+        xy[:, 1, 1] - xy[:, 0, 1]) * (xy[:, 2, 0] - xy[:, 0, 0])
+    keep = np.abs(area2) >= 1e-4
+    if not keep.any():
         return None
-    xy = np.asarray(tris, np.float64)
+    xy = xy[keep]
     lo = xy.min(1)
     hi = xy.max(1)
-    zs_a = np.asarray(zs, np.float64)
-    return xy, lo, hi, zs_a, lo.min(0), hi.max(0), float(zs_a.min()), float(zs_a.max())
+    zs = tv[keep, :, 2].copy()
+    return xy, lo, hi, zs, lo.min(0), hi.max(0), float(zs.min()), float(zs.max())
 
 
 def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
@@ -688,10 +668,14 @@ def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
         for tri2, qlo, qhi, cz in zip(c_xy, c_lo, c_hi, c_z):
             if not len(t):
                 return p[:0], t.reshape(0, 3), uv[:0], material[:0]
+            cz_arr = np.asarray(cz, np.float64)
+            cz_lo = float(cz_arr.min()) if cz_arr.ndim else float(cz_arr)
+            cz_hi = float(cz_arr.max()) if cz_arr.ndim else float(cz_arr)
             tv = p[t]
-            tz = tv[:, :, 2].mean(1)
+            tz_lo = tv[:, :, 2].min(1)
+            tz_hi = tv[:, :, 2].max(1)
             hit = (material == top_mi) & (tv[:, :, :2].max(1) >= qlo).all(1) & (
-                tv[:, :, :2].min(1) <= qhi).all(1) & (np.abs(tz - cz) < z_tol)
+                tv[:, :, :2].min(1) <= qhi).all(1) & (tz_hi >= cz_lo - z_tol) & (tz_lo <= cz_hi + z_tol)
             if not hit.any():
                 continue
             edge = np.roll(tri2, -1, axis=0) - tri2
@@ -699,9 +683,15 @@ def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
             if abs(area2) < 1e-6:
                 continue
             sign = 1.0 if area2 > 0.0 else -1.0
+            den = (tri2[1, 1] - tri2[2, 1]) * (tri2[0, 0] - tri2[2, 0]) + (
+                tri2[2, 0] - tri2[1, 0]) * (tri2[0, 1] - tri2[2, 1])
+            hit_idx = np.flatnonzero(hit)
+            replace = np.zeros(len(t), bool)
             pieces, labels = [], []
-            for indices, mat in zip(t[hit], material[hit]):
+            for ti_pos in hit_idx:
+                indices, mat = t[ti_pos], material[ti_pos]
                 inside = np.c_[p[indices], uv[indices]]
+                tri_pieces = []
                 for a, d in zip(tri2, edge):
                     if len(inside) < 3:
                         break
@@ -709,8 +699,6 @@ def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
                     if (distance >= -1e-9).all():
                         continue
                     if (distance <= 1e-9).all():
-                        pieces.append(inside)
-                        labels.append(mat)
                         inside = np.zeros((0, 5))
                         break
                     inn, out = [], []
@@ -723,10 +711,26 @@ def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
                             inn.append(cut)
                             out.append(cut)
                     if len(out) >= 3:
-                        pieces.append(np.array(out))
-                        labels.append(mat)
+                        tri_pieces.append(np.array(out))
                     inside = np.array(inn)
-            tt, mm, pp, uu = [t[~hit]], [material[~hit]], [p], [uv]
+                if len(inside) < 3:
+                    continue
+                if cz_arr.ndim and len(cz_arr) == 3 and abs(den) > 1e-10:
+                    cx, cy = float(inside[:, 0].mean()), float(inside[:, 1].mean())
+                    w0 = ((tri2[1, 1] - tri2[2, 1]) * (cx - tri2[2, 0]) + (tri2[2, 0] - tri2[1, 0]) * (cy - tri2[2, 1])) / den
+                    w1 = ((tri2[2, 1] - tri2[0, 1]) * (cx - tri2[2, 0]) + (tri2[0, 0] - tri2[2, 0]) * (cy - tri2[2, 1])) / den
+                    cz_at = w0 * float(cz_arr[0]) + w1 * float(cz_arr[1]) + (1.0 - w0 - w1) * float(cz_arr[2])
+                else:
+                    cz_at = 0.5 * (cz_lo + cz_hi)
+                if abs(float(inside[:, 2].mean()) - cz_at) >= z_tol:
+                    continue
+                replace[ti_pos] = True
+                for poly in tri_pieces:
+                    pieces.append(poly)
+                    labels.append(mat)
+            if not replace.any():
+                continue
+            tt, mm, pp, uu = [t[~replace]], [material[~replace]], [p], [uv]
             at = len(p)
             for poly, mat in zip(pieces, labels):
                 pp.append(poly[:, :3])
@@ -740,6 +744,27 @@ def _cut_coplanar_tops(p, t, uv, material, top_mi, cutters, z_tol=0.055):
         return p[:0], t.reshape(0, 3), uv[:0], material[:0]
     used, inverse = np.unique(t, return_inverse=True)
     return p[used], inverse.reshape(-1, 3), uv[used], material
+
+
+def _append_cut_barrier(bp, bt_, buv, origin, side, P, T, UV, M, nv, cutters):
+    """Trim coplanar upward concrete parapet crowns against earlier barriers and append to mesh lists."""
+    bp_rel = bp - origin
+    tv = bp_rel[bt_]
+    cr = np.cross(tv[:, 1] - tv[:, 0], tv[:, 2] - tv[:, 0])
+    ln = np.linalg.norm(cr, axis=1)
+    up = (cr[:, 2] > 0.7 * np.maximum(ln, 1e-12)).astype(np.int64)
+    if cutters and up.any():
+        bp_rel, bt_, buv, up = _cut_coplanar_tops(bp_rel, bt_, buv, up, 1, cutters)
+    if not len(bt_):
+        return nv
+    cb = _mesh_cutter_batch(bp_rel, bt_, up, 1)
+    if cb is not None:
+        cutters.append(cb)
+    P.append(bp_rel)
+    UV.append(buv)
+    T.append(bt_ + nv)
+    M.append(np.full(len(bt_), side))
+    return nv + len(bp_rel)
 
 
 def _trim_joined(mid, z, hw, om, oz, ow):
@@ -812,7 +837,8 @@ def trim_overlaps(rb, context=(), shared=None):
             if _trim_joined(mid, z, hw, om, oz, ohw):
                 overlap = np.maximum(hw + wo - dc, 0.0) / 2.0
                 ramp = np.clip((dc - np.maximum(hw, wo)) / 1.5, 0.0, 1.0)
-                cut = np.where((dc >= np.maximum(hw, wo)) & (dz >= 1.2), np.minimum(cut, overlap * ramp), 0.0)
+                z_ramp = np.clip((dz - 0.6) / 0.6, 0.0, 1.0)
+                cut = np.where(dc >= np.maximum(hw, wo), np.minimum(cut, overlap * ramp * z_ramp), 0.0)
             on_left = ((qj - mid) * u).sum(1) > 0
             tl = np.where(hit & on_left, np.maximum(tl, cut), tl)
             tr = np.where(hit & ~on_left, np.maximum(tr, cut), tr)
@@ -1360,7 +1386,7 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
             if len(l_d) >= 2:
                 for e in (0, -1):
                     deck_abuts.append(((l_d[e] + r_d[e]) * 0.5, l_d[e].copy(), r_d[e].copy(), r[4],
-                                       float(np.hypot(*(l_d[e] - r_d[e])))))
+                                       float(np.hypot(*(l_d[e] - r_d[e]))), float(r[5][e])))
 
     ab_pts = np.array([a[0] for a in deck_abuts], np.float64) if deck_abuts else np.zeros((0, 2), np.float64)
     ab_layer = [a[3] for a in deck_abuts]
@@ -1373,6 +1399,7 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
         if not ok.any():
             return None
         return int(np.where(ok, d, np.inf).argmin())
+    abut_z = {}
     if len(deck_abuts):
         new_rbc = []
         for r, c in rbc:
@@ -1385,18 +1412,21 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
                 d1 = np.hypot(ab_pts[:, 0] - mid1[0], ab_pts[:, 1] - mid1[1])
                 hit0 = _abut(d0, layer, float(np.hypot(*(left[0] - right[0]))))
                 hit1 = _abut(d1, layer, float(np.hypot(*(left[-1] - right[-1]))))
+                z0_ab = z1_ab = None
                 if hit0 is not None:
-                    _, l_ab, r_ab = deck_abuts[hit0][:3]
+                    _, l_ab, r_ab, _, _, z0_ab = deck_abuts[hit0]
                     if (np.hypot(*(left[0] - l_ab)) + np.hypot(*(right[0] - r_ab))) <= (np.hypot(*(left[0] - r_ab)) + np.hypot(*(right[0] - l_ab))):
                         left[0], right[0] = l_ab, r_ab
                     else:
                         left[0], right[0] = r_ab, l_ab
                 if hit1 is not None:
-                    _, l_ab, r_ab = deck_abuts[hit1][:3]
+                    _, l_ab, r_ab, _, _, z1_ab = deck_abuts[hit1]
                     if (np.hypot(*(left[-1] - l_ab)) + np.hypot(*(right[-1] - r_ab))) <= (np.hypot(*(left[-1] - r_ab)) + np.hypot(*(right[-1] - l_ab))):
                         left[-1], right[-1] = l_ab, r_ab
                     else:
                         left[-1], right[-1] = r_ab, l_ab
+                if z0_ab is not None or z1_ab is not None:
+                    abut_z[len(new_rbc)] = (z0_ab, z1_ab)
                 new_rbc.append(((left, right, v, m, layer, fz), c))
             else:
                 new_rbc.append((r, c))
@@ -1445,6 +1475,18 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
                     cur_lift = np.minimum(cur_lift, DECK_SKIN + (lift - DECK_SKIN) * w1)
             lift_2k = np.concatenate((cur_lift, cur_lift))
             z = u[k0:k0 + 2 * k] + LIFT[layer] + lift_2k
+            if ri in abut_z and k >= 2:
+                mid = (left + right) * 0.5
+                s_from_start = np.r_[0.0, np.cumsum(np.hypot(*np.diff(mid, axis=0).T))]
+                z0_ab, z1_ab = abut_z[ri]
+                if z0_ab is not None and abs(z0_ab - float(0.5 * (u[k0] + u[k0 + k]))) <= 2.0:
+                    w0 = np.clip(1.0 - s_from_start / 6.0, 0.0, 1.0)
+                    z[:k] += w0 * (z0_ab - u[k0])
+                    z[k:] += w0 * (z0_ab - u[k0 + k])
+                if z1_ab is not None and abs(z1_ab - float(0.5 * (u[k0 + k - 1] + u[k0 + 2 * k - 1]))) <= 2.0:
+                    w1 = np.clip(1.0 - (s_from_start[-1] - s_from_start) / 6.0, 0.0, 1.0)
+                    z[:k] += w1 * (z1_ab - u[k0 + k - 1])
+                    z[k:] += w1 * (z1_ab - u[k0 + 2 * k - 1])
             k0 += 2 * k
         else:                                   # on a deck: over its opaque concrete top
             z = np.concatenate((fz, fz)) + LIFT[layer] + DECK_SKIN
@@ -1683,11 +1725,12 @@ MEDIAN_JOIN_M = 6.0     # m: two decks' edges closer than this (a divided road's
                         # median: no parapets there, each slab widened to meet the other halfway (two parapets and a
                         # dark gap stood in a divided road's median over a canal, Port St. Lucie, 2026-10-23)
 FOOTING_M = 2.0         # m a pier reaches into the ground
-PIER_T = 1.8            # m: a wall pier's thickness along the deck (at its top; FOOTING tapers wider)
+PIER_T = 1.8            # m: pier placement clearance thickness along the deck
+PIER_SHAFT_T = 1.3      # m: drawn pier wall thickness along the deck (slender inside PIER_T envelope)
 PIER_TAPER = 0.012      # its width grows this much per m down (each side)
-PIER_CAP_H = 1.2        # m of pier cap under the girders, as wide as the deck
-PIER_BENT_W = 16.0      # a deck wider than this stands on columns (a bent) rather than one wall
-PIER_COLUMN = 1.6       # m square columns of a bent
+PIER_CAP_H = 0.9        # m of pier cap under the girders, as wide as the deck
+PIER_BENT_W = 11.5      # a deck wider than this stands on columns (a bent) rather than one wall
+PIER_COLUMN = 1.25      # m square columns of a bent
 
 
 # The parapet (2026-10-27): a closed New Jersey barrier, not three open faces (its ends and underside were missing: the
@@ -1877,9 +1920,10 @@ def _match_opposite_parapets(specs, entries):
             dot_out = (out_q * oa[:, None, :]).sum(2)
             opp_ok = (dot_out < -0.5) & (g_lat <= 0.25)
             pad_ok = is_pad_pair & (dot_out > 0.5) & (np.abs(g_lat) <= 0.45)
+            join_ok = (d2 <= 0.35 ** 2) & (np.abs(pza[:, None] - zb) < 0.25)
             ok = ((d2 <= 0.85 ** 2)
                   & (np.abs(pza[:, None] - zb) < PARAPET_COVER_DZ)
-                  & (opp_ok | pad_ok))
+                  & (opp_ok | pad_ok | join_ok))
             if not ok.any():
                 continue
             d2_ok = np.where(ok, d2, np.inf)
@@ -1924,7 +1968,13 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
             h = parapet_heights(parapet["mid"], parapet["ends"])
             if BRIDGE_RAILS and n in low_parapet_decks:
                 nz_mask = np.asarray(parapet.get("nose_mask", parapet.get("nose", False)), bool)
-                cap_h = np.where(nz_mask, parapet_h, BRIDGE_CURB_H)
+                if nz_mask.ndim == 1 and len(nz_mask) == len(parapet["edge"]) and nz_mask.any() and (~nz_mask).any():
+                    pe = np.asarray(parapet["edge"], np.float64)
+                    s_arc = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pe, axis=0).T))]
+                    d_false = np.abs(s_arc[:, None] - s_arc[~nz_mask][None, :]).min(1)
+                    cap_h = BRIDGE_CURB_H + (parapet_h - BRIDGE_CURB_H) * np.clip(d_false / 2.5, 0.0, 1.0)
+                else:
+                    cap_h = np.where(nz_mask, parapet_h, BRIDGE_CURB_H)
             else:
                 cap_h = parapet_h
             h = np.minimum(h, cap_h)
@@ -1945,7 +1995,8 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
             edge = pts[:, :2] + out * (JERSEY_HALF_W + 0.02)
             ends = [tuple(edge[0]), tuple(edge[-1])]
             h = parapet_heights(edge, ends)
-            pz = field.at(edge) if field is not None else pts[:, 2] - PAD_DROP
+            pz = (field.at(edge) if field is not None
+                  else centre[2] - PAD_DROP + np.clip(pts[:, 2] - centre[2], -JUNCTION_JOIN_Z_M, JUNCTION_JOIN_Z_M))
             entry = {"deck": ("pad", pi), "edge": edge, "out": out}
             parapet_specs[id(entry)] = (pz, h)
             parapet_entries.append((entry, pz, h))
@@ -2037,6 +2088,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         P[i], T[i], UV[i], M[i] = lp, lt + start_nv, lu, lm
         nv = start_nv + len(lp)
         return i
+    barrier_cutters = []
     for n, ((left, right, v, m, layer, z), c) in enumerate(rb):
         seam_at = (len(P), len(T), len(UV), len(M), nv)
         active_field = junctions.get(c.get('fid'))
@@ -2076,7 +2128,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
                     del P[i0:], T[i0:], UV[i0:], M[i0:]
                     nv = nv0
             if i0 < len(P):
-                cb = _ribbon_cutter_batch(L, R, c, origin)
+                cb = _mesh_cutter_batch(P[i0], T[i0] - nv0, M[i0], top)
                 if cb is not None:
                     top_cutters.append((active_field, cb))
         # the slab a closed solid from its top's own outline (the user, 2026-11-07: watertight): sides straight down
@@ -2085,8 +2137,8 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         if shells.ON:
             kept = clip_top(i0, c)
             if kept is not None:
+                tp0_nv = sum(len(a) for a in P[:kept])
                 if other_cutters:
-                    tp0_nv = sum(len(a) for a in P[:kept])
                     tp, tt_top, tu, tm = _cut_coplanar_tops(P[kept], T[kept] - tp0_nv, UV[kept], M[kept], top, other_cutters)
                     if len(tt_top):
                         P[kept], T[kept], UV[kept], M[kept] = tp, tt_top + tp0_nv, tu, tm
@@ -2096,7 +2148,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
                         nv = tp0_nv
                         kept = None
                 if kept is not None:
-                    cb = _ribbon_cutter_batch(L, R, c, origin)
+                    cb = _mesh_cutter_batch(P[kept], T[kept] - tp0_nv, M[kept], top)
                     if cb is not None:
                         top_cutters.append((active_field, cb))
                     tops.setdefault(round(slab, 3), []).append(kept)
@@ -2128,11 +2180,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         for parapet in parapets_by_deck.get(n, ()):
             pz, h = parapet_specs[id(parapet)]
             bp, bt_, buv = barrier_solid(parapet["edge"], -parapet["out"], pz, h, parapet["v"])
-            P.append(bp - origin)
-            UV.append(buv)
-            T.append(bt_ + nv)
-            M.append(np.full(len(bt_), side))
-            nv += len(bp)
+            nv = _append_cut_barrier(bp, bt_, buv, origin, side, P, T, UV, M, nv, barrier_cutters)
         if shells.ON:
             clip_seam(*after_top, c)            # girders and parapets; the top stays one piece for _slabs_from_tops
         else:
@@ -2140,7 +2188,8 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     if tops:                # (the tops of a deck's pieces closed together: their shared end rows weld, no wall between)
         P, T, UV, M = _slabs_from_tops(P, T, UV, M, tops, side)
         nv = sum(len(a) for a in P)
-    portal_ctx = list(rb) + list(cr_all) + _ground_carriageways(list(chunks) + list(ground)) if piers else ()
+    gc_lines = _ground_carriageways(list(chunks) + list(ground)) if (piers or len(beams)) else ()
+    portal_ctx = list(rb) + list(cr_all) + gc_lines if piers else ()
     if piers:
         import roads as _roads
         piers = _roads.pier_portals(piers, portal_ctx)
@@ -2154,11 +2203,7 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         for entry, out in rails:
             pz, h = parapet_specs[id(entry)]
             bp, bt_, buv = barrier_solid(entry["edge"], -out, pz, h)
-            P.append(bp - origin)
-            UV.append(buv)
-            T.append(bt_ + nv)
-            M.append(np.full(len(bt_), side))
-            nv += len(bp)
+            nv = _append_cut_barrier(bp, bt_, buv, origin, side, P, T, UV, M, nv, barrier_cutters)
         pp = np.concatenate(P[start_p:])
         tt = np.concatenate(T[start_t:]) - start_nv
         uu = np.concatenate(UV[start_uv:])
@@ -2170,9 +2215,14 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
         if len(tt):
             P[start_p:], T[start_t:], UV[start_uv:], M[start_m:] = [pp], [tt + start_nv], [uu], [mm]
             nv = start_nv + len(pp)
+            cb = _mesh_cutter_batch(pp, tt, mm, top)
+            if cb is not None:
+                top_cutters.append((field, cb))
         else:
             del P[start_p:], T[start_t:], UV[start_uv:], M[start_m:]
             nv = start_nv
+    if len(beams):
+        beams = _clear_and_widen_beams(beams, rb, cr_all, gc_lines)
     if len(beams):
         for pt in sorted({b[4] if len(b) > 4 else "grey" for b in beams}):
             mats.append(steel(pt))
@@ -2191,6 +2241,122 @@ TRUSS_STEEL = "bne_truss_steel"     # painted steel (the stock metal_paint, grey
 def steel(paint):
     """... and in the other paints (bridgetypes.PAINTS): bne_steel_<paint>."""
     return TRUSS_STEEL if paint in (None, "grey") else f"bne_steel_{paint}"
+
+
+def _clear_and_widen_beams(beams, rb, cr_all, ground_lines):
+    """Widen deck-side ribs/hangers out past widened bridge slabs and drop any remaining beam blocking roadway headroom."""
+    beams = [list(b) for b in beams]
+    deck_infos = []
+    for (l, r, _v, _m, _layer, z), c in rb:
+        if c.get("tunnel"):
+            continue
+        mid = (l + r) / 2
+        if len(mid) < 2:
+            continue
+        hw = float(np.median(np.hypot(*(l - r).T))) / 2
+        deck_infos.append((mid, hw, np.asarray(z, np.float64)))
+    widen = {}
+    if deck_infos:
+        for b in beams:
+            p, q = np.asarray(b[0], np.float64), np.asarray(b[1], np.float64)
+            bw, bh = float(b[2]), float(b[3])
+            n = max(2, int(np.linalg.norm(q - p)) + 1)
+            pts = p[None] + (q - p)[None] * np.linspace(0.0, 1.0, n)[:, None]
+            for di, (mid, hw, z) in enumerate(deck_infos):
+                a, bseg = mid[:-1, :2], mid[1:, :2]
+                ab = bseg - a
+                l2 = np.maximum((ab * ab).sum(1), 1e-12)
+                tn = ab / np.sqrt(l2)[:, None]
+                raw_t = ((pts[:, None, :2] - a[None]) * ab[None]).sum(2) / l2[None]
+                f = np.clip(raw_t, 0.0, 1.0)
+                proj = a[None] + f[..., None] * ab[None]
+                d = np.hypot(*(pts[:, None, :2] - proj).transpose(2, 0, 1))
+                best = d.argmin(1)
+                idx = np.arange(len(pts))
+                past_end = ((best == 0) & (raw_t[idx, best] < -0.05)) | ((best == len(a) - 1) & (raw_t[idx, best] > 1.05))
+                if past_end.all():
+                    continue
+                z_d = z[best] + f[idx, best] * (z[best + 1] - z[best])
+                nrm = np.c_[-tn[best, 1], tn[best, 0]]
+                signed_off = ((pts[:, :2] - proj[idx, best]) * nrm).sum(1)
+                need_hw = hw + PARAPET_W + bw / 2.0 + 0.15
+                intrude = (~past_end) & (np.abs(signed_off) < need_hw) & (pts[:, 2] + bh / 2.0 > z_d + 0.15) & (
+                    pts[:, 2] - bh / 2.0 < z_d + 4.75)
+                if not intrude.any():
+                    continue
+                s_vals = signed_off[intrude]
+                if (s_vals > 1.0).all() or (s_vals < -1.0).all():
+                    side_s = 1.0 if s_vals.mean() > 0.0 else -1.0
+                    prev = widen.get((di, side_s))
+                    cand = float(hw + PARAPET_W + 0.35 + bw / 2.0)
+                    min_intr = float(np.min(np.abs(s_vals)))
+                    if prev is None:
+                        widen[(di, side_s)] = (cand, min_intr)
+                    else:
+                        widen[(di, side_s)] = (max(prev[0], cand), min(prev[1], min_intr))
+    if widen:
+        for b in beams:
+            for ei in (0, 1):
+                pt = np.asarray(b[ei], np.float64).copy()
+                for (di, side_s), (target_off, min_intr_off) in widen.items():
+                    mid, hw, z = deck_infos[di]
+                    a, bseg = mid[:-1, :2], mid[1:, :2]
+                    ab = bseg - a
+                    l2 = np.maximum((ab * ab).sum(1), 1e-12)
+                    raw_t = ((pt[:2][None] - a) * ab).sum(1) / l2
+                    f = np.clip(raw_t, 0.0, 1.0)
+                    proj = a + f[:, None] * ab
+                    d = np.hypot(*(pt[:2][None] - proj).T)
+                    k = int(np.argmin(d))
+                    if (k == 0 and raw_t[k] < -0.1) or (k == len(a) - 1 and raw_t[k] > 1.1):
+                        continue
+                    seg_u = ab[k] / max(float(np.linalg.norm(ab[k])), 1e-9)
+                    nrm = np.array([-seg_u[1], seg_u[0]])
+                    off = float((pt[:2] - proj[k]) @ nrm)
+                    z_d = float(z[k] + f[k] * (z[k + 1] - z[k]))
+                    if (side_s * off >= min_intr_off - 0.8 and side_s * off <= target_off + 0.1
+                            and (pt[2] >= z_d - 3.0
+                                 or (max(float(b[0][2]), float(b[1][2])) + float(b[3]) / 2.0 >= z_d - 1.5
+                                     and pt[2] >= z_d - 12.0))):
+                        pt[:2] = proj[k] + nrm * (side_s * target_off)
+                        b[ei] = pt
+                        break
+    all_lines = []
+    seen = set()
+    for items in (rb, cr_all, ground_lines):
+        for (l, r, _v, _m, _layer, z), c in items:
+            if c.get("tunnel"):
+                continue
+            mid = (l + r) / 2
+            if len(mid) < 2:
+                continue
+            key = id(c) if isinstance(c, dict) else (len(mid), float(mid[0, 0]), float(mid[-1, 0]))
+            if key in seen:
+                continue
+            seen.add(key)
+            hw = float(np.median(np.hypot(*(l - r).T))) / 2
+            all_lines.append((mid, hw, np.asarray(z, np.float64), mid[:, :2].min(0), mid[:, :2].max(0)))
+    if not all_lines:
+        return [tuple(b) for b in beams]
+    kept = []
+    for b in beams:
+        p, q = np.asarray(b[0], np.float64), np.asarray(b[1], np.float64)
+        bw, bh = float(b[2]), float(b[3])
+        n = max(int(np.linalg.norm(q - p)), 1) + 1
+        pts = p[None] + (q - p)[None] * np.linspace(0.0, 1.0, n)[:, None]
+        lo_b, hi_b = pts[:, :2].min(0) - bw / 2.0, pts[:, :2].max(0) + bw / 2.0
+        blocked = False
+        for mid, hw, z, m_lo, m_hi in all_lines:
+            if hi_b[0] < m_lo[0] - hw or lo_b[0] > m_hi[0] + hw or hi_b[1] < m_lo[1] - hw or lo_b[1] > m_hi[1] + hw:
+                continue
+            d, z_at = _seg_nearest_z(pts[:, :2], mid, z)
+            if ((d < hw + PARAPET_W + max(0.0, bw / 2.0 - 0.1)) & (pts[:, 2] + bh / 2.0 > z_at + 0.15) & (
+                    pts[:, 2] - bh / 2.0 < z_at + 4.70)).any():
+                blocked = True
+                break
+        if not blocked:
+            kept.append(tuple(b))
+    return kept
 
 
 def _beams(beams, origin, P, T, UV, M, mat):
@@ -2239,10 +2405,10 @@ def _pad(ring, centre, origin, P, T, UV, M, top, side, field=None):
     """A junction pad (roads.deck_pads: ring (k, 3) counter-clockwise, centre (3,)): its top a fan from the centre in
     the decks' top material, its rim a skirt PAD_SKIRT deep, appended to P, T, UV, M (part of the colliding deck
     mesh)."""
-    ring = np.asarray(ring, np.float64)
+    c = np.asarray(centre, np.float64)
+    ring = _clamp_pad_ring(ring, c)
     if len(ring) < 3:
         return
-    c = np.asarray(centre, np.float64)
     o = np.asarray(origin, np.float64)
     nv = sum(len(a) for a in P)
     k = len(ring)
@@ -2295,58 +2461,109 @@ def _portal_columns(p):
     return z_road, left_c, right_c, cap_bot
 
 
+def _seg_nearest_z(pts, mid, z):
+    """Per query point in `pts` (m, 2): (min segment distance, interpolated polyline z) on `(mid, z)`."""
+    a, b = mid[:-1, :2], mid[1:, :2]
+    ab = b - a
+    l2 = np.maximum((ab * ab).sum(1), 1e-12)
+    f = np.clip(((pts[:, None] - a[None]) * ab[None]).sum(2) / l2[None], 0.0, 1.0)
+    proj = a[None] + f[..., None] * ab[None]
+    d = np.hypot(*(pts[:, None] - proj).transpose(2, 0, 1))
+    best = d.argmin(1)
+    idx = np.arange(len(pts))
+    return d[idx, best], z[best] + f[idx, best] * (z[best + 1] - z[best])
+
+
+def _pier_hits_poly(pts, reach_r, z_lo, z_hi, poly_lines, pad_deck=0.0):
+    """True when any sample point in `pts` (m, 2) comes within `hw + pad + reach_r` and `[z_lo, z_hi]` of any polyline."""
+    if not len(pts) or not poly_lines:
+        return False
+    p_lo, p_hi = pts.min(0) - (reach_r + pad_deck), pts.max(0) + (reach_r + pad_deck)
+    for mid, hw, z, m_lo, m_hi, is_deck in poly_lines:
+        ew = hw + (pad_deck if is_deck else 0.0)
+        if p_hi[0] < m_lo[0] - ew or p_lo[0] > m_hi[0] + ew or p_hi[1] < m_lo[1] - ew or p_lo[1] > m_hi[1] + ew:
+            continue
+        d, z_at = _seg_nearest_z(pts, mid, z)
+        if ((d < ew + reach_r) & (z_at >= z_lo) & (z_at <= z_hi)).any():
+            return True
+    return False
+
+
 def _piers_clear(piers, rb, context=None):
-    """The piers that cross no other deck under their top, nor place portal columns into lower carriageways."""
+    """The piers that cross no other deck or ground carriageway within their shaft or cap volume."""
     if not piers:
         return []
     src = context if context is not None else rb
     if not rb and not src:
         return list(piers)
-    lines = [(((l + r) / 2), float(np.median(np.hypot(*(l - r).T))) / 2 + PARAPET_W, z) for (l, r, v, m, layer, z), c in rb
-             if not c.get("tunnel")]
-    col_lines = [(((l + r) / 2), float(np.median(np.hypot(*(l - r).T))) / 2, z) for (l, r, v, m, layer, z), c in src
-                 if not c.get("tunnel")]
+    col_lines = []
+    seen = set()
+    for items in (rb, src):
+        for (l, r, _v, _m, _layer, z), c in items:
+            if c.get("tunnel"):
+                continue
+            mid = (l + r) / 2
+            if len(mid) < 2:
+                continue
+            key = id(c) if isinstance(c, dict) else (len(mid), float(mid[0, 0]), float(mid[-1, 0]))
+            if key in seen:
+                continue
+            seen.add(key)
+            hw = float(np.median(np.hypot(*(l - r).T))) / 2
+            col_lines.append((mid, hw, np.asarray(z, np.float64), mid[:, :2].min(0), mid[:, :2].max(0), bool(c.get("deck"))))
     out = []
     for p in piers:
         tag = p[8][0] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
         x, y, ux, uy, zt, zb, width = p[:7]
+        thick = p[7] if len(p) > 7 else None
+        c_xy = np.array([x, y], np.float64)
+        nrm = np.array([-uy, ux], np.float64)
         pinfo = _portal_columns(p)
         if pinfo is False:
             continue
         if pinfo is not None:
-            _zr, left_c, right_c, _cap_bot = pinfo
-            c_xy = np.array([x, y])
-            nrm = np.array([-uy, ux])
-            col_clear_r = PIER_COLUMN / 2 + 1.0
-            hit = False
-            for lat in (left_c, right_c):
-                cq = c_xy + nrm * lat
-                for mid, hw, z in col_lines:
-                    d = np.hypot(*(mid - cq).T)
-                    k = int(np.argmin(d))
-                    if d[k] < hw + col_clear_r and zb - 0.5 <= z[k] < zt - 1.0:
-                        hit = True
-                        break
-                if hit:
-                    break
-            if not hit:
-                out.append(p)
+            _zr, left_c, right_c, cap_bot = pinfo
+            cols = np.vstack([c_xy + nrm * left_c, c_xy + nrm * right_c])
+            if _pier_hits_poly(cols, PIER_COLUMN / 2 + 1.0, zb - 0.5, cap_bot + 0.5, col_lines):
+                continue
+            ncap = max(3, int(math.ceil((right_c - left_c) / 2.0)) + 1)
+            cap_pts = c_xy[None] + nrm[None] * np.linspace(left_c, right_c, ncap)[:, None]
+            if _pier_hits_poly(cap_pts, PIER_T / 2 + 0.5, cap_bot - 0.3, zt + 0.50, col_lines):
+                continue
+            out.append(p)
             continue
-        q = np.array([x, y])
         if tag == "median":
             offs = p[8][3] if len(p[8]) > 3 else (0.0,)
-            reach = (max(abs(float(o)) for o in offs) if offs else 0.0) + max(float(p[8][1]), float(p[8][2])) + 0.10
-        else:
-            reach = float(np.clip(0.7 * width, 2.5, 14.0)) / 2 + PIER_T
-        hit = False
-        for mid, hw, z in lines:
-            d = np.hypot(*(mid - q).T)
-            k = int(np.argmin(d))
-            if d[k] < hw + reach and z[k] < zt - 1.0:       # a deck below the pier's top, across its footprint
-                hit = True
-                break
-        if not hit:
+            m_pts = c_xy[None] + nrm[None] * np.asarray(offs if offs else (0.0,), np.float64)[:, None]
+            m_rad = max(float(p[8][1]), float(p[8][2])) + 0.30
+            if _pier_hits_poly(m_pts, m_rad, zb - 0.5, zt + 0.50, col_lines):
+                continue
             out.append(p)
+            continue
+        if thick is not None:
+            n_w = max(3, int(math.ceil(width / 2.0)) + 1)
+            pts = c_xy[None] + nrm[None] * np.linspace(-width / 2, width / 2, n_w)[:, None]
+            if _pier_hits_poly(pts, float(thick) / 2 + 0.3, zb - 0.5, zt + 0.50, col_lines):
+                continue
+            out.append(p)
+            continue
+        cap_w = width / 2 + PARAPET_W
+        ncap = max(3, int(math.ceil((2.0 * cap_w) / 2.0)) + 1)
+        cap_pts = c_xy[None] + nrm[None] * np.linspace(-cap_w, cap_w, ncap)[:, None]
+        if _pier_hits_poly(cap_pts, PIER_T / 2 + 0.5, zt - PIER_CAP_H - 0.3, zt + 0.50, col_lines):
+            continue
+        if width > PIER_BENT_W:
+            nc = max(2, int(round(width / 9.0)))
+            shaft_pts = c_xy[None] + nrm[None] * np.linspace(-(width / 2 - 2.0), width / 2 - 2.0, nc)[:, None]
+            reach_r = PIER_COLUMN / 2 + 0.5
+        else:
+            wall = float(np.clip(0.7 * width, 2.5, 14.0)) / 2
+            nw = max(3, int(math.ceil((2.0 * wall) / 2.0)) + 1)
+            shaft_pts = c_xy[None] + nrm[None] * np.linspace(-wall, wall, nw)[:, None]
+            reach_r = PIER_T / 2 + 0.5
+        if _pier_hits_poly(shaft_pts, reach_r, zb - 0.5, zt - PIER_CAP_H + 0.3, col_lines):
+            continue
+        out.append(p)
     return out
 
 
@@ -2680,24 +2897,6 @@ def _parapet_cover_one(rb, context=()):
 
 
 
-def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
-    """Actual generated bridge parapets as XY centre lines plus the mesh geometry.
-
-    Uses the same coverage masks, edge offsets, tunnel exclusion, and minimum-run rule as deck().
-    _rb lets deck() share its already-computed ribbons. Returned dictionaries are ordered by deck
-    chunk and edge, and include the points deck() uses verbatim.
-    """
-    junctions = _junction_surfaces(chunks, context)
-    if _rb is None:
-        dch = [c for c in chunks if c.get("deck")]
-        cr_all = [(r, c) for r, c in ribbon_pairs(list(context)) if r[5] is not None]
-        rb = trim_overlaps([(r, c) for r, c in ribbon_pairs(dch) if r[5] is not None], cr_all,
-                           junctions)
-    else:
-        rb = _rb
-    if not rb:
-        return []
-
 def _non_opposing_cover(rb_item, ctx_items, edge_pts, mask, mine):
     """Evaluate _parapet_cover at masked edge points against only non-opposing ribbons."""
     if not mask.any():
@@ -2808,10 +3007,18 @@ def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
                 while j + 1 < k and not cov[j + 1]:
                     j += 1
                 run_len = float(np.hypot(*np.diff(edge[i:j + 1], axis=0).T).sum()) if j > i else 0.0
-                if j > i and (run_len >= PARAPET_MIN_M or i == 0 or j == k - 1):
+                mid_ = (left + right) / 2
+                box = c.get("deck_box") if c.get("deck_seam") else None
+                at_seam = bool(box) and (
+                    (i == 0 and min(abs(float(mid_[0, 0]) - box[0]), abs(float(mid_[0, 0]) - box[2]),
+                                    abs(float(mid_[0, 1]) - box[1]), abs(float(mid_[0, 1]) - box[3])) <= 1.0)
+                    or (j == k - 1 and min(abs(float(mid_[-1, 0]) - box[0]), abs(float(mid_[-1, 0]) - box[2]),
+                                           abs(float(mid_[-1, 1]) - box[1]), abs(float(mid_[-1, 1]) - box[3])) <= 1.0)
+                )
+                whole_uncovered = i == 0 and j == k - 1
+                if j > i and (run_len >= PARAPET_MIN_M or whole_uncovered or at_seam):
                     sl = slice(i, j + 1)
                     edge_run, inner_run = edge[sl], inner[sl]
-                    mid_ = (left + right) / 2
                     ends = list(c.get("abut") or [])
                     if i > 0:                                       # the run stops there (a gap, a gore)
                         ends.append(tuple(mid_[i]))
@@ -2848,11 +3055,11 @@ def _pier(p, origin, P, T, UV, M, mat):
     nrm = np.array([-uy, ux])
     c = np.array([x, y])
     boxes = []                                  # (centre, half along t, half across, z0, z1, widen per m down)
-    cap_w = width / 2 + PARAPET_W
+    cap_w = max(width / 2 - 0.15, 1.5)
     if pinfo is not None:
         _z_road, left_c, right_c, cap_bot = pinfo
         mid_lat = 0.5 * (left_c + right_c)
-        boxes.append((c + nrm * mid_lat, PIER_T / 2 + 0.3, 0.5 * (right_c - left_c) + PIER_COLUMN / 2, cap_bot, zt, 0.0))
+        boxes.append((c + nrm * mid_lat, PIER_SHAFT_T / 2 + 0.15, 0.5 * (right_c - left_c) + PIER_COLUMN / 2, cap_bot, zt, 0.0))
         for lat in (left_c, right_c):
             boxes.append((c + nrm * lat, PIER_COLUMN / 2, PIER_COLUMN / 2, zb, cap_bot, 0.0))
     elif median is not None:
@@ -2860,22 +3067,22 @@ def _pier(p, origin, P, T, UV, M, mat):
         offs = median[3] if len(median) > 3 else (0.0,)
         cap_h = PIER_CAP_H if zt - zb >= 3.0 else min(PIER_CAP_H, 0.35 * max(zt - zb, 0.2))
         cap_bot = zt - cap_h
-        boxes.append((c, max(ht + 0.15, PIER_T / 2 + 0.3), cap_w, cap_bot, zt, 0.0))
+        boxes.append((c, max(ht + 0.15, PIER_SHAFT_T / 2 + 0.15), cap_w, cap_bot, zt, 0.0))
         for lat in offs:
             boxes.append((c + nrm * float(lat), ht, hn, zb, cap_bot, 0.0))
     elif thick is not None:
         boxes.append((c, thick / 2, width / 2, zb, zt, PIER_TAPER))
     else:
-        boxes.append((c, PIER_T / 2 + 0.3, cap_w, zt - PIER_CAP_H, zt, 0.0))
+        boxes.append((c, PIER_SHAFT_T / 2 + 0.15, cap_w, zt - PIER_CAP_H, zt, 0.0))
     if pinfo is not None or median is not None or thick is not None:
         pass
     elif width > PIER_BENT_W:
         nc = max(2, int(round(width / 9.0)))
-        for off in np.linspace(-(width / 2 - 2.0), width / 2 - 2.0, nc):
+        for off in np.linspace(-(width / 2 - 1.8), width / 2 - 1.8, nc):
             boxes.append((c + nrm * off, PIER_COLUMN / 2, PIER_COLUMN / 2, zb, zt - PIER_CAP_H, 0.0))
     else:
-        wall = float(np.clip(0.7 * width, 2.5, 14.0)) / 2
-        boxes.append((c, PIER_T / 2, wall, zb, zt - PIER_CAP_H, PIER_TAPER))
+        wall = float(np.clip(0.42 * width, 1.4, 5.5)) / 2
+        boxes.append((c, PIER_SHAFT_T / 2, wall, zb, zt - PIER_CAP_H, PIER_TAPER))
     for cc, ht, hn, z0, z1, taper in boxes:
         grow = taper * max(z1 - z0, 0.0)
         top = [cc + t * a * ht + nrm * b * hn for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
@@ -2963,6 +3170,32 @@ def _tunnel_section(hw, th=TUNNEL_H, low=False, box=False):
 WALL_THICK_M = 2.4         # a retaining wall's top: over the grading's flat strip behind it (grading.WALL_FLAT_M)
 
 
+def _smooth_wall_face(b, tw, thick):
+    """Smooth coarse 1 m lateral quantization notches along +tw for non-parapet retaining walls,
+    preserving endpoints, back terrain line, and smooth curves (WallSolidTest)."""
+    k = len(b)
+    if k < 4:
+        return b, thick
+    b = b.copy()
+    thick = thick.copy()
+    for _pass in range(6):
+        for i in range(1, k - 1):
+            if float(tw[i - 1] @ tw[i + 1]) < 0.85:
+                continue
+            h0 = float(np.hypot(*(b[i] - b[i - 1])))
+            h1 = float(np.hypot(*(b[i + 1] - b[i])))
+            if h0 < 1e-6 or h1 < 1e-6:
+                continue
+            ta = h0 / (h0 + h1)
+            mid = (1.0 - ta) * b[i - 1] + ta * b[i + 1]
+            scurv = -0.5 * ta * (1.0 - ta) * float((tw[i + 1] - tw[i - 1]) @ (b[i + 1] - b[i - 1]))
+            err = float((mid - b[i]) @ tw[i]) - scurv
+            if 0.02 < err <= 1.2:
+                b[i] = b[i] + err * tw[i]
+                thick[i] += err
+    return b, thick
+
+
 def _retaining_walls(walls, origin, P, T, UV, M, nv):
     """roads.retaining_walls' walls as stone (material index 2): the face toward the road, the top, the ends;
     appended to P, T, UV, M. Returns the new vertex count."""
@@ -2972,10 +3205,12 @@ def _retaining_walls(walls, origin, P, T, UV, M, nv):
         k = len(b)
         if k < 2:
             continue
-        s = np.concatenate(([0.0], np.cumsum(np.hypot(*np.diff(b, axis=0).T))))
         thick = np.asarray(w.get("thick", np.full(k, WALL_THICK_M)), np.float64)    # (roads.retaining_walls)
         face_m, face_uv = (0, CONCRETE_UV_M) if w.get("concrete") else (2, STONE_UV_M)  # (a major road's: concrete)
         back = b - tw * thick[:, None]
+        if not w.get("parapet") and k >= 4:
+            b, thick = _smooth_wall_face(b, tw, thick)
+        s = np.concatenate(([0.0], np.cumsum(np.hypot(*np.diff(b, axis=0).T))))
         # (its top behind the coping up to the ground at its back edge: roads.retaining_walls' back_top)
         btop = np.maximum(np.asarray(w.get("back_top", top), np.float64), top)
         face_lo = np.c_[b, foot] - origin
@@ -2992,7 +3227,7 @@ def _retaining_walls(walls, origin, P, T, UV, M, nv):
         else:                                   # a retaining wall's back: down into the ground behind it (where the
             bot = btop - WALL_SKIRT_M           # ground there lies lower, its edge was open, seen from above)
         back_lo = np.c_[back, bot] - origin
-        quads.append((back_lo, back_hi, bot, top, face_m))
+        quads.append((back_lo, back_hi, bot, btop, face_m))
         # its underside, from the back's bottom to the face's foot: a closed solid (2026-10-27: no face of it open,
         # its ends one-sided caps of its section; every edge shared by two faces, test_shortdecks.WallSolidTest)
         quads.append((back_lo, face_lo, None, float(np.mean(thick)), face_m))
@@ -3104,10 +3339,17 @@ def tunnel(chunks, origin, walls=()):
             ax = np.concatenate([axis[i], axis[i]])
             flip = (nrm * (ax - cen)).sum(1) < 0
             tri[flip] = tri[flip][:, ::-1]
-            # a low arch is seen from outside too (where its thin cover is cut away: its stone, not a hole)
-            T.append(np.concatenate([tri, tri[:, ::-1]]) if low and j >= 2 and j < m - 3 else tri)
+            # a low arch is seen from outside too (where its thin cover is cut away: its stone, not a hole);
+            # separate vertices keep inward and outward vertex normals from cancelling in face_normal_sum
+            T.append(tri)
             M.append(mat)
             nv += 2 * k
+            if low and j >= 2 and j < m - 3:
+                P.append(np.concatenate([a, b]))
+                UV.append(UV[-1])
+                T.append(tri[:, ::-1] + 2 * k)
+                M.append(mat)
+                nv += 2 * k
         # the lamps: under the vault along both lines, every other step, faced down (a long tunnel's; not under an arch)
         if not low:
             nv = _tunnel_lamps(P, T, UV, M, nv, mid, u, z, hw, origin)
@@ -3143,7 +3385,12 @@ def tunnel(chunks, origin, walls=()):
             i = np.arange(m - 1)
             A, A1, B, B1 = nv + i, nv + i + 1, nv + m + i, nv + m + i + 1
             tri = np.concatenate([np.stack([A, B, B1], 1), np.stack([A, B1, A1], 1)])
-            T.append(np.concatenate([tri, tri[:, ::-1]]))   # seen from outside and from in the tube
+            T.append(tri)   # seen from outside and from in the tube without cancelling face_normal_sum
+            M.append(2 if stone else 0)
+            nv += 2 * m
+            P.append(np.concatenate([inner, outer]))
+            UV.append(UV[-1])
+            T.append(tri[:, ::-1] + 2 * m)
             M.append(2 if stone else 0)
             nv += 2 * m
             if low and (cap_m is None or cap_m >= LOW_CAP_MIN):

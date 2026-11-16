@@ -143,12 +143,17 @@ def _node(frame, akey, load, ground, ix, iy):
     reach = MARGIN_M
     cells = [load(k) for k in railways.cells_near(frame, box, reach)]
     tunnels = railways.road_underpasses(frame, cells, box, reach)     # (parts' own: asked once)
-    rails = [r for r in railways.parts(frame, cells, box, reach=reach, clip=True, underpasses=tunnels) if r[1] != "tram"]
+    part_levels = {}
+    rails = [r for r in railways.parts(frame, cells, box, reach=reach, clip=True,
+                                       underpasses=tunnels, levels=part_levels) if r[1] != "tram"]
     out = {}
     if rails:
         tunnels = tunnels + railways.coarse_underpasses(frame, cells, box, rails, reach, ground=ground)
         xy, off = _flat(rails)
-        z = np.concatenate([np.asarray(zb, np.float64).ravel() for zb, _zg in railways.profile(rails, ground, tunnels)])
+        ctx = railways._bridge_context(frame, cells, box, reach, rails, ground, levels=part_levels)
+        z = np.concatenate([np.asarray(zb, np.float64).ravel()
+                            for zb, _zg in railways.profile(rails, ground, tunnels,
+                                                            levels=part_levels, context=ctx)])
         if SMOOTH_ON:
             z = _smooth_flat(xy, off, z, np.array([kind == "ground" for _f, _c, kind, _xy in rails], bool))
         inner = (box[0] - reach + 3 * railways.STEP_M, box[1] - reach + 3 * railways.STEP_M,

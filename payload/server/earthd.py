@@ -70,6 +70,14 @@ import math  # noqa: E402
 import re  # noqa: E402
 import secrets  # noqa: E402
 import sys  # noqa: E402
+
+_BRF_ADDON_REV = "0.3.0"
+if not os.environ.get("BNE_BRF_ADDON_REV_PIN") and os.environ.get("BNE_BRF_ADDON_REV") != _BRF_ADDON_REV:
+    os.environ["BNE_BRF_ADDON_REV"] = _BRF_ADDON_REV
+    _brf_revisit = sys.modules.get("revisit")
+    if _brf_revisit is not None:
+        getattr(_brf_revisit, "_code", []).clear()
+        getattr(_brf_revisit, "_switches", []).clear()
 import shutil  # noqa: E402
 import collections  # noqa: E402
 import threading  # noqa: E402
@@ -2875,12 +2883,6 @@ class Server:
         dmesh = roadmeshmod.deck(chunks, (x0, y0, 0.0), _piers, ctx, _beams,
                                  ground=cover, parapets=parapets,
                                  low_parapet_decks=low_parapet_decks, pads=pads)
-        import fences
-        try:                        # the mapped stone walls (GitHub #938), in the retaining walls' stone
-            rwalls = rwalls + fences.stone_walls(anchor.frame, infra_fn, box, elev, roads=near_roads)
-        except Exception as ex:
-            log.warning("stone walls: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
-        tmesh = roadmeshmod.tunnel(chunks, (x0, y0, 0.0), rwalls)
         import railways
         rail_props = []                 # (buffer stops and the walk signs at footway crossings: railways.tile_mesh's furniture)
         rmesh, rail_decks = railways.tile_mesh(anchor.frame, tx, ty,
@@ -2897,6 +2899,17 @@ class Server:
                                    infra_fn=infra_fn)
         if rail_props:
             props = (props or []) + rail_props
+        import fences
+        all_decks = guardrail_decks + rail_decks
+        try:                        # the mapped stone walls (GitHub #938), in the retaining walls' stone
+            rwalls = rwalls + fences.stone_walls(anchor.frame, infra_fn, box, elev, roads=near_roads)
+        except Exception as ex:
+            log.warning("stone walls: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
+        try:                        # continuous grade-following concrete noise barriers
+            rwalls = rwalls + fences.noise_walls(anchor.frame, infra_fn, box, elev, decks=all_decks, roads=near_roads)
+        except Exception as ex:
+            log.warning("noise walls: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
+        tmesh = roadmeshmod.tunnel(chunks, (x0, y0, 0.0), rwalls)
         bld = None
         garage_sound = ()
         oil_wells = []
@@ -2919,9 +2932,8 @@ class Server:
                                   clearance=clearance[0] if clearance else None)    # high-voltage lines
             import fences
             try:
-                props.extend(fences.rows(anchor.frame, infra_fn, box, elev, decks=[
-                    {"n": np.column_stack((xy, z)), "w": spec.width} for _f, spec, xy, z, _l in deck_parts] + rail_decks,
-                    roads=near_roads, french=frontage_country == "FR"))
+                props.extend(fences.rows(anchor.frame, infra_fn, box, elev, decks=all_decks,
+                    roads=near_roads, french=frontage_country == "FR", include_noisewalls=False))
             except Exception as ex:
                 log.warning("fences: tile %s_%s: %s: %s", tx, ty, type(ex).__name__, ex)
             import picnic
@@ -7394,6 +7406,11 @@ class Connection:
         elif kind == "hello":
             lease_id = self.s.attach_stream(self, msg)
             self.s.check_user_dir(self, msg.get("userPath"))
+            try:
+                import bridge_rail_report
+                bridge_rail_report.check_fixed_reports_async(self.s, user_path=msg.get("userPath"))
+            except Exception:
+                pass
             lay = self.s.layout
             fmt = msg.get("format", lay.format)
             if msg.get("protocol") != PROTOCOL:

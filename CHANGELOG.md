@@ -1,5 +1,26 @@
 # Changelog
 
+## v0.3.0
+
+### Highlights
+- Support **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.0-beta.dev.456** on 64-bit Windows 10 and 11 (`21` patched server modules including `fences`, `vegetation`, and `delineators`, with `PLANS_FORMAT = 54` and automatic add-on revision cache invalidation).
+- Add a quiet one-time launch corner notice when a newer release of **Bridge & Rail Fixes** is available (`notifyAddonUpdates`), alongside an optional launch notice for previously reported spots (`notifyFixedReports`).
+- Verify `1,269,747 / 8,949,779` structures clean (`14.19%`, `11 / 234` structural archetypes cleared) across `128 / 128` global Overture Maps shards.
+
+### Bridges, Ramps, Piers & Guardrails
+- Couple opposite-direction divided carriageways and twin overpass bridges across corridors to preserve full approach widths and prevent twin-slab elevation splits.
+- Smooth curved ramp diverge approaches, behind-abutment head-slopes, and bridge-end apron transitions while preventing elevated spans from raising embankment fill underneath decks.
+- Propagate cross-cell lane counts on full-bridge ways, enforce multi-tier stacked viaduct clearance, and suppress pier columns or portal caps over active lower lanes and markings.
+- Render continuous 0.5 m sloped concrete highway noise barriers (`fences.noise_walls`), smooth non-parapet retaining wall faces, and clear utility poles and delineator posts from paved travel lanes and gores (`furniture`, `delineators`, `vegetation`).
+
+### Railways, Tunnels & Streaming
+- Align elevated light-rail and railway viaduct deck clearances over multi-level roadways (`railways`, `railprofile`).
+- Gate pedestrian walkway bores, step parallel motorway tunnel mouths cleanly, and keep open-cut tunnel portal lids aligned (`tunnellids`).
+- Stamp `_BRF_ADDON_REV` into `earthd`, `blockworker`, `plancache`, and `roads` so add-on updates automatically invalidate stale local plan and revisit caches without manual cache clearing.
+
+### Installer & Add-on UX (`Ctrl+Shift+B`)
+- Add `notifyAddonUpdates` (`Notify when an add-on update is available`, enabled by default) and `notifyFixedReports` (`Notify when my reported spots are fixed`, enabled by default) toggles in **Add-ons -> Options**, displaying non-focus-stealing corner notices only after world load settles.
+
 ## v0.2.0
 
 ### Highlights

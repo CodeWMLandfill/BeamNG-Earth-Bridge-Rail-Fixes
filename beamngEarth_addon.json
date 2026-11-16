@@ -15,6 +15,20 @@
       "help": "Press Ctrl+Shift+B while driving to send a quick screenshot and map location without pausing."
     },
     {
+      "key": "notifyFixedReports",
+      "label": "Notify when my reported spots are fixed",
+      "type": "bool",
+      "default": true,
+      "help": "Shows a quiet one-time corner notice at launch when a spot you reported with Ctrl+Shift+B is fixed in an update."
+    },
+    {
+      "key": "notifyAddonUpdates",
+      "label": "Notify when an add-on update is available",
+      "type": "bool",
+      "default": true,
+      "help": "Checks once at launch for a newer release of Bridge & Rail Fixes and shows a quiet corner notice."
+    },
+    {
       "key": "reportCategory",
       "label": "Spot report category",
       "type": "choice",

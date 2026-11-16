@@ -750,18 +750,27 @@ def anchor_road_gap(half):
 
 
 def _clear_of_roads(foot, road_lines, gap):
-    """Whether every footprint point stays outside each road.
+    """Whether perimeter, edge samples, and centroid of `foot` stay outside each road.
 
     road_lines: polylines (k, 2), or (polyline, half width) pairs. A known half width uses
     anchor_road_gap (never under gap). A polyline alone keeps gap, the centreline rule.
     """
+    pts = [np.asarray(q, np.float64)[:2] for q in foot]
+    if not pts:
+        return True
+    arr = np.asarray(pts, np.float64)
+    samples = [arr.mean(0)]
+    for i in range(len(arr)):
+        a, b = arr[i], arr[(i + 1) % len(arr)]
+        for f in (0.0, 0.25, 0.5, 0.75):
+            samples.append(a + f * (b - a))
     for item in road_lines or ():
         ln, half = _as_road(item)
         ln = np.asarray(ln, np.float64)
         if ln.ndim != 2 or len(ln) < 2:
             continue
         need = float(gap) if half is None else max(float(gap), anchor_road_gap(half))
-        if min(_seg_dist(q, ln[:, :2]) for q in foot) < need:
+        if min(_seg_dist(q, ln[:, :2]) for q in samples) < need:
             return False
     return True
 
@@ -944,15 +953,18 @@ def truss_members(parts, info, ground_fn, wet_fn=None, with_piers=False, road_li
                 for k2, (xy2, z2, w2) in enumerate(P):
                     if k2 == k:
                         continue
-                    d = np.hypot(*(xy2 - p).T)
+                    a, bseg = xy2[:-1], xy2[1:]
+                    ab = bseg - a
+                    f = np.clip(((p - a) * ab).sum(1) / np.maximum((ab * ab).sum(1), 1e-12), 0.0, 1.0)
+                    q = a + f[:, None] * ab
+                    d = np.hypot(*(q - p).T)
                     m = int(np.argmin(d))
-                    if d[m] > SIDE_REACH_M or abs(tans[k2][m] @ t) < PARALLEL_COS:
+                    if d[m] > SIDE_REACH_M or abs(tans[k2][m] @ t) < PARALLEL_COS or abs(float((q[m] - p) @ t)) > PANEL_M:
                         continue
-                    off = float((xy2[m] - p) @ nrm)
-                    if abs(float((xy2[m] - p) @ t)) > PANEL_M:
-                        continue
+                    off = float((q[m] - p) @ nrm)
+                    zq = float(z2[m] + f[m] * (z2[m + 1] - z2[m]))
                     lo, hi = min(lo, off - w2 / 2), max(hi, off + w2 / 2)
-                    zlo, zhi = min(zlo, float(z2[m])), max(zhi, float(z2[m]))
+                    zlo, zhi = min(zlo, zq), max(zhi, zq)
                 lo -= PARAPET_W + SIDE_GAP_M
                 hi += PARAPET_W + SIDE_GAP_M
                 L, R = p + nrm * hi, p + nrm * lo
@@ -1179,6 +1191,9 @@ def arch_members(P, arcs, tans, ms, info, ground_fn):
     ends = np.array([st[0][1], st[-1][1]])
     g_ends = np.asarray(ground_fn(ends), np.float64)
     g_mid = float(np.asarray(ground_fn(st[n // 2][1][None]), np.float64)[0])
+    # Unqualified "arch" on a long low coastal/flat causeway is never a giant through-arch superstructure.
+    if info["type"] == ARCH_ANY and L >= 80.0 and deck_c - g_mid < max(6.0, 0.03 * L):
+        return []
     through = info["type"] == NBI_THROUGH_ARCH or (info["type"] != NBI_DECK_ARCH and deck_c - g_mid < 0.9 * ARCH_RISE * L)
     rw, rh = _sz(L, 1 / 120, 1.0, 4.5), _sz(L, 1 / 60, 1.2, 9.0)        # rib (width, depth)
     beams = []
@@ -1391,9 +1406,8 @@ def structure_members(parts, info, ground_fn, wet_fn=None, road_lines=(), pylons
 def _structure_members(parts, info, ground_fn, wet_fn, road_lines, pylons=(), depths=None, other_decks=()):
     if info["type"] in TRUSS_TYPES:
         beams, piers = truss_members(parts, info, ground_fn, wet_fn, with_piers=True, road_lines=road_lines)
-        if other_decks:
-            P, _, _ = _prep(parts)
-            beams = _clear_of_decks(beams, (), other_decks=other_decks)
+        if other_decks or road_lines:
+            beams = _clear_of_decks(beams, (), other_decks=other_decks, road_lines=road_lines, ground_fn=ground_fn)
         return beams, piers
     if info["type"] in MOVABLE_TYPES:
         beams, piers = movable_members(parts, info, ground_fn, wet_fn, road_lines, depths=depths)
@@ -1594,7 +1608,7 @@ def _clear_of_decks(beams, P, other_decks=(), road_lines=(), ground_fn=None):
         pts = p[None] + (q - p)[None] * np.linspace(0.0, 1.0, n)[:, None]
         lo_b, hi_b = pts[:, :2].min(0) - 30.0, pts[:, :2].max(0) + 30.0
         blocked = False
-        for pack, pad_w, min_dz in ((own, -0.3, -0.5), (oth, bw / 2.0, -0.5 - bh / 2.0)):
+        for pack, pad_w in ((own, -0.3), (oth, bw / 2.0)):
             if pack is None:
                 continue
             A, B, ZA, ZB, HW, AB, L2 = pack
@@ -1605,7 +1619,7 @@ def _clear_of_decks(beams, P, other_decks=(), road_lines=(), ground_fn=None):
             t = np.clip(((pts[:, None, :2] - a[None]) * ab[None]).sum(2) / l2[None], 0.0, 1.0)
             d = np.hypot(*(pts[:, None, :2] - (a[None] + t[..., None] * ab[None])).transpose(2, 0, 1))
             dz = pts[:, 2:3] - (ZA[near][None] + (ZB[near] - ZA[near])[None] * t)
-            if ((d < HW[near][None] + pad_w) & (dz > min_dz) & (dz < CLEAR_HEADROOM_M)).any():
+            if ((d < HW[near][None] + pad_w) & (dz + bh / 2.0 > -0.5) & (dz - bh / 2.0 < CLEAR_HEADROOM_M)).any():
                 blocked = True
                 break
         if not blocked and has_roads:
@@ -1636,7 +1650,7 @@ def _clear_of_decks(beams, P, other_decks=(), road_lines=(), ground_fn=None):
                     if in_r.any():
                         gz = np.asarray(ground_fn(pts[:, :2]), np.float64)[:, None]
                         dz = pts[:, 2:3] - gz
-                        if (in_r & (dz > 0.15 - bh / 2.0) & (dz < CLEAR_HEADROOM_M)).any():
+                        if (in_r & (dz + bh / 2.0 > 0.15) & (dz - bh / 2.0 < CLEAR_HEADROOM_M)).any():
                             blocked = True
         if not blocked:
             out.append(b)
