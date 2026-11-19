@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "20261119T080033Z-2c467b8f",
+  "createdAt": "2026-11-19T08:00:33.802Z",
+  "lat": 39.73503,
+  "lon": -105.428846,
+  "kind": "bridge",
+  "summary": "In-game bridge report @ 39.73503, -105.42885",
+  "note": "Captured with Ctrl+Shift+B silent 1-hotkey reporter.",
+  "earthVersion": "1.10.1-beta",
+  "addonVersion": "0.3.0",
+  "headingDeg": 308.58,
+  "altM": 2289.3,
+  "speedMs": 0.01,
+  "camera": {
+    "forward": [
+      -0.66867717513064,
+      0.71687325445094,
+      -0.19739192615765
+    ],
+    "pos": [
+      -4183.7801592509,
+      2776.2670963697,
+      2289.1733418614
+    ]
+  },
+  "screenshotPath": "screenshots/2026-11-19/20261119T080033Z-2c467b8f.jpg"
+}
