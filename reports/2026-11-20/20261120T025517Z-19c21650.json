@@ -1,0 +1,38 @@
+{
+  "schemaVersion": 1,
+  "id": "20261120T025517Z-19c21650",
+  "createdAt": "2026-11-20T02:55:17.272Z",
+  "lat": 42.062225,
+  "lon": -87.754939,
+  "kind": "bridge",
+  "summary": "In-game bridge report @ 42.06223, -87.75494",
+  "note": "Captured with Ctrl+Shift+B silent 1-hotkey reporter. [loading_incomplete: roads_pending,queued_road_tiles]",
+  "earthVersion": "1.10.1-beta",
+  "addonVersion": "0.3.0",
+  "headingDeg": 9.18,
+  "altM": 191.08,
+  "speedMs": 0,
+  "camera": {
+    "forward": [
+      0.15844928778868,
+      0.98725132567276,
+      0.015120950917292
+    ],
+    "pos": [
+      -409.58838019515,
+      11354.571505999,
+      181.88858877362
+    ]
+  },
+  "nearest": {
+    "loading": {
+      "reason": "roads_pending,queued_road_tiles",
+      "roadsQueued": 9,
+      "roadsDone": 30,
+      "roadsWant": 40
+    }
+  },
+  "loading_incomplete": true,
+  "loading_reason": "roads_pending,queued_road_tiles",
+  "screenshotPath": "screenshots/2026-11-20/20261120T025517Z-19c21650.jpg"
+}
