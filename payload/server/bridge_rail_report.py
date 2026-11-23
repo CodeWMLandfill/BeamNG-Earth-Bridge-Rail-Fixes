@@ -33,7 +33,7 @@ ALLOWED_RELEASE_URL_PREFIX = (
 )
 MAX_RELEASE_JSON_BYTES = 65536
 ADDON_ID = "beamng-earth-bridge-rail-fixes"
-ADDON_VERSION = "0.3.0"
+ADDON_VERSION = "0.3.1"
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
 ALLOWED_KINDS = ("bridge", "rail", "road", "other")
 BUNDLED_FIXED_REPORTS = {
@@ -50,7 +50,7 @@ _FIXED_CHECKED_KEYS = set()
 ALLOWED_KEYS = frozenset({
     "lat", "lon", "kind", "summary", "note", "earthVersion", "addonVersion",
     "headingDeg", "altM", "speedMs", "anchorId", "camera", "nearest", "screenshot",
-    "loading_incomplete", "loading_reason",
+    "loading_incomplete", "loading_reason", "experimentalFlags",
 })
 
 _PNG_SIG = b"\x89PNG\r\n\x1a\n"
@@ -236,6 +236,27 @@ def _read_addon_options():
     return {}
 
 
+def read_experimental_flags(user_dir=None):
+    """Return sanitized list of active BeamNG.Earth experimental switch IDs via guarded import."""
+    try:
+        import experimental
+        settings_fn = getattr(experimental, "read_settings", None)
+        chosen_fn = getattr(experimental, "chosen", None)
+        settings = settings_fn(str(user_dir) if user_dir else "") if callable(settings_fn) else {}
+        if not isinstance(settings, dict):
+            settings = {}
+        raw_flags = list(chosen_fn(settings)) if callable(chosen_fn) else []
+    except Exception:
+        return []
+    out = []
+    for item in raw_flags[:24]:
+        if isinstance(item, str) and item.strip():
+            cleaned = redact_paths(item.strip())[:64]
+            if cleaned and cleaned not in out:
+                out.append(cleaned)
+    return out
+
+
 def _prepare_screenshot_data_url(shot_path):
     """Read screenshot JPEG/PNG, strip all metadata, and shrink via Pillow if > MAX_SHOT_BYTES."""
     if not shot_path or not shot_path.is_file():
@@ -279,7 +300,7 @@ def _prepare_screenshot_data_url(shot_path):
     return None
 
 
-def build_payload(msg, shot_path=None, options=None):
+def build_payload(msg, shot_path=None, options=None, user_dir=None):
     """Build a Worker-compatible sanitized report dict from incoming Lua message."""
     raw = dict(msg.get("payload") or {})
     opts = options if options is not None else _read_addon_options()
@@ -316,6 +337,26 @@ def build_payload(msg, shot_path=None, options=None):
             cleaned = _sanitize_value(val)
             if isinstance(cleaned, dict):
                 payload[key] = cleaned
+    exp_flags = []
+    raw_exp = raw.get("experimentalFlags")
+    if isinstance(raw_exp, (list, tuple)):
+        for item in raw_exp[:24]:
+            if isinstance(item, str) and item.strip():
+                cleaned_flag = redact_paths(item.strip())[:64]
+                if cleaned_flag and cleaned_flag not in exp_flags:
+                    exp_flags.append(cleaned_flag)
+    for item in read_experimental_flags(user_dir):
+        if len(exp_flags) >= 24:
+            break
+        if item not in exp_flags:
+            exp_flags.append(item)
+    if exp_flags:
+        payload["experimentalFlags"] = exp_flags
+        nearest_map = dict(payload.get("nearest") or {})
+        nearest_map["experimentalFlags"] = list(exp_flags)
+        cleaned_nearest = _sanitize_value(nearest_map)
+        if isinstance(cleaned_nearest, dict):
+            payload["nearest"] = cleaned_nearest
     if shot_path is not None:
         shot_url = _prepare_screenshot_data_url(Path(shot_path))
         if shot_url:
@@ -368,7 +409,7 @@ def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait
         if shot_path is None and candidate.is_file() and candidate.stat().st_size > 0:
             shot_path = candidate
 
-    payload = build_payload(msg, shot_path=shot_path, options=opts)
+    payload = build_payload(msg, shot_path=shot_path, options=opts, user_dir=user_dir)
 
     def _post_json(body_dict):
         req = urllib.request.Request(
@@ -390,21 +431,35 @@ def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait
         if (
             err.code == 400
             and "Unsupported top-level field" in body
-            and ("loading_incomplete" in payload or "loading_reason" in payload)
+            and any(k in payload for k in ("loading_incomplete", "loading_reason", "experimentalFlags"))
         ):
-            legacy = {k: v for k, v in payload.items() if k not in ("loading_incomplete", "loading_reason")}
+            legacy = {
+                k: v
+                for k, v in payload.items()
+                if k not in ("loading_incomplete", "loading_reason", "experimentalFlags")
+            }
             nearest = dict(legacy.get("nearest") or {})
-            loading_obj = dict(nearest.get("loading") or {}) if isinstance(nearest.get("loading"), dict) else {}
-            if "loading_incomplete" in payload:
-                loading_obj["loading_incomplete"] = payload["loading_incomplete"]
-            if "loading_reason" in payload:
-                loading_obj["loading_reason"] = payload["loading_reason"]
-            nearest["loading"] = loading_obj
+            if "loading_incomplete" in payload or "loading_reason" in payload:
+                loading_obj = dict(nearest.get("loading") or {}) if isinstance(nearest.get("loading"), dict) else {}
+                if "loading_incomplete" in payload:
+                    loading_obj["loading_incomplete"] = payload["loading_incomplete"]
+                if "loading_reason" in payload:
+                    loading_obj["loading_reason"] = payload["loading_reason"]
+                nearest["loading"] = loading_obj
+            if "experimentalFlags" in payload:
+                nearest["experimentalFlags"] = list(payload["experimentalFlags"])
             legacy["nearest"] = _sanitize_value(nearest)
-            tag = f"[loading_incomplete: {payload.get('loading_reason') or 'true'}]"
             note = str(legacy.get("note") or "")
-            if tag not in note:
-                legacy["note"] = (f"{note} {tag}".strip() if note else tag)[:2000]
+            tags = []
+            if "loading_incomplete" in payload or "loading_reason" in payload:
+                tags.append(f"[loading_incomplete: {payload.get('loading_reason') or 'true'}]")
+            if "experimentalFlags" in payload:
+                tags.append(f"[experimentalFlags: {', '.join(payload['experimentalFlags'])}]")
+            for tag in tags:
+                if tag not in note:
+                    note = (f"{note} {tag}".strip() if note else tag)[:2000]
+            if note:
+                legacy["note"] = note
             try:
                 result = _post_json(legacy)
             except urllib.error.HTTPError as err2:

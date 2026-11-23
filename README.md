@@ -69,4 +69,4 @@ Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screensh
 ## Requirements
 
 - **Windows 10 or 11** (64-bit).
-- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.0-beta.dev.456** or newer (older versions are skipped safely with a clear notice).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** or newer (newer `v1.10.1-beta.dev.*` builds automatically use forward-compatible client & reporter mode; older versions are skipped safely with a clear notice).

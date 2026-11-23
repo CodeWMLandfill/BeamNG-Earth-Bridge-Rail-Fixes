@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1
+
+### Highlights
+- Support **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** in full solver mode (`full_solver`, `21` patched server modules + `roads.lua` + `Ctrl+Shift+B` reporter), and add automatic forward-compatible `client_and_reporter` mode (`patchTier`) for newer dev builds (`v1.10.1-beta.dev.491+` / `dev.567+`).
+- Update surgical `roads.lua` patching (`reset_viewAt`) so both `v1.9.1-beta.dev.424..v1.10.1-beta` and `v1.10.1-beta.dev.567+` (`M._dropRetiring()`) layouts patch cleanly and idempotently.
+- Capture active `BeamNG.Earth` experimental switch IDs (`experimentalFlags`) in `bridge_rail_report.py` via guarded `experimental` inspection (`read_settings` / `chosen`) while preserving strict path redaction and Worker backward compatibility.
+
 ## v0.3.0
 
 ### Highlights
