@@ -3026,8 +3026,11 @@ def _lane_overrides(feats):
     """{feature: lanes} of rampoverrides (PR #471), once per Features."""
     d = feats.__dict__.get("_lane_overrides")
     if d is None:
-        import rampoverrides
-        d = feats.__dict__["_lane_overrides"] = rampoverrides.lane_counts(feats)
+        try:
+            import rampoverrides
+            d = feats.__dict__["_lane_overrides"] = rampoverrides.lane_counts(feats)
+        except ImportError:
+            d = feats.__dict__["_lane_overrides"] = {}
     return d
 
 

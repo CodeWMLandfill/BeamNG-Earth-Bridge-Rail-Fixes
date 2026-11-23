@@ -245,8 +245,12 @@ def generated_counts(feats):
         np.ascontiguousarray(feats.coord_off, np.int64), np.ascontiguousarray(feats.lonlat, np.float64).reshape(-1, 2),
         (float(origin[0]), float(origin[1])), (float(scale[0]), float(scale[1])), con_f, con_s, con_v)
     counts = [None if c < 0 else c for c in got.tolist()]
-    import rampoverrides
-    for i, lanes in rampoverrides.lane_counts(feats).items():
-        counts[i] = lanes
+    try:
+        import rampoverrides
+    except ImportError:
+        rampoverrides = None
+    if rampoverrides is not None:
+        for i, lanes in rampoverrides.lane_counts(feats).items():
+            counts[i] = lanes
     feats._generated_lanes = counts
     return counts

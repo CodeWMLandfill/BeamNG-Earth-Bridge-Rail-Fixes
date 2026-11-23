@@ -27,9 +27,30 @@ VERSION = "0.3.1"
 MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_3_1"
 TAG = "earthBridgeRailFixes"
 MAX_SOLVER_FAST_VERSION = 305
+MAX_BRIDGED_SOLVER_FAST_VERSION = 607
 TIER_FULL_SOLVER = "full_solver"
 TIER_CLIENT_AND_REPORTER = "client_and_reporter"
+SOLVER_MODE_DIRECT = "direct"
+SOLVER_MODE_BRIDGED_V2 = "bridged_v2"
+SOLVER_MODE_CLIENT_ONLY = "client_only"
 ORIG_EARTHD_MODULE = "_brf_orig_earthd"
+V2_BRIDGE_MODULE = "_brf_v2_bridge"
+V2_FULL_OVERLAY_MODULES = (
+    "guardrails",
+    "furniture",
+    "roadlanes",
+    "bridgetypes",
+    "carriageways",
+    "fences",
+    "tunnellids",
+)
+V2_HOOK_MODULES = (
+    "roads",
+    "grading",
+    "roadmesh",
+    "rails",
+    "plancache",
+)
 COOKIE = struct.Struct("!8sIIII64s")
 ENTRY = struct.Struct("!IIIIBc")
 MAGIC = b"MEI\x0c\x0b\x0a\x0b\x0e"
@@ -557,11 +578,44 @@ def _verify_earthd_dispatch_hook(earthd_co):
     raise PatchError("Unsupported upstream earthd layout (missing Connection.dispatch hook point)")
 
 
-def _detect_pyz_patch_tier(data, offset, toc, payload_dir=None, extra_modules=()):
+def _code_defined_symbols(co):
+    return {
+        inst.argval
+        for inst in dis.get_instructions(co)
+        if inst.opname in ("STORE_NAME", "STORE_GLOBAL")
+    } | set(co.co_names)
+
+
+def _verify_v2_bridge_anchors(load_mod_code, toc):
+    if "v2host" not in toc:
+        return False
+    for mod in V2_FULL_OVERLAY_MODULES + V2_HOOK_MODULES:
+        if mod not in toc:
+            return False
+    required = {
+        "roads": ("TunnelProfiles", "block_arch_raise", "tunnel_sections"),
+        "grading": ("fill_abutment", "ground_under_deck", "guard_limits"),
+        "roadmesh": ("_tunnel_section", "_arch_cap", "_beams"),
+        "rails": ("tile_chunks", "_sleepers"),
+        "plancache": ("for_grader",),
+    }
+    for mod_name, syms in required.items():
+        try:
+            defined = _code_defined_symbols(load_mod_code(mod_name))
+        except Exception:
+            return False
+        if any(s not in defined for s in syms):
+            return False
+    return True
+
+
+def _detect_pyz_patch_tier_and_mode(data, offset, toc, payload_dir=None, extra_modules=()):
+    if V2_BRIDGE_MODULE in toc:
+        return TIER_FULL_SOLVER, SOLVER_MODE_BRIDGED_V2
     if ORIG_EARTHD_MODULE in toc:
-        return TIER_CLIENT_AND_REPORTER
+        return TIER_CLIENT_AND_REPORTER, SOLVER_MODE_CLIENT_ONLY
     if "bridge_rail_report" in toc:
-        return TIER_FULL_SOLVER
+        return TIER_FULL_SOLVER, SOLVER_MODE_DIRECT
     if "earthd" not in toc:
         raise PatchError("Executable does not contain expected server module 'earthd'")
 
@@ -574,7 +628,7 @@ def _detect_pyz_patch_tier(data, offset, toc, payload_dir=None, extra_modules=()
         for mod in req_mods:
             if mod not in toc:
                 raise PatchError(f"Executable does not contain expected server module '{mod}'")
-        return TIER_FULL_SOLVER
+        return TIER_FULL_SOLVER, SOLVER_MODE_DIRECT
 
     def _load_mod_code(mod_name):
         kind, pos, length = toc[mod_name]
@@ -587,7 +641,9 @@ def _detect_pyz_patch_tier(data, offset, toc, payload_dir=None, extra_modules=()
         fast_min = _extract_fast_min_version_from_code(fast_co)
         if fast_min is not None and fast_min > MAX_SOLVER_FAST_VERSION:
             _verify_earthd_dispatch_hook(_load_mod_code("earthd"))
-            return TIER_CLIENT_AND_REPORTER
+            if fast_min <= MAX_BRIDGED_SOLVER_FAST_VERSION and _verify_v2_bridge_anchors(_load_mod_code, toc):
+                return TIER_FULL_SOLVER, SOLVER_MODE_BRIDGED_V2
+            return TIER_CLIENT_AND_REPORTER, SOLVER_MODE_CLIENT_ONLY
 
     for mod in req_mods:
         if mod not in toc:
@@ -606,17 +662,27 @@ def _detect_pyz_patch_tier(data, offset, toc, payload_dir=None, extra_modules=()
             _scan_missing_exports_in_code(co, replaced_set, payload_exports, {}, missing)
             if missing:
                 _verify_earthd_dispatch_hook(_load_mod_code("earthd"))
-                return TIER_CLIENT_AND_REPORTER
+                return TIER_CLIENT_AND_REPORTER, SOLVER_MODE_CLIENT_ONLY
 
-    return TIER_FULL_SOLVER
+    return TIER_FULL_SOLVER, SOLVER_MODE_DIRECT
 
 
-def _detect_source_patch_tier(root, payload_dir=None):
+def _detect_pyz_patch_tier(data, offset, toc, payload_dir=None, extra_modules=()):
+    tier, _mode = _detect_pyz_patch_tier_and_mode(
+        data, offset, toc, payload_dir=payload_dir, extra_modules=extra_modules
+    )
+    return tier
+
+
+def _detect_source_patch_tier_and_mode(root, payload_dir=None):
     root = Path(root)
     server_dir = root / "server"
     sidecar = read_json(root / f".{TAG}" / "receipt.json", {})
     if sidecar.get("state") == "installed" and sidecar.get("patchTier") in (TIER_FULL_SOLVER, TIER_CLIENT_AND_REPORTER):
-        return sidecar["patchTier"]
+        smode = sidecar.get("solverMode") or (
+            SOLVER_MODE_DIRECT if sidecar["patchTier"] == TIER_FULL_SOLVER else SOLVER_MODE_CLIENT_ONLY
+        )
+        return sidecar["patchTier"], smode
 
     eff_payload = payload_dir if payload_dir is not None else _default_payload_dir()
     active_mods = effective_server_modules(eff_payload)
@@ -632,7 +698,13 @@ def _detect_source_patch_tier(root, payload_dir=None):
         fast_min = _extract_fast_min_version_from_source(fast_raw)
         if fast_min is not None and fast_min > MAX_SOLVER_FAST_VERSION:
             _check_source_earthd_hook()
-            return TIER_CLIENT_AND_REPORTER
+            if (
+                fast_min <= MAX_BRIDGED_SOLVER_FAST_VERSION
+                and (server_dir / "v2host.py").is_file()
+                and all((server_dir / f"{m}.py").is_file() for m in (V2_FULL_OVERLAY_MODULES + V2_HOOK_MODULES))
+            ):
+                return TIER_FULL_SOLVER, SOLVER_MODE_BRIDGED_V2
+            return TIER_CLIENT_AND_REPORTER, SOLVER_MODE_CLIENT_ONLY
 
     for mod in active_mods:
         if not (server_dir / f"{mod}.py").is_file():
@@ -644,7 +716,7 @@ def _detect_source_patch_tier(root, payload_dir=None):
         missing = []
         for py_file in sorted(server_dir.glob("*.py")):
             mod_name = py_file.stem
-            if mod_name in replaced_set or mod_name in ("bench_pose", "bridge_rail_report"):
+            if mod_name in replaced_set or mod_name in ("bench_pose", "bridge_rail_report", "bridge_rail_v2_bridge"):
                 continue
             try:
                 co = compile(py_file.read_text(encoding="utf-8"), py_file.name, "exec")
@@ -653,9 +725,14 @@ def _detect_source_patch_tier(root, payload_dir=None):
             _scan_missing_exports_in_code(co, replaced_set, payload_exports, {}, missing)
             if missing:
                 _check_source_earthd_hook()
-                return TIER_CLIENT_AND_REPORTER
+                return TIER_CLIENT_AND_REPORTER, SOLVER_MODE_CLIENT_ONLY
 
-    return TIER_FULL_SOLVER
+    return TIER_FULL_SOLVER, SOLVER_MODE_DIRECT
+
+
+def _detect_source_patch_tier(root, payload_dir=None):
+    tier, _mode = _detect_source_patch_tier_and_mode(root, payload_dir=payload_dir)
+    return tier
 
 
 def validate_pyz_compatibility(toc, earth_version="", extra_modules=()):
@@ -714,12 +791,17 @@ def _stamp_addon_rev(src_text, cache_rev):
     return "".join(out)
 
 
-def _build_tier2_earthd_wrapper_src(enable_reporter):
+def _build_tier2_earthd_wrapper_src(
+    enable_reporter,
+    patch_tier=TIER_CLIENT_AND_REPORTER,
+    solver_mode=SOLVER_MODE_CLIENT_ONLY,
+):
     lines = [
         "import sys as _brf_sys",
         f"import {ORIG_EARTHD_MODULE} as _brf_orig",
         f"_earth_bridge_rail_fixes_patch = {MARKER!r}",
-        f"_BRF_PATCH_TIER = {TIER_CLIENT_AND_REPORTER!r}",
+        f"_BRF_PATCH_TIER = {patch_tier!r}",
+        f"_BRF_SOLVER_MODE = {solver_mode!r}",
     ]
     if enable_reporter:
         lines.extend([
@@ -752,6 +834,7 @@ def _build_tier2_earthd_wrapper_src(enable_reporter):
         "_brf_mod_name = __name__",
         "_brf_orig._earth_bridge_rail_fixes_patch = _earth_bridge_rail_fixes_patch",
         "_brf_orig._BRF_PATCH_TIER = _BRF_PATCH_TIER",
+        "_brf_orig._BRF_SOLVER_MODE = _BRF_SOLVER_MODE",
         "globals().update(_brf_orig.__dict__)",
         "globals()['__name__'] = _brf_mod_name",
         "if _brf_mod_name == '__main__':",
@@ -763,11 +846,112 @@ def _build_tier2_earthd_wrapper_src(enable_reporter):
     return "\n".join(lines)
 
 
-def _compile_server_payload(payload_dir, existing_filenames, apply_fixes, enable_reporter, patch_tier=TIER_FULL_SOLVER):
+def _build_v2_overlay_src(mod_name, payload_src):
+    orig_mod = f"_brf_orig_{mod_name}"
+    header = (
+        f"import {orig_mod} as _brf_orig\n"
+        "_brf_mod_name = __name__\n"
+        "for _k, _v in _brf_orig.__dict__.items():\n"
+        "    if not _k.startswith('__'):\n"
+        "        globals()[_k] = _v\n"
+    )
+    footer = (
+        "\nglobals()['__name__'] = _brf_mod_name\n"
+        f"_earth_bridge_rail_fixes_patch = {MARKER!r}\n"
+    )
+    return header + payload_src + footer
+
+
+def _build_v2_hook_wrapper_src(mod_name, cache_rev):
+    orig_mod = f"_brf_orig_{mod_name}"
+    if mod_name == "rails":
+        return (
+            "import sys as _brf_sys\n"
+            f"import {orig_mod} as _brf_orig\n"
+            "import _brf_payload_rails as _brf_pay\n"
+            "_brf_mod_name = __name__\n"
+            "globals().update(_brf_orig.__dict__)\n"
+            "globals()['__name__'] = _brf_mod_name\n"
+            "_orig_tc = _brf_orig.tile_chunks\n"
+            "_sleepers = _brf_pay._sleepers\n"
+            "globals()['_sleepers'] = _sleepers\n"
+            "_brf_orig._sleepers = _sleepers\n"
+            "def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None, records=None):\n"
+            "    if records is None:\n"
+            "        return _brf_pay.tile_chunks(frame, tx, ty, cells, country, urban_fn)\n"
+            "    return _orig_tc(frame, tx, ty, cells, country=country, urban_fn=urban_fn, records=records)\n"
+            "globals()['tile_chunks'] = tile_chunks\n"
+            "_brf_orig.tile_chunks = tile_chunks\n"
+            f"_brf_orig._earth_bridge_rail_fixes_patch = {MARKER!r}\n"
+            "_brf_sys.modules[_brf_mod_name] = _brf_orig\n"
+        )
+    hook_call = (
+        f"_brf_v2_bridge.apply_plancache_hooks(globals(), {cache_rev!r})"
+        if mod_name == "plancache"
+        else f"_brf_v2_bridge.apply_{mod_name}_hooks(globals())"
+    )
+    return (
+        "import sys as _brf_sys\n"
+        f"import {V2_BRIDGE_MODULE}\n"
+        f"import {orig_mod} as _brf_orig\n"
+        "_brf_mod_name = __name__\n"
+        "globals().update(_brf_orig.__dict__)\n"
+        "globals()['__name__'] = _brf_mod_name\n"
+        f"{hook_call}\n"
+        "for _k, _v in list(globals().items()):\n"
+        "    if not _k.startswith('__'):\n"
+        "        setattr(_brf_orig, _k, _v)\n"
+        f"_brf_orig._earth_bridge_rail_fixes_patch = {MARKER!r}\n"
+        "_brf_sys.modules[_brf_mod_name] = _brf_orig\n"
+    )
+
+
+def _compile_server_payload(
+    payload_dir,
+    existing_filenames,
+    apply_fixes,
+    enable_reporter,
+    patch_tier=TIER_FULL_SOLVER,
+    solver_mode=SOLVER_MODE_DIRECT,
+):
     """Return {module_name: compressed_marshal_bytes} to replace/add in PYZ."""
     payload_server = Path(payload_dir) / "server"
     compiled = {}
-    if apply_fixes and patch_tier == TIER_FULL_SOLVER:
+    if apply_fixes and patch_tier == TIER_FULL_SOLVER and solver_mode == SOLVER_MODE_BRIDGED_V2:
+        cache_rev = _server_cache_rev(payload_dir)
+        bridge_path = payload_server / "bridge_rail_v2_bridge.py"
+        if not bridge_path.is_file():
+            raise PatchError("Packaged add-on payload is missing bridge_rail_v2_bridge.py")
+        bridge_code = compile(bridge_path.read_text(encoding="utf-8"), "bridge_rail_v2_bridge.py", "exec")
+        compiled[V2_BRIDGE_MODULE] = zlib.compress(marshal.dumps(bridge_code), 6)
+
+        rails_src_path = payload_server / "rails.py"
+        if not rails_src_path.is_file():
+            raise PatchError("Packaged add-on payload is missing rails.py")
+        rails_pay_code = compile(rails_src_path.read_text(encoding="utf-8"), "_brf_payload_rails.py", "exec")
+        compiled["_brf_payload_rails"] = zlib.compress(marshal.dumps(rails_pay_code), 6)
+
+        for mod in V2_FULL_OVERLAY_MODULES:
+            src_path = payload_server / f"{mod}.py"
+            if not src_path.is_file():
+                raise PatchError(f"Packaged add-on payload is missing {mod}.py")
+            overlay_src = _build_v2_overlay_src(mod, src_path.read_text(encoding="utf-8"))
+            code = compile(overlay_src, existing_filenames.get(mod, f"{mod}.py"), "exec")
+            compiled[mod] = zlib.compress(marshal.dumps(code), 6)
+
+        for mod in V2_HOOK_MODULES:
+            hook_src = _build_v2_hook_wrapper_src(mod, cache_rev)
+            code = compile(hook_src, existing_filenames.get(mod, f"{mod}.py"), "exec")
+            compiled[mod] = zlib.compress(marshal.dumps(code), 6)
+
+        ed_src = _build_tier2_earthd_wrapper_src(
+            enable_reporter=bool(enable_reporter),
+            patch_tier=TIER_FULL_SOLVER,
+            solver_mode=SOLVER_MODE_BRIDGED_V2,
+        )
+        ed_code = compile(ed_src, existing_filenames.get("earthd", "earthd.py"), "exec")
+        compiled["earthd"] = zlib.compress(marshal.dumps(ed_code), 6)
+    elif apply_fixes and patch_tier == TIER_FULL_SOLVER:
         cache_rev = _server_cache_rev(payload_dir)
         for mod in effective_server_modules(payload_dir):
             src_path = payload_server / f"{mod}.py"
@@ -805,14 +989,14 @@ def _read_pyz_toc(data):
     return offset, raw_toc, dict(raw_toc)
 
 
-def patch_pyz_with_tier(data, payload_dir, apply_fixes=True, enable_reporter=True, earth_version=""):
+def patch_pyz_with_tier_and_mode(data, payload_dir, apply_fixes=True, enable_reporter=True, earth_version=""):
     if len(data) < 12 or data[:4] != b"PYZ\x00" or data[4:8] != importlib.util.MAGIC_NUMBER:
         raise PatchError("Embedded Python version does not match; run setup through BeamNG.Earth's --run-addon")
     offset, raw_toc, toc = _read_pyz_toc(data)
     active_mods = effective_server_modules(payload_dir)
     validate_pyz_compatibility(toc, earth_version=earth_version, extra_modules=active_mods)
 
-    if ORIG_EARTHD_MODULE in toc or "bridge_rail_report" in toc:
+    if ORIG_EARTHD_MODULE in toc or "bridge_rail_report" in toc or V2_BRIDGE_MODULE in toc:
         raise PatchError("A Bridge & Rail patch is already present without a matching receipt")
 
     e_kind, e_pos, e_len = toc["earthd"]
@@ -822,12 +1006,27 @@ def patch_pyz_with_tier(data, payload_dir, apply_fixes=True, enable_reporter=Tru
     if "EARTH_BRIDGE_RAIL_FIXES_" in repr(earthd_code.co_consts):
         raise PatchError("A Bridge & Rail patch is already present without a matching receipt")
 
-    patch_tier = _detect_pyz_patch_tier(data, offset, toc, payload_dir=payload_dir, extra_modules=active_mods)
+    patch_tier, solver_mode = _detect_pyz_patch_tier_and_mode(
+        data, offset, toc, payload_dir=payload_dir, extra_modules=active_mods
+    )
     if not apply_fixes:
         patch_tier = TIER_CLIENT_AND_REPORTER
+        solver_mode = SOLVER_MODE_CLIENT_ONLY
 
     existing_filenames = {"earthd": earthd_code.co_filename}
-    if patch_tier == TIER_FULL_SOLVER:
+    if patch_tier == TIER_FULL_SOLVER and solver_mode == SOLVER_MODE_BRIDGED_V2:
+        _verify_earthd_dispatch_hook(earthd_code)
+        toc[ORIG_EARTHD_MODULE] = toc["earthd"]
+        for mod in V2_FULL_OVERLAY_MODULES + V2_HOOK_MODULES:
+            kind, pos, length = toc[mod]
+            if kind != 0 or pos < 12 or pos + length > offset:
+                raise PatchError(f"Unsupported PYZ entry layout for '{mod}'")
+            code = marshal.loads(zlib.decompress(data[pos:pos + length]))
+            if "EARTH_BRIDGE_RAIL_FIXES_" in repr(code.co_consts):
+                raise PatchError("A Bridge & Rail patch is already present without a matching receipt")
+            existing_filenames[mod] = code.co_filename
+            toc[f"_brf_orig_{mod}"] = toc[mod]
+    elif patch_tier == TIER_FULL_SOLVER:
         for mod in active_mods:
             kind, pos, length = toc[mod]
             if kind != 0 or pos < 12 or pos + length > offset:
@@ -841,7 +1040,12 @@ def patch_pyz_with_tier(data, payload_dir, apply_fixes=True, enable_reporter=Tru
         toc[ORIG_EARTHD_MODULE] = toc["earthd"]
 
     compiled = _compile_server_payload(
-        payload_dir, existing_filenames, apply_fixes, enable_reporter, patch_tier=patch_tier
+        payload_dir,
+        existing_filenames,
+        apply_fixes,
+        enable_reporter,
+        patch_tier=patch_tier,
+        solver_mode=solver_mode,
     )
     result = bytearray(data[:offset])
     cursor = offset
@@ -851,7 +1055,18 @@ def patch_pyz_with_tier(data, payload_dir, apply_fixes=True, enable_reporter=Tru
         cursor += len(blob)
     struct.pack_into("!i", result, 8, cursor)
     result.extend(marshal.dumps(list(toc.items()) if isinstance(raw_toc, list) else toc))
-    return bytes(result), patch_tier
+    return bytes(result), patch_tier, solver_mode
+
+
+def patch_pyz_with_tier(data, payload_dir, apply_fixes=True, enable_reporter=True, earth_version=""):
+    new_pz, patch_tier, _mode = patch_pyz_with_tier_and_mode(
+        data,
+        payload_dir,
+        apply_fixes=apply_fixes,
+        enable_reporter=enable_reporter,
+        earth_version=earth_version,
+    )
+    return new_pz, patch_tier
 
 
 def patch_pyz(data, payload_dir, apply_fixes=True, enable_reporter=True, earth_version=""):
@@ -973,7 +1188,7 @@ def _patch_executable_with_tier(data, payload_dir, apply_fixes=True, enable_repo
         return zlib.decompress(blob) if entry[4] else blob
 
     pz = _read_entry_raw(pyz_entry)
-    new_pz, patch_tier = patch_pyz_with_tier(
+    new_pz, patch_tier, solver_mode = patch_pyz_with_tier_and_mode(
         pz,
         payload_dir,
         apply_fixes=apply_fixes,
@@ -1032,11 +1247,11 @@ def _patch_executable_with_tier(data, payload_dir, apply_fixes=True, enable_repo
     result = bytearray(header[:start]) + new_body + new_toc + cookie
     struct.pack_into("<I", result, checksum_at, pe_checksum(result, checksum_at))
     archive_entries(result)
-    return bytes(result), signed, patch_tier
+    return bytes(result), signed, patch_tier, solver_mode
 
 
 def patch_executable(data, payload_dir, apply_fixes=True, enable_reporter=True):
-    patched_bytes, signed, _ = _patch_executable_with_tier(
+    patched_bytes, signed, _, _ = _patch_executable_with_tier(
         data, payload_dir, apply_fixes=apply_fixes, enable_reporter=enable_reporter
     )
     return patched_bytes, signed
@@ -1090,6 +1305,7 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
         after = backup.read_bytes()
         signed = previous.get("originalSigned", False)
         patch_tier = previous.get("patchTier", "")
+        solver_mode = previous.get("solverMode", "")
     else:
         pristine = before
         if previous and digest == previous.get("patchedSha"):
@@ -1114,7 +1330,7 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
         elif backup.exists() and (not previous or sha256_bytes(backup.read_bytes()) != previous.get("originalSha") or digest != previous.get("originalSha")):
             raise PatchError("Existing backup belongs to a different Earth build; it was preserved")
 
-        after, signed, patch_tier = _patch_executable_with_tier(
+        after, signed, patch_tier, solver_mode = _patch_executable_with_tier(
             pristine, payload_dir, apply_fixes=apply_fixes, enable_reporter=enable_reporter
         )
         if not backup.exists():
@@ -1135,6 +1351,7 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
         "version": VERSION,
         "mode": "exe",
         "patchTier": patch_tier,
+        "solverMode": solver_mode,
         "state": "pending",
         "operation": operation,
         "target": str(target),
@@ -1181,17 +1398,31 @@ def _read_pristine(root, rel):
     return (bpath if bpath.is_file() else Path(root) / rel).read_bytes()
 
 
-def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter, patch_tier=None):
+def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter, patch_tier=None, solver_mode=None):
     """Compute {rel_posix: bytes} desired in a source BeamNG.Earth checkout."""
     root = Path(root)
     payload_root = Path(payload_dir)
-    if patch_tier is None:
-        patch_tier = _detect_source_patch_tier(root, payload_dir=payload_dir)
+    if patch_tier is None or solver_mode is None:
+        det_tier, det_mode = _detect_source_patch_tier_and_mode(root, payload_dir=payload_dir)
+        patch_tier = patch_tier or det_tier
+        solver_mode = solver_mode or det_mode
     if not apply_fixes:
         patch_tier = TIER_CLIENT_AND_REPORTER
+        solver_mode = SOLVER_MODE_CLIENT_ONLY
     desired = {}
     if apply_fixes:
-        if patch_tier == TIER_FULL_SOLVER:
+        if patch_tier == TIER_FULL_SOLVER and solver_mode == SOLVER_MODE_BRIDGED_V2:
+            cache_rev = _server_cache_rev(payload_dir)
+            desired["server/_brf_v2_bridge.py"] = (payload_root / "server/bridge_rail_v2_bridge.py").read_bytes()
+            desired["server/_brf_payload_rails.py"] = (payload_root / "server/rails.py").read_bytes()
+            for mod in V2_FULL_OVERLAY_MODULES:
+                desired[f"server/_brf_orig_{mod}.py"] = _read_pristine(root, f"server/{mod}.py")
+                overlay_src = _build_v2_overlay_src(mod, (payload_root / f"server/{mod}.py").read_text(encoding="utf-8"))
+                desired[f"server/{mod}.py"] = overlay_src.encode("utf-8")
+            for mod in V2_HOOK_MODULES:
+                desired[f"server/_brf_orig_{mod}.py"] = _read_pristine(root, f"server/{mod}.py")
+                desired[f"server/{mod}.py"] = _build_v2_hook_wrapper_src(mod, cache_rev).encode("utf-8")
+        elif patch_tier == TIER_FULL_SOLVER:
             cache_rev = _server_cache_rev(payload_dir)
             for mod in effective_server_modules(payload_dir):
                 rel = f"server/{mod}.py"
@@ -1203,7 +1434,7 @@ def _build_source_plan(root, payload_dir, apply_fixes, enable_reporter, patch_ti
         desired[MOD_ROADS_LUA] = patch_roads_lua_bytes(_read_pristine(root, MOD_ROADS_LUA), fallback_bytes=fallback_roads)
     if enable_reporter:
         desired["server/bridge_rail_report.py"] = (payload_root / "server/bridge_rail_report.py").read_bytes()
-        if patch_tier != TIER_FULL_SOLVER:
+        if patch_tier != TIER_FULL_SOLVER or solver_mode == SOLVER_MODE_BRIDGED_V2:
             # Hook ONLY bridge_rail_report into untouched earthd.py cleanly.
             raw_earthd = _read_pristine(root, "server/earthd.py").decode("utf-8")
             anchor = '        elif kind == "terrain_patch":'
@@ -1290,9 +1521,10 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
         return record
 
     validate_source_compatibility(root, payload_dir=payload_dir)
-    patch_tier = _detect_source_patch_tier(root, payload_dir=payload_dir)
+    patch_tier, solver_mode = _detect_source_patch_tier_and_mode(root, payload_dir=payload_dir)
     if not apply_fixes:
         patch_tier = TIER_CLIENT_AND_REPORTER
+        solver_mode = SOLVER_MODE_CLIENT_ONLY
     if previous and previous.get("state") == "installed":
         # Re-install from verified original state when options changed, or return up-to-date.
         if (previous.get("payloadSha") == payload_sha
@@ -1303,7 +1535,7 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
                 for f in previous.get("files", [])
             )
             if all_match:
-                record = dict(previous, patchTier=patch_tier, state="installed", token=token, serverPid=server_pid,
+                record = dict(previous, patchTier=patch_tier, solverMode=solver_mode, state="installed", token=token, serverPid=server_pid,
                               message="Bridge & Rail fixes are already installed.")
                 atomic_json(sidecar, record)
                 atomic_json(status, record)
@@ -1313,7 +1545,7 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
             if not f.get("added") and not (backup_dir / f["rel"]).is_file():
                 raise PatchError(f"Missing original backup for {f['rel']}")
 
-    plan = _build_source_plan(root, payload_dir, apply_fixes, enable_reporter, patch_tier=patch_tier)
+    plan = _build_source_plan(root, payload_dir, apply_fixes, enable_reporter, patch_tier=patch_tier, solver_mode=solver_mode)
     _cleanup_stale_stage(state_dir, previous)
     backup_dir.mkdir(parents=True, exist_ok=True)
     stage_dir.mkdir(parents=True, exist_ok=True)
@@ -1349,7 +1581,7 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
             manifest.append({"rel": rel, "added": False, "originalSha": orig_sha, "patchedSha": new_sha})
 
     record = {
-        "version": VERSION, "mode": "source", "patchTier": patch_tier, "state": "pending", "operation": "install",
+        "version": VERSION, "mode": "source", "patchTier": patch_tier, "solverMode": solver_mode, "state": "pending", "operation": "install",
         "target": str(root), "config": str(config), "status": str(status), "sidecar": str(sidecar),
         "token": token, "serverPid": server_pid, "payloadSha": payload_sha,
         "applyFixes": bool(apply_fixes), "enableReporter": bool(enable_reporter),
@@ -1468,6 +1700,7 @@ def inspect_target(target):
         "hasBackup": False,
         "state": "unknown",
         "patchTier": "",
+        "solverMode": "",
         "missingModules": [],
         "signed": False,
     }
@@ -1524,7 +1757,7 @@ def inspect_target(target):
             roads_raw = (resolved / MOD_ROADS_LUA).read_bytes()
             if b"function M.collideNear" in roads_raw:
                 patch_roads_lua_bytes(roads_raw)
-            info["patchTier"] = _detect_source_patch_tier(resolved)
+            info["patchTier"], info["solverMode"] = _detect_source_patch_tier_and_mode(resolved)
         except PatchError as exc:
             info["reason"] = str(exc)
             info["state"] = "incompatible"
@@ -1613,10 +1846,13 @@ def inspect_target(target):
         roads_raw = zlib.decompress(roads_blob) if roads_entry[4] else roads_blob
         if b"function M.collideNear" in roads_raw:
             patch_roads_lua_bytes(roads_raw)
-        if info["patched"] and sidecar.get("patchTier") in (TIER_FULL_SOLVER, TIER_CLIENT_AND_REPORTER) and ORIG_EARTHD_MODULE not in toc and "bridge_rail_report" not in toc:
+        if info["patched"] and sidecar.get("patchTier") in (TIER_FULL_SOLVER, TIER_CLIENT_AND_REPORTER) and ORIG_EARTHD_MODULE not in toc and "bridge_rail_report" not in toc and V2_BRIDGE_MODULE not in toc:
             info["patchTier"] = sidecar["patchTier"]
+            info["solverMode"] = sidecar.get("solverMode") or (
+                SOLVER_MODE_DIRECT if sidecar["patchTier"] == TIER_FULL_SOLVER else SOLVER_MODE_CLIENT_ONLY
+            )
         else:
-            info["patchTier"] = _detect_pyz_patch_tier(pz, offset, toc)
+            info["patchTier"], info["solverMode"] = _detect_pyz_patch_tier_and_mode(pz, offset, toc)
     except (PatchError, zlib.error, UnicodeDecodeError) as exc:
         info["reason"] = str(exc)
         info["state"] = "incompatible"
