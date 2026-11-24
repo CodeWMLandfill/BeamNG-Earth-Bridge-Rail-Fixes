@@ -195,6 +195,7 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None, records=None)
     the cut railways.tile_mesh makes from the same records), none from the carriageways here."""
     import railways
     import roads
+    cells = list(cells)
     box = roads.tile_bbox(tx, ty)
     reach = max(t[0] for t in TRACK.values()) + MARGIN_M
     carriageways, motorways, town_ways, tracks, seen = {}, {}, {}, [], set()
@@ -298,6 +299,20 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None, records=None)
         return on_road(pts, eligible) | in_street(pts) | on_motorway(pts, pad)
 
     ballast, sleepers, rails = [], [], []
+    if any(wear == 2 and not kept for _k, _xy, _m, wear, kept in tracks):
+        trail_reach = float(railways.REACH_M)
+        trail_lines = railways._trail_ways(frame, cells, box, reach=trail_reach)
+        if trail_lines:
+            near_trail = (box[0] - trail_reach, box[1] - trail_reach, box[2] + trail_reach, box[3] + trail_reach)
+            all_ways = list(carriageways.values()) + list(motorways.values())
+            filtered_tracks = []
+            for kind, xy, meshed, wear, kept in tracks:
+                if wear == 2 and not kept:
+                    for piece in railways.suppress_rail_trail_line(xy, trail_lines, all_ways, near=near_trail):
+                        filtered_tracks.append((kind, piece, meshed, wear, kept))
+                else:
+                    filtered_tracks.append((kind, xy, meshed, wear, kept))
+            tracks = filtered_tracks
     todo = []
     for kind, xy, meshed, wear, kept in tracks:
         if fit and meshed and kind in ("rail", "narrow"):

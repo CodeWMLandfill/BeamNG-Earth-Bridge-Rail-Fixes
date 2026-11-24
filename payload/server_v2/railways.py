@@ -649,6 +649,8 @@ def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, 
     out = fast._ef.rail_parts_select(idx, cells, tuple(float(v) for v in near), roads.level_ranges, roads.ground_parts,
                                      wear_of, kept, gauges, TUNNELS_ON, RAIL_LIFECYCLE)
     lv_map = _match_bridge_levels(frame, cells, out)
+    if any(kind == "ground" and wear_of.get(fid) == 2 and fid not in kept for fid, _c, kind, _xy in out):
+        out = _suppress_collinear_rail_trails(frame, cells, box, reach, out, wear_of, kept, cut_ends)
     if any(kind == "ground" and wear_of.get(fid) for fid, _c, kind, _xy in out):
         mw_ways = motorway_crossings(frame, cells, box, reach)
         out = _cut_worn_at_motorways(out, wear_of, mw_ways, kept, cut_ends)
@@ -1572,6 +1574,204 @@ def _road_crossings(frame, cells, box, reach, worn):
     return out
 
 
+RAIL_TRAIL_CLASSES = frozenset({"cycleway", "footway", "path", "bridleway", "pedestrian", "steps"})
+RAIL_TRAIL_DIST_M = 6.5
+RAIL_TRAIL_MIN_COS = 0.85
+RAIL_TRAIL_MIN_SHARE = 0.40
+RAIL_TRAIL_CROSS_M = 35.0
+
+
+def _trail_ways(frame, cells, box, reach=REACH_M):
+    """[xy (k, 2)]: mapped non-motorized trail and path polylines near box for rail-trail collinearity checks."""
+    pad = max(float(reach), REACH_M) + RAIL_TRAIL_CROSS_M + RAIL_TRAIL_DIST_M
+    near = (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
+    trail_cls = tuple(sorted(RAIL_TRAIL_CLASSES))
+    seen, out = set(), []
+    for feats in cells:
+        if feats is None or len(feats) == 0 or "subtype" not in feats.attrs or "class" not in feats.attrs:
+            continue
+        mask = _is(feats.attrs["subtype"], ("road",)) & _is(feats.attrs["class"], trail_cls)
+        if not np.any(mask):
+            continue
+        mask = np.asarray(mask, bool) & ~np.asarray(roads.unbuilt_mask(feats), bool)
+        if not np.any(mask):
+            continue
+        for i in _box_hits(feats.boxes(frame), near, mask):
+            fid = str(feats.ids[i])
+            rings = [ring for part in feats.parts(i) for ring in part if len(ring) >= 2]
+            for xy in mapgeom.enu_rings(feats, frame, rings):
+                if len(xy) < 2:
+                    continue
+                key = (fid, round(float(xy[0, 0]), 1), round(float(xy[0, 1]), 1),
+                       round(float(xy[-1, 0]), 1), round(float(xy[-1, 1]), 1))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(np.ascontiguousarray(xy[:, :2], np.float64))
+    return out
+
+
+def _collinear_trail_mask(xy, trail_lines, max_dist=RAIL_TRAIL_DIST_M, min_cos=RAIL_TRAIL_MIN_COS):
+    """Bool mask over stations of xy within max_dist of a >= 1 m trail segment with |cos(theta)| >= min_cos."""
+    xy = np.asarray(xy, np.float64)[:, :2]
+    n = len(xy)
+    if n < 2 or not trail_lines:
+        return np.zeros(n, bool)
+    dxy = xy[1:] - xy[:-1]
+    seg_len = np.maximum(dnp.hypot(dxy[:, 0], dxy[:, 1]), 1e-9)
+    u_seg = dxy / seg_len[:, None]
+    u_fwd = np.vstack([u_seg, u_seg[-1:]])
+    u_bwd = np.vstack([u_seg[:1], u_seg])
+
+    x0, y0 = float(xy[:, 0].min()) - max_dist, float(xy[:, 1].min()) - max_dist
+    x1, y1 = float(xy[:, 0].max()) + max_dist, float(xy[:, 1].max()) + max_dist
+    seg_a, seg_b, seg_u = [], [], []
+    for ln in trail_lines:
+        ln = np.asarray(ln, np.float64)[:, :2]
+        if len(ln) < 2:
+            continue
+        if (float(ln[:, 0].max()) < x0 or float(ln[:, 0].min()) > x1
+                or float(ln[:, 1].max()) < y0 or float(ln[:, 1].min()) > y1):
+            continue
+        a, b = ln[:-1], ln[1:]
+        keep = ((np.maximum(a[:, 0], b[:, 0]) >= x0) & (np.minimum(a[:, 0], b[:, 0]) <= x1)
+                & (np.maximum(a[:, 1], b[:, 1]) >= y0) & (np.minimum(a[:, 1], b[:, 1]) <= y1))
+        if not np.any(keep):
+            continue
+        a, b = a[keep], b[keep]
+        ab = b - a
+        tl = dnp.hypot(ab[:, 0], ab[:, 1])
+        long_enough = tl >= 1.0
+        if not np.any(long_enough):
+            continue
+        a, b, ab, tl = a[long_enough], b[long_enough], ab[long_enough], tl[long_enough]
+        seg_a.append(a)
+        seg_b.append(b)
+        seg_u.append(ab / tl[:, None])
+    if not seg_a:
+        return np.zeros(n, bool)
+
+    sa_all = np.vstack(seg_a)
+    sb_all = np.vstack(seg_b)
+    su_all = np.vstack(seg_u)
+    sab_all = sb_all - sa_all
+    sab2_all = sab_all[:, 0] * sab_all[:, 0] + sab_all[:, 1] * sab_all[:, 1]
+
+    tx0 = float(min(sa_all[:, 0].min(), sb_all[:, 0].min())) - max_dist
+    ty0 = float(min(sa_all[:, 1].min(), sb_all[:, 1].min())) - max_dist
+    tx1 = float(max(sa_all[:, 0].max(), sb_all[:, 0].max())) + max_dist
+    ty1 = float(max(sa_all[:, 1].max(), sb_all[:, 1].max())) + max_dist
+    cand = np.flatnonzero((xy[:, 0] >= tx0) & (xy[:, 0] <= tx1) & (xy[:, 1] >= ty0) & (xy[:, 1] <= ty1))
+    if len(cand) == 0:
+        return np.zeros(n, bool)
+
+    pts = xy[cand]
+    uf = u_fwd[cand]
+    ub = u_bwd[cand]
+    hit_cand = np.zeros(len(cand), bool)
+    r2 = float(max_dist) * float(max_dist)
+    for k in range(0, len(sa_all), 256):
+        sa = sa_all[k:k + 256]
+        sab = sab_all[k:k + 256]
+        sab2 = sab2_all[k:k + 256]
+        stu = su_all[k:k + 256]
+        ap = pts[:, None, :] - sa[None, :, :]
+        t = np.clip((ap[..., 0] * sab[None, :, 0] + ap[..., 1] * sab[None, :, 1]) / sab2[None, :], 0.0, 1.0)
+        dx = ap[..., 0] - t * sab[None, :, 0]
+        dy = ap[..., 1] - t * sab[None, :, 1]
+        near_seg = dx * dx + dy * dy <= r2
+        if not np.any(near_seg):
+            continue
+        cf = np.abs(uf[:, None, 0] * stu[None, :, 0] + uf[:, None, 1] * stu[None, :, 1])
+        cb = np.abs(ub[:, None, 0] * stu[None, :, 0] + ub[:, None, 1] * stu[None, :, 1])
+        hit_cand |= np.any(near_seg & (np.maximum(cf, cb) >= min_cos), axis=1)
+
+    col = np.zeros(n, bool)
+    col[cand] = hit_cand
+    return col
+
+
+def suppress_rail_trail_line(xy, trail_lines, road_crossers=(), near=None, cut_ends=None):
+    """Suppress an abandoned ground rail polyline converted to a collinear separate-way trail (>= 40% station share in
+    near, or road-crossing spans within 35 m of a crossed road that carry collinear trail stations)."""
+    xy = np.asarray(xy, np.float64)[:, :2]
+    if len(xy) < 2 or not trail_lines:
+        return [xy]
+    seg_d = dnp.hypot(*np.diff(xy, axis=0).T)
+    pts = np.asarray(roads.densify(xy, STEP_M), np.float64)[:, :2] if float(np.max(seg_d)) > STEP_M * 1.5 else xy
+    col = _collinear_trail_mask(pts, trail_lines)
+    if not np.any(col):
+        return [xy]
+    if near is not None:
+        in_near = (pts[:, 0] >= near[0]) & (pts[:, 0] <= near[2]) & (pts[:, 1] >= near[1]) & (pts[:, 1] <= near[3])
+        scope = col[in_near] if np.any(in_near) else col
+    else:
+        scope = col
+    if float(np.mean(scope)) >= RAIL_TRAIL_MIN_SHARE:
+        return []
+    r_valid = [(np.asarray(ln, np.float64)[:, :2], float(hw)) for ln, hw in road_crossers if len(ln) >= 2]
+    if not r_valid:
+        return [xy]
+    r_lines = [ln for ln, _hw in r_valid]
+    s = _arc(pts)
+    cut = np.zeros(len(pts), bool)
+    for (r_ln, half), hits in zip(r_valid, roads._crossings_by([pts], r_lines)):
+        for _pi, arc, pt in hits:
+            near_xing = np.abs(s - float(arc)) <= RAIL_TRAIL_CROSS_M
+            if int(np.count_nonzero(col[near_xing])) < 3:
+                continue
+            j = int(np.clip(np.searchsorted(s, arc) - 1, 0, len(s) - 2))
+            t_vec = pts[j + 1] - pts[j]
+            r_vec = _unit_at(r_ln, np.asarray(pt, np.float64))
+            sin = abs(float(t_vec[0] * r_vec[1] - t_vec[1] * r_vec[0])) / max(float(dnp.hypot(*t_vec)), 1e-9)
+            win = max(RAIL_TRAIL_CROSS_M, half / max(sin, WORN_CUT_MIN_SIN) + WORN_CUT_M)
+            cut |= np.abs(s - float(arc)) <= win
+    if not np.any(cut):
+        return [xy]
+    pieces = []
+    for ri, rj in _runs(cut):
+        piece = np.ascontiguousarray(pts[ri:rj + 1], np.float64)
+        if float(_arc(piece)[-1]) < MIN_PART_M:
+            continue
+        if cut_ends is not None:
+            if ri > 0:
+                cut_ends.add(end_key(piece[0]))
+            if rj < len(pts) - 1:
+                cut_ends.add(end_key(piece[-1]))
+        pieces.append(piece)
+    return pieces
+
+
+def _suppress_collinear_rail_trails(frame, cells, box, reach, rails, wear_of, kept=frozenset(), cut_ends=None):
+    """Filter ground abandoned rail parts converted to separate-way trails while keeping bridges and standalone beds."""
+    trail_reach = max(float(reach), REACH_M)
+    trail_lines = _trail_ways(frame, cells, box, reach=trail_reach)
+    if not trail_lines:
+        return rails
+    near_trail = (box[0] - trail_reach, box[1] - trail_reach, box[2] + trail_reach, box[3] + trail_reach)
+    road_crossers = None
+    out = []
+    for fid, cls, kind, xy in rails:
+        if kind != "ground" or wear_of.get(fid, 0) != 2 or fid in kept:
+            out.append((fid, cls, kind, xy))
+            continue
+        if road_crossers is None:
+            seg_d = dnp.hypot(*np.diff(xy, axis=0).T) if len(xy) >= 2 else np.zeros(1)
+            pts_chk = (np.asarray(roads.densify(xy, STEP_M), np.float64)[:, :2]
+                       if len(xy) >= 2 and float(np.max(seg_d)) > STEP_M * 1.5 else xy)
+            col_chk = _collinear_trail_mask(pts_chk, trail_lines)
+            if np.any(col_chk):
+                in_n = ((pts_chk[:, 0] >= near_trail[0]) & (pts_chk[:, 0] <= near_trail[2])
+                        & (pts_chk[:, 1] >= near_trail[1]) & (pts_chk[:, 1] <= near_trail[3]))
+                sc = col_chk[in_n] if np.any(in_n) else col_chk
+                if float(np.mean(sc)) < RAIL_TRAIL_MIN_SHARE:
+                    road_crossers = crossings(frame, cells, box, reach=trail_reach)
+        for piece in suppress_rail_trail_line(xy, trail_lines, road_crossers or (), near=near_trail,
+                                              cut_ends=cut_ends):
+            out.append((fid, cls, kind, piece))
+    return out
+
+
 # GitHub #579: a road's sidewalks and kerbs stop where a railway crosses it at grade (the ballast runs across them)
 WALK_CLEAR_M = BALLAST_TOP_M + BALLAST_H * BALLAST_SLOPE    # m from the track's centre: the ballast's foot
 WALK_MIN_SIN = 0.3          # a track this square or more to a road crosses it (a parallel one beside it leaves it be)
@@ -1580,7 +1780,11 @@ WALK_MIN_SIN = 0.3          # a track this square or more to a road crosses it (
 def walk_cut_lines(frame, cells, box, reach=60.0):
     """[(xy (k, 2), half width)]: the drawn railway tracks on the ground near box (trams left out: street track, its
     sidewalks stay; Sweden's are rails.tram_lines), what a sidewalk crossing them stops at (roads.build_tile)."""
+    cells = list(cells)
     near = (box[0] - reach, box[1] - reach, box[2] + reach, box[3] + reach)
+    trail_reach = max(float(reach), REACH_M)
+    near_trail = (box[0] - trail_reach, box[1] - trail_reach, box[2] + trail_reach, box[3] + trail_reach)
+    trail_lines = road_crossers = None
     seen, out = set(), []
     for feats in cells:
         if feats is None or len(feats) == 0 or "subtype" not in feats.attrs:
@@ -1590,15 +1794,30 @@ def walk_cut_lines(frame, cells, box, reach=60.0):
             if fid in seen:
                 continue
             seen.add(fid)
-            if drawn(feats, i) is None:
+            got = drawn(feats, i)
+            if got is None:
                 continue
+            abandoned_plain = int(got[1]) == 2 and not (RAIL_LIFECYCLE and heritage(feats, i))
             for kind, rings in _pieces(feats, i):
                 if kind != "ground":
                     continue
                 for xy in mapgeom.enu_rings(feats, frame, rings):
-                    if len(xy) >= 2 and _box_hit((xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()),
-                                                 near):
-                        out.append((xy, WALK_CLEAR_M))
+                    if len(xy) < 2 or not _box_hit((xy[:, 0].min(), xy[:, 1].min(), xy[:, 0].max(), xy[:, 1].max()),
+                                                   near):
+                        continue
+                    if abandoned_plain:
+                        if trail_lines is None:
+                            trail_lines = _trail_ways(frame, cells, box, reach=trail_reach)
+                        if trail_lines:
+                            if road_crossers is None:
+                                road_crossers = crossings(frame, cells, box, reach=trail_reach)
+                            for piece in suppress_rail_trail_line(xy, trail_lines, road_crossers, near=near_trail):
+                                if len(piece) >= 2 and _box_hit(
+                                    (piece[:, 0].min(), piece[:, 1].min(), piece[:, 0].max(), piece[:, 1].max()), near
+                                ):
+                                    out.append((piece, WALK_CLEAR_M))
+                            continue
+                    out.append((xy, WALK_CLEAR_M))
     return out
 
 

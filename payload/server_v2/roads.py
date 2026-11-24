@@ -11471,8 +11471,9 @@ def _bound_hole_lateral(part_mask, xy, x0, y0, square, lat_cap):
 
 
 def _punch_open_mouth_throat(part_mask, u, xy, z, x0, y0, square, hw_lining, th, m0, m1):
-    """Punch elevated gravel/cliff mounds inside open portal collar throats [-3.5 m .. +throat] within hw_lining,
-    sparing flat approach surfaces (max(u_sq) <= z_end + 0.30)."""
+    """Punch elevated gravel/cliff squares inside open portal collar throats [-3.5 m .. +throat_in] within hw_lining
+    whose heights straddle the local bore opening [z_at + 0.25 .. z_at + th + TUNNEL_HOLE_MARGIN), sparing flat
+    approach ground and deep valleys far below suspended tubes."""
     n = u.shape[0]
     if n < 2 or len(xy) < 2 or (not m0 and not m1):
         return
@@ -11483,9 +11484,13 @@ def _punch_open_mouth_throat(part_mask, u, xy, z, x0, y0, square, hw_lining, th,
     p0s, p1s = xy[:-1], xy[1:]
     ab = p1s - p0s
     l2 = np.maximum((ab * ab).sum(1), 1e-12)
-    throat_in = min(max(LOW_HOLE_M + LOW_HOLE_STEP + float(square), 5.5), total)
+    throat_in = min(max(LOW_HOLE_M + LOW_HOLE_STEP + float(square), 24.0), total)
     throat_out = 3.5
     reach_m = hw_lining + max(throat_in, throat_out) + float(square)
+    z_arr = np.asarray(z, np.float64)
+    z_lo = float(np.min(z_arr))
+    z_hi = float(np.max(z_arr))
+    ceil_hi = z_hi + float(th) + TUNNEL_HOLE_MARGIN
     for is_open, p_end, p_nb, end0 in ((m0, xy[0], xy[1], True), (m1, xy[-1], xy[-2], False)):
         if not is_open:
             continue
@@ -11501,14 +11506,15 @@ def _punch_open_mouth_throat(part_mask, u, xy, z, x0, y0, square, hw_lining, th,
         iy1 = min(n - 2, int(dmath.ceil((float(p_end[1]) + reach_m - y0) / square)))
         if ix0 > ix1 or iy0 > iy1:
             continue
-        z_end = float(z[0] if end0 else z[-1])
-        z_ceil = z_end + float(th) + TUNNEL_HOLE_MARGIN
+        z_end = float(z_arr[0] if end0 else z_arr[-1])
         for iy_s in range(iy0, iy1 + 1):
             for ix_s in range(ix0, ix1 + 1):
                 if part_mask[iy_s, ix_s]:
                     continue
                 u_sq = u[iy_s:iy_s + 2, ix_s:ix_s + 2]
-                if float(np.max(u_sq)) <= z_end + 0.30 or float(np.min(u_sq)) >= z_ceil:
+                u_max = float(np.max(u_sq))
+                u_min = float(np.min(u_sq))
+                if u_max <= z_lo + 0.25 or u_min >= ceil_hi or u_min < z_lo - 4.0:
                     continue
                 hit_throat = False
                 for dy_c in (0.0, float(square)):
@@ -11519,8 +11525,10 @@ def _punch_open_mouth_throat(part_mask, u, xy, z, x0, y0, square, hw_lining, th,
                         s_ax = dv_x * float(t_in[0]) + dv_y * float(t_in[1])
                         if -throat_out <= s_ax <= 0.0:
                             if abs(dv_x * float(n_lat[0]) + dv_y * float(n_lat[1])) <= hw_lining:
-                                hit_throat = True
-                                break
+                                z_ceil_at = z_end + float(th) + TUNNEL_HOLE_MARGIN
+                                if u_max > z_end + 0.25 and z_end - 4.0 <= u_min < z_ceil_at:
+                                    hit_throat = True
+                                    break
                         elif 0.0 < s_ax <= throat_in:
                             t0 = ((px_c - p0s[:, 0]) * ab[:, 0] + (py_c - p0s[:, 1]) * ab[:, 1]) / l2
                             tc = np.clip(t0, 0.0, 1.0)
@@ -11532,8 +11540,11 @@ def _punch_open_mouth_throat(part_mask, u, xy, z, x0, y0, square, hw_lining, th,
                                 bs = float(s_xy[k_seg] + tc[k_seg] * (s_xy[k_seg + 1] - s_xy[k_seg]))
                                 s_mouth = bs if end0 else (total - bs)
                                 if s_mouth <= throat_in:
-                                    hit_throat = True
-                                    break
+                                    z_at = float(z_arr[k_seg] + tc[k_seg] * (z_arr[k_seg + 1] - z_arr[k_seg]))
+                                    z_ceil_at = z_at + float(th) + TUNNEL_HOLE_MARGIN
+                                    if u_max > z_at + 0.25 and z_at - 4.0 <= u_min < z_ceil_at:
+                                        hit_throat = True
+                                        break
                     if hit_throat:
                         break
                 if hit_throat:

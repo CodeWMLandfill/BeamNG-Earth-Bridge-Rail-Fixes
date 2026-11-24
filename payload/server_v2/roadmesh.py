@@ -3661,23 +3661,11 @@ def tunnel(chunks, origin, walls=()):
                     fitd, np.r_[mid[at], z[at]] - origin, ul, outv, sec, th, hw, STONE_UV_M if stone_p else CONCRETE_UV_M,
                     near, low), 2 if stone_p else 0, 2 if (low and stone_p) else 7)
                 if not low:
-                    bore_climb = 0.0
                     bore_len = float(dnp.hypot(*np.diff(mid, axis=0).T).sum()) if len(mid) >= 2 else 0.0
-                    if c.get("ground") is not None and len(c["ground"]) == len(c["n"]) and len(c["n"]) >= 2:
-                        cn2 = np.asarray(c["n"], np.float64)[:, :2]
-                        sc2 = np.r_[0.0, np.cumsum(dnp.hypot(*np.diff(cn2, axis=0).T))]
-                        if sc2[-1] > 1.0:
-                            s_from_p = sc2 if at == 0 else (sc2[-1] - sc2)[::-1]
-                            gr_from_p = np.asarray(c["ground"], np.float64)
-                            if at != 0:
-                                gr_from_p = gr_from_p[::-1]
-                            g3 = float(dnp.interp(min(3.5, float(s_from_p[-1])), s_from_p, gr_from_p)) - float(z[at])
-                            g9 = float(dnp.interp(min(9.5, float(s_from_p[-1])), s_from_p, gr_from_p)) - float(z[at])
-                            bore_climb = max(0.0, g9 - max(g3, 0.0))
                     nv = _portal_hill_skirt(
                         P, T, UV, M, nv, fitd, np.r_[mid[at], z[at]] - origin, ul, outv, th, hw,
                         2 if stone_p else 0, STONE_UV_M if stone_p else CONCRETE_UV_M,
-                        bore_climb=bore_climb, bore_len=bore_len,
+                        bore_len=bore_len,
                     )
                 if low and (cap_m is None or cap_m >= LOW_CAP_MIN):
                     # a low arch's top over its mouth (the terrain is cut away there): at the ground behind the
@@ -3836,16 +3824,16 @@ def _portal_hill_skirt(P, T, UV, M, nv, fitd, p0, ul, outv, th, hw, face_mat, fa
                 face_mat,
             )
 
-    # 2. Sloped rock/soil return hood extending >= 5.2 m (up to 7.5 m on deep bores) into hillside up to cliff rim
-    hill_mat = 6 if (st in (0, 2) or max_fg > th + 3.0 or bore_climb > 2.0) else 4
+    # 2. Sloped rock/soil return hood extending >= 5.2 m (up to 7.5 m on deep bores) into hillside up to cliff rim.
+    # gx already reflects ground elevation inside the portal face, so ramp linearly from h_brow to h_s2 without
+    # adding extra bore_climb (which double-counted hillside height and created skyward blocks above the brow).
+    hill_mat = 6 if (st in (0, 2) or max_fg > th + 3.0) else 4
     hill_uv = SCREE_UV_M if hill_mat == 6 else SOIL_UV_M
     s2_max = min(max(5.2, min(0.45 * max(bore_len - sb, 0.0), 7.5)), 7.5)
     s0_in, s1_in, s2_in = cop_in, 0.5 * (cop_in + s2_max), s2_max
-    climb_mid = 0.55 * bore_climb
-    climb_far = bore_climb + (0.65 if (max_fg > th + 2.5 or bore_climb > 1.5) else 0.25)
     h_s0 = h_brow.copy()
-    h_s1 = np.maximum(h_s0 + 0.20, gx + climb_mid + 0.45)
-    h_s2 = np.maximum(h_s1 + 0.15, gx + climb_far)
+    h_s2 = np.maximum(h_s0 + 0.25, gx + 0.45)
+    h_s1 = 0.5 * (h_s0 + h_s2)
     p_s0, p_s1, p_s2 = p_cop, _wpt(xs, s1_in, h_s1), _wpt(xs, s2_in, h_s2)
     out_up = [0.5 * outv[0], 0.5 * outv[1], 0.86]
     _emit_strip(p_s0, p_s1, np.c_[xs, np.full(nk, s0_in)] / hill_uv, np.c_[xs, np.full(nk, s1_in)] / hill_uv,
