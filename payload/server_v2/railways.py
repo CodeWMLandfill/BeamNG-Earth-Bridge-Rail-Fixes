@@ -648,6 +648,17 @@ def parts(frame, cells, box, reach=REACH_M, clip=False, worn=None, gauges=None, 
            for feats in cells]
     out = fast._ef.rail_parts_select(idx, cells, tuple(float(v) for v in near), roads.level_ranges, roads.ground_parts,
                                      wear_of, kept, gauges, TUNNELS_ON, RAIL_LIFECYCLE)
+    if wear_of:
+        for feats in cells:
+            if feats is None or not len(feats) or "subtype" not in feats.attrs:
+                continue
+            a = feats.attrs
+            if not any(k in a for k in _STILL_PRESENT_ATTRS):
+                continue
+            for i in _box_hits(feats.boxes(frame), near, _is(a["subtype"], ("rail",))):
+                fid = str(feats.ids[i])
+                if fid in wear_of and rails_still_present(feats, i):
+                    kept.add(fid)
     lv_map = _match_bridge_levels(frame, cells, out)
     if any(kind == "ground" and wear_of.get(fid) == 2 and fid not in kept for fid, _c, kind, _xy in out):
         out = _suppress_collinear_rail_trails(frame, cells, box, reach, out, wear_of, kept, cut_ends)
@@ -712,9 +723,9 @@ def _rail_index(feats, frame):
     xin = feats.xy_in(frame)
     a = feats.attrs
     cols = _drawn_cols(feats)
-    src = (xin, cols, a["subtype"], a.get("osm_usage"), a.get("osm_railway:preserved"), a.get("osm_gauge"), feats.ids,
-           feats.lonlat, feats.part_off, feats.ring_off, feats.coord_off, STEP_M, roads.MIN_PART, MIN_PART_M,
-           SHORT_TUNNEL_M)
+    src = (xin, cols, a["subtype"], a.get("osm_usage"), a.get("osm_railway:preserved"), a.get("osm_rails"),
+           a.get("osm_electrified"), a.get("osm_gauge"), feats.ids, feats.lonlat, feats.part_off, feats.ring_off,
+           feats.coord_off, STEP_M, roads.MIN_PART, MIN_PART_M, SHORT_TUNNEL_M)
     memos = feats.__dict__.setdefault("_rail_index", [])
     for got_src, got in memos:
         if len(got_src) == len(src) and all(x is y for x, y in zip(got_src, src)):
@@ -729,7 +740,7 @@ def _rail_index(feats, frame):
         np.asarray(xin, np.float64).reshape(-1, 2), np.asarray(feats.boxes(frame), np.float64).reshape(-1, 4)[rows],
         np.array([cls_of[i] for i in rl], np.int64), np.array([wear_at[i] for i in rl], np.int64),
         np.array([roads._feature_length_m(feats, i) for i in rl], np.float64), [str(ids[i]) for i in rl],
-        [heritage(feats, i) for i in rl], np.array([osm_gauge(feats, i) or np.nan for i in rl], np.float64),
+        [rails_still_present(feats, i) for i in rl], np.array([osm_gauge(feats, i) or np.nan for i in rl], np.float64),
         np.asarray(frame.origin, np.float64), np.asarray(frame.rot, np.float64), float(STEP_M),
         float(roads.MIN_PART), float(MIN_PART_M), float(SHORT_TUNNEL_M))
     memos.append((src, ix))
@@ -1425,6 +1436,21 @@ def drawn(feats, i, bridges=False):
     return None if k < 0 else (_DRAWN_CLASSES[k], w[i])
 
 
+def _osm_str(col, i):
+    if col is None:
+        return ""
+    v = col[i]
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return ""
+    s = str(v).strip().lower()
+    return "" if s in ("none", "nan") else s
+
+
+_NO_ELECTRIFIED = frozenset({"", "no", "abandoned", "disused", "razed", "dismantled"})
+_RAILS_PRESENT = frozenset({"yes", "true", "1"})
+_STILL_PRESENT_ATTRS = ("osm_usage", "osm_railway:preserved", "osm_rails", "osm_electrified")
+
+
 def heritage(feats, i):
     """A heritage line by OSM's tags (railtags.py): usage=tourism or railway:preserved=yes. A worn one of these (a
     preserved line tagged disused out of season, a museum line) keeps its level crossings with BNE_RAIL_LIFECYCLE: cut
@@ -1432,6 +1458,16 @@ def heritage(feats, i):
     u = feats.attrs.get("osm_usage")
     p = feats.attrs.get("osm_railway:preserved")
     return bool((u is not None and str(u[i] or "") == "tourism") or (p is not None and str(p[i] or "") == "yes"))
+
+
+def rails_still_present(feats, i):
+    """Whether OSM tags indicate physical rails remain in place (heritage/tourism/preserved, rails=yes, or active
+    electrification), even when the line is tagged disused or abandoned."""
+    if heritage(feats, i):
+        return True
+    if _osm_str(feats.attrs.get("osm_rails"), i) in _RAILS_PRESENT:
+        return True
+    return _osm_str(feats.attrs.get("osm_electrified"), i) not in _NO_ELECTRIFIED
 
 
 
@@ -1575,14 +1611,15 @@ def _road_crossings(frame, cells, box, reach, worn):
 
 
 RAIL_TRAIL_CLASSES = frozenset({"cycleway", "footway", "path", "bridleway", "pedestrian", "steps"})
-RAIL_TRAIL_DIST_M = 6.5
+RAIL_TRAIL_DIST_M = 4.5
 RAIL_TRAIL_MIN_COS = 0.85
 RAIL_TRAIL_MIN_SHARE = 0.40
 RAIL_TRAIL_CROSS_M = 35.0
+_SIDEWALK_SUBCLASSES = frozenset({"sidewalk", "crosswalk", "crossing"})
 
 
 def _trail_ways(frame, cells, box, reach=REACH_M):
-    """[xy (k, 2)]: mapped non-motorized trail and path polylines near box for rail-trail collinearity checks."""
+    """[xy (k, 2)]: mapped dedicated trail and cycleway polylines near box (sidewalks/crossings excluded)."""
     pad = max(float(reach), REACH_M) + RAIL_TRAIL_CROSS_M + RAIL_TRAIL_DIST_M
     near = (box[0] - pad, box[1] - pad, box[2] + pad, box[3] + pad)
     trail_cls = tuple(sorted(RAIL_TRAIL_CLASSES))
@@ -1596,7 +1633,14 @@ def _trail_ways(frame, cells, box, reach=REACH_M):
         mask = np.asarray(mask, bool) & ~np.asarray(roads.unbuilt_mask(feats), bool)
         if not np.any(mask):
             continue
+        subc_col = feats.attrs.get("subclass")
+        fw_col = feats.attrs.get("osm_footway")
+        subc_rules = feats.rules.get("subclass")
         for i in _box_hits(feats.boxes(frame), near, mask):
+            if (_osm_str(subc_col, i) in _SIDEWALK_SUBCLASSES
+                    or _osm_str(fw_col, i) in _SIDEWALK_SUBCLASSES
+                    or str(roads._rule_value(subc_rules, i) or "").strip().lower() in _SIDEWALK_SUBCLASSES):
+                continue
             fid = str(feats.ids[i])
             rings = [ring for part in feats.parts(i) for ring in part if len(ring) >= 2]
             for xy in mapgeom.enu_rings(feats, frame, rings):
@@ -1611,8 +1655,12 @@ def _trail_ways(frame, cells, box, reach=REACH_M):
     return out
 
 
-def _collinear_trail_mask(xy, trail_lines, max_dist=RAIL_TRAIL_DIST_M, min_cos=RAIL_TRAIL_MIN_COS):
+def _collinear_trail_mask(xy, trail_lines, max_dist=None, min_cos=None):
     """Bool mask over stations of xy within max_dist of a >= 1 m trail segment with |cos(theta)| >= min_cos."""
+    if max_dist is None:
+        max_dist = RAIL_TRAIL_DIST_M
+    if min_cos is None:
+        min_cos = RAIL_TRAIL_MIN_COS
     xy = np.asarray(xy, np.float64)[:, :2]
     n = len(xy)
     if n < 2 or not trail_lines:
@@ -1785,7 +1833,7 @@ def walk_cut_lines(frame, cells, box, reach=60.0):
     trail_reach = max(float(reach), REACH_M)
     near_trail = (box[0] - trail_reach, box[1] - trail_reach, box[2] + trail_reach, box[3] + trail_reach)
     trail_lines = road_crossers = None
-    seen, out = set(), []
+    seen, kept, out = set(), set(), []
     for feats in cells:
         if feats is None or len(feats) == 0 or "subtype" not in feats.attrs:
             continue
@@ -1797,7 +1845,9 @@ def walk_cut_lines(frame, cells, box, reach=60.0):
             got = drawn(feats, i)
             if got is None:
                 continue
-            abandoned_plain = int(got[1]) == 2 and not (RAIL_LIFECYCLE and heritage(feats, i))
+            if int(got[1]) and rails_still_present(feats, i):
+                kept.add(fid)
+            abandoned_plain = int(got[1]) == 2 and fid not in kept
             for kind, rings in _pieces(feats, i):
                 if kind != "ground":
                     continue

@@ -1,4 +1,4 @@
--- 1-hotkey silent bug reporter for BeamNG-Earth-Bridge-Rail-Fixes (Ctrl+Shift+B).
+-- 1-hotkey silent bug reporter for BeamNG.Earth - Bridge, Rail & Tunnel Fixes (Ctrl+Shift+B).
 -- Captures anonymized coordinates/telemetry + screenshot locally, notifies the patched earthd server
 -- to publish cleanly to the Cloudflare Worker collector, and flashes a subtle non-blocking toast.
 local M = {}
@@ -67,7 +67,7 @@ local function addonOptions()
 end
 
 local function sanitizeCategory(v)
-  if v == 'bridge' or v == 'rail' or v == 'road' or v == 'other' then return v end
+  if v == 'bridge' or v == 'rail' or v == 'tunnel' or v == 'road' or v == 'other' then return v end
   return 'bridge'
 end
 
@@ -680,7 +680,7 @@ function M.onUpdate()
     im.SetNextWindowPos(im.ImVec2(20, updY), im.Cond_Always)
     if im.Begin('##bngeBridgeRailUpdateToast', nil, noticeFlags) then
       local ut = updateToast
-      im.TextUnformatted(string.format('Bridge & Rail Fixes v%s available (installed: v%s)',
+      im.TextUnformatted(string.format('Bridge, Rail & Tunnel Fixes v%s available (installed: v%s)',
         ut.latestVersion, ut.currentVersion or M.ADDON_VERSION))
       if im.Button('Get Update') then
         if isAllowedReleaseUrl(ut.releaseUrl) then

@@ -1,4 +1,4 @@
-"""Asynchronous 1-hotkey silent bug report uploader for BeamNG-Earth-Bridge-Rail-Fixes."""
+"""Asynchronous 1-hotkey silent bug report uploader for BeamNG.Earth - Bridge, Rail & Tunnel Fixes."""
 import base64
 import io
 import json
@@ -35,7 +35,7 @@ MAX_RELEASE_JSON_BYTES = 65536
 ADDON_ID = "beamng-earth-bridge-rail-fixes"
 ADDON_VERSION = "0.4.0"
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
-ALLOWED_KINDS = ("bridge", "rail", "road", "other")
+ALLOWED_KINDS = ("bridge", "rail", "tunnel", "road", "other")
 BUNDLED_FIXED_REPORTS = {
     str(num): {
         "fixedIn": "0.2.0",
@@ -424,53 +424,57 @@ def upload_report(user_dir, msg, endpoint=DEFAULT_ENDPOINT, timeout_s=20.0, wait
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    try:
-        result = _post_json(payload)
-    except urllib.error.HTTPError as err:
-        body = err.read().decode("utf-8", errors="replace")[:300]
-        if (
-            err.code == 400
-            and "Unsupported top-level field" in body
-            and any(k in payload for k in ("loading_incomplete", "loading_reason", "experimentalFlags"))
-        ):
-            legacy = {
-                k: v
-                for k, v in payload.items()
-                if k not in ("loading_incomplete", "loading_reason", "experimentalFlags")
-            }
-            nearest = dict(legacy.get("nearest") or {})
-            if "loading_incomplete" in payload or "loading_reason" in payload:
-                loading_obj = dict(nearest.get("loading") or {}) if isinstance(nearest.get("loading"), dict) else {}
-                if "loading_incomplete" in payload:
-                    loading_obj["loading_incomplete"] = payload["loading_incomplete"]
-                if "loading_reason" in payload:
-                    loading_obj["loading_reason"] = payload["loading_reason"]
-                nearest["loading"] = loading_obj
-            if "experimentalFlags" in payload:
-                nearest["experimentalFlags"] = list(payload["experimentalFlags"])
-            legacy["nearest"] = _sanitize_value(nearest)
-            note = str(legacy.get("note") or "")
-            tags = []
-            if "loading_incomplete" in payload or "loading_reason" in payload:
-                tags.append(f"[loading_incomplete: {payload.get('loading_reason') or 'true'}]")
-            if "experimentalFlags" in payload:
-                tags.append(f"[experimentalFlags: {', '.join(payload['experimentalFlags'])}]")
-            for tag in tags:
-                if tag not in note:
-                    note = (f"{note} {tag}".strip() if note else tag)[:2000]
-            if note:
-                legacy["note"] = note
-            try:
-                result = _post_json(legacy)
-            except urllib.error.HTTPError as err2:
-                body2 = err2.read().decode("utf-8", errors="replace")[:300]
-                result = {"ok": False, "status": err2.code, "error": redact_paths(body2 or str(err2))}
-            except Exception as err2:
-                result = {"ok": False, "error": redact_paths(str(err2))}
-        else:
+    cur_payload = dict(payload)
+    result = None
+    for _attempt in range(3):
+        try:
+            result = _post_json(cur_payload)
+            break
+        except urllib.error.HTTPError as err:
+            body = err.read().decode("utf-8", errors="replace")[:300]
+            unsupported_field = "Unsupported top-level field" in body and any(
+                k in cur_payload for k in ("loading_incomplete", "loading_reason", "experimentalFlags")
+            )
+            unsupported_kind = cur_payload.get("kind") == "tunnel" and "kind" in body.lower()
+            if err.code == 400 and _attempt < 2 and (unsupported_field or unsupported_kind):
+                nxt = {
+                    k: v
+                    for k, v in cur_payload.items()
+                    if not (unsupported_field and k in ("loading_incomplete", "loading_reason", "experimentalFlags"))
+                }
+                nearest = dict(nxt.get("nearest") or {})
+                tags = []
+                if unsupported_field:
+                    if "loading_incomplete" in cur_payload or "loading_reason" in cur_payload:
+                        loading_obj = dict(nearest.get("loading") or {}) if isinstance(nearest.get("loading"), dict) else {}
+                        if "loading_incomplete" in cur_payload:
+                            loading_obj["loading_incomplete"] = cur_payload["loading_incomplete"]
+                        if "loading_reason" in cur_payload:
+                            loading_obj["loading_reason"] = cur_payload["loading_reason"]
+                        nearest["loading"] = loading_obj
+                        tags.append(f"[loading_incomplete: {cur_payload.get('loading_reason') or 'true'}]")
+                    if "experimentalFlags" in cur_payload:
+                        nearest["experimentalFlags"] = list(cur_payload["experimentalFlags"])
+                        tags.append(f"[experimentalFlags: {', '.join(cur_payload['experimentalFlags'])}]")
+                if unsupported_kind:
+                    nxt["kind"] = "other"
+                    nearest["originalKind"] = "tunnel"
+                    tags.append("[category: tunnel]")
+                if nearest:
+                    nxt["nearest"] = _sanitize_value(nearest)
+                note = str(nxt.get("note") or "")
+                for tag in tags:
+                    if tag not in note:
+                        note = (f"{note} {tag}".strip() if note else tag)[:2000]
+                if note:
+                    nxt["note"] = note
+                cur_payload = nxt
+                continue
             result = {"ok": False, "status": err.code, "error": redact_paths(body or str(err))}
-    except Exception as err:
-        result = {"ok": False, "error": redact_paths(str(err))}
+            break
+        except Exception as err:
+            result = {"ok": False, "error": redact_paths(str(err))}
+            break
 
     if report_dir is not None:
         try:

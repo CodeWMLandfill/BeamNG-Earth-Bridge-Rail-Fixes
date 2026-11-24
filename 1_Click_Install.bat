@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title BeamNG.Earth - Bridge and Rail Fixes (1-Click Install)
+title BeamNG.Earth - Bridge, Rail and Tunnel Fixes (1-Click Install)
 
 set "SCRIPT_DIR=%~dp0"
 set "SETUP_PY=%SCRIPT_DIR%tools\easy_setup.py"
@@ -9,7 +9,7 @@ if exist "%SETUP_PY%" goto :find_python
 
 echo.
 echo  ========================================================================
-echo   BeamNG.Earth - Bridge ^& Rail Fixes
+echo   BeamNG.Earth - Bridge, Rail ^& Tunnel Fixes
 echo  ========================================================================
 echo.
 echo   It looks like this file was opened directly inside a ZIP archive.
@@ -113,7 +113,7 @@ for %%F in (
 
 echo.
 echo  ========================================================================
-echo   BeamNG.Earth - Bridge ^& Rail Fixes (Setup Help)
+echo   BeamNG.Earth - Bridge, Rail ^& Tunnel Fixes (Setup Help)
 echo  ========================================================================
 echo.
 echo   Python was not found on this PC, and BeamNG.Earth.exe was not in

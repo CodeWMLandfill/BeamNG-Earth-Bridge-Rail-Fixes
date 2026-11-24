@@ -3,10 +3,10 @@
   "options": [
     {
       "key": "applyBridgeRailFixes",
-      "label": "Apply Bridge & Rail fixes",
+      "label": "Apply Bridge, Rail & Tunnel fixes",
       "type": "bool",
       "default": true,
-      "help": "Fixes bridges, piers, ramps, divided highways, railway crossings, and lane transitions. Click Save, click Start, then restart BeamNG.Earth."
+      "help": "Fixes bridges, piers, ramps, divided highways, railway crossings, tunnel portals, multi-bore tunnel clearance, and lane transitions. Click Save, click Start, then restart BeamNG.Earth."
     },
     {
       "key": "enableOneHotkeyReport",
@@ -27,14 +27,14 @@
       "label": "Notify when an add-on update is available",
       "type": "bool",
       "default": true,
-      "help": "Checks once at launch for a newer release of Bridge & Rail Fixes and shows a quiet corner notice."
+      "help": "Checks once at launch for a newer release of Bridge, Rail & Tunnel Fixes and shows a quiet corner notice."
     },
     {
       "key": "reportCategory",
       "label": "Spot report category",
       "type": "choice",
       "default": "bridge",
-      "choices": ["bridge", "rail", "road", "other"],
+      "choices": ["bridge", "rail", "tunnel", "road", "other"],
       "help": "Default category used when pressing Ctrl+Shift+B (takes effect right away without restarting)."
     },
     {

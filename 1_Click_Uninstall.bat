@@ -1,6 +1,6 @@
 @echo off
 setlocal EnableExtensions DisableDelayedExpansion
-title BeamNG.Earth - Bridge and Rail Fixes (1-Click Uninstall)
+title BeamNG.Earth - Bridge, Rail and Tunnel Fixes (1-Click Uninstall)
 
 set "SCRIPT_DIR=%~dp0"
 set "SETUP_PY=%SCRIPT_DIR%tools\easy_setup.py"
@@ -9,7 +9,7 @@ if exist "%SETUP_PY%" goto :find_python
 
 echo.
 echo  ========================================================================
-echo   BeamNG.Earth - Bridge ^& Rail Fixes (Uninstall)
+echo   BeamNG.Earth - Bridge, Rail ^& Tunnel Fixes (Uninstall)
 echo  ========================================================================
 echo.
 echo   It looks like this file was opened directly inside a ZIP archive.
@@ -113,7 +113,7 @@ for %%F in (
 
 echo.
 echo  ========================================================================
-echo   BeamNG.Earth - Bridge ^& Rail Fixes (Uninstall Help)
+echo   BeamNG.Earth - Bridge, Rail ^& Tunnel Fixes (Uninstall Help)
 echo  ========================================================================
 echo.
 echo   Could not find Python or BeamNG.Earth.exe automatically.
@@ -121,7 +121,7 @@ echo.
 echo   Easy ways to restore your original BeamNG.Earth:
 echo     - Move this extracted folder next to your BeamNG.Earth.exe and
 echo       double-click 1_Click_Uninstall.bat again, OR
-echo     - Inside BeamNG.Earth -^> Add-ons -^> Bridge ^& Rail Fixes -^> Options:
+echo     - Inside BeamNG.Earth -^> Add-ons -^> Bridge, Rail ^& Tunnel Fixes -^> Options:
 echo       choose "Restore original app", click Save, click Start, and
 echo       restart BeamNG.Earth.
 echo.

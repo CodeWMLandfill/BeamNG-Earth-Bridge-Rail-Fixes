@@ -1,8 +1,8 @@
-# BeamNG.Earth - Bridge & Rail Fixes
+# BeamNG.Earth - Bridge, Rail & Tunnel Fixes
 
-Fixes broken bridges, ramps, piers, divided highways, railway crossings, and lane transitions in **BeamNG.Earth**, and includes an optional **`Ctrl+Shift+B`** hotkey to flag bad spots while driving without pausing.
+Fixes broken bridges, ramps, piers, divided highways, railway crossings, tunnel portals, multi-bore tunnel clearance, and lane transitions in **BeamNG.Earth**, and includes an optional **`Ctrl+Shift+B`** hotkey to flag bad spots while driving without pausing.
 
-> **Work in Progress - Accelerated by Community Reports:** This add-on **does not fix every bridge and railway in the game**. Because **BeamNG.Earth** generates roads and bridges across the entire world, this project is an active work in progress that is **accelerated by community bug reporting**. When you run into a broken bridge, overpass, or railway crossing, press **`Ctrl+Shift+B`** while driving to report it so that structural pattern can be fixed in future updates.
+> **Work in Progress - Accelerated by Community Reports:** This add-on **does not fix every bridge, railway, and tunnel in the game**. Because **BeamNG.Earth** generates roads, bridges, railways, and tunnels across the entire world, this project is an active work in progress that is **accelerated by community bug reporting**. When you run into a broken bridge, overpass, railway crossing, or tunnel portal, press **`Ctrl+Shift+B`** while driving to report it so that structural pattern can be fixed in future updates.
 
 ## Global Feature & Archetype Completion Metrics
 
@@ -36,6 +36,9 @@ Keeps elevated bridge decks and lane markings continuous across cross-streets an
 
 ![Before and after comparison of twin highway overpass decks and lane markings](docs/images/comparison_3_overpass_grade.png)
 
+### Railways, Tunnel Portals & Multi-Bore Clearance
+Preserves physically present heritage, electrified, and active railway tracks while suppressing converted collinear rail-trails across highways; seals open-mouth tunnel portal hoods, caps scree skirts below natural hillside lines, punches deep multi-bore portal throats cleanly, and prevents staggered or curved neighboring bores from clipping into adjacent driving lanes.
+
 ## Install - Option 1 (1-Click ZIP)
 
 1. Click the green **Code** button above -> **Download ZIP** (or [download the ZIP directly](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/archive/refs/heads/main.zip)).
@@ -58,7 +61,7 @@ Keeps elevated bridge decks and lane markings continuous across cross-streets an
 
 ## Report a Bad Spot (`Ctrl+Shift+B`)
 
-Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screenshot and map location without pausing the game. When a spot you reported is fixed in a later update, a quiet one-time corner notice lets you open the report or teleport straight there. You can change the default category (`bridge`, `rail`, `road`, `other`), turn fix notices off, or disable the hotkey in **Add-ons -> Options**.
+Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screenshot and map location without pausing the game. When a spot you reported is fixed in a later update, a quiet one-time corner notice lets you open the report or teleport straight there. You can change the default category (`bridge`, `rail`, `tunnel`, `road`, `other`), turn fix notices off, or disable the hotkey in **Add-ons -> Options**.
 
 ## Privacy
 

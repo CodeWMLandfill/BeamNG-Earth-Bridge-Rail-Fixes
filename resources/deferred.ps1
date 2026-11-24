@@ -58,7 +58,7 @@ function Show-Popup($message, $title, $icon = 'Information') {
 
 function Show-ReadyNotice($rec) {
     if ($rec.notify -and -not $rec.skipReadyNotice) {
-        Show-Popup 'Bridge & Rail Fixes are staged and ready. Close BeamNG.Earth completely, wait a few seconds, then launch BeamNG.Earth normally.' 'Bridge & Rail Fixes - restart required'
+        Show-Popup 'Bridge, Rail & Tunnel Fixes are staged and ready. Close BeamNG.Earth completely, wait a few seconds, then launch BeamNG.Earth normally.' 'Bridge, Rail & Tunnel Fixes - restart required'
     }
 }
 
@@ -180,7 +180,7 @@ try {
         $record.message = 'Original BeamNG.Earth restored. Start BeamNG.Earth normally.'
     } else {
         $record.state = 'installed'
-        $record.message = 'Bridge & Rail fixes installed. Start BeamNG.Earth normally.'
+        $record.message = 'Bridge, Rail & Tunnel fixes installed. Start BeamNG.Earth normally.'
     }
     Save-Record $record
 
@@ -204,7 +204,7 @@ try {
     }
 
     if ($record.completionNotice) {
-        Show-Popup $record.completionNotice 'Bridge & Rail Fixes'
+        Show-Popup $record.completionNotice 'Bridge, Rail & Tunnel Fixes'
     }
 } catch {
     if ($record) {
@@ -212,7 +212,7 @@ try {
         $record.message = $_.Exception.Message
         Save-Record $record
         if ($record.notify -and $record.skipReadyNotice) {
-            Show-Popup $_.Exception.Message 'Bridge & Rail Fixes - setup error' 'Error'
+            Show-Popup $_.Exception.Message 'Bridge, Rail & Tunnel Fixes - setup error' 'Error'
         }
     }
 }

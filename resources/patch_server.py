@@ -44,6 +44,7 @@ V2_FULL_OVERLAY_MODULES = (
     "grading",
     "guardrails",
     "plancache",
+    "portals",
     "railprofile",
     "rails",
     "railways",
@@ -151,8 +152,8 @@ REPORT_ACTION_DEF = {
     "order": 93,
     "ctx": "tlua",
     "onDown": "if beamngEarth_bugreport then beamngEarth_bugreport.captureSilent() end",
-    "title": "BeamNG.Earth: quick bridge/rail bug report",
-    "desc": "Silently captures a screenshot and telemetry and sends a report to the Bridge & Rail fix queue (Ctrl+Shift+B).",
+    "title": "BeamNG.Earth: quick bridge/rail/tunnel bug report",
+    "desc": "Silently captures a screenshot and telemetry and sends a report to the Bridge, Rail & Tunnel fix queue (Ctrl+Shift+B).",
 }
 REPORT_BINDING = {"control": "ctrl shift b", "action": REPORT_ACTION_KEY}
 REPORT_MODSCRIPT_LINE = "setExtensionUnloadMode('beamngEarth_bugreport', 'manual')"
@@ -1342,7 +1343,7 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
                 record = dict(
                     previous,
                     state="installed",
-                    message="Bridge & Rail fixes are installed. Restart BeamNG.Earth if you changed options.",
+                    message="Bridge, Rail & Tunnel fixes are installed. Restart BeamNG.Earth if you changed options.",
                     token=token,
                     serverPid=server_pid,
                 )
@@ -1397,7 +1398,7 @@ def _prepare_exe(target, config, status, payload_dir, operation, token, server_p
         "token": token,
         "serverPid": server_pid,
         "message": (
-            "Bridge & Rail patch ready. Close BeamNG.Earth completely, then start it normally."
+            "Bridge, Rail & Tunnel patch ready. Close BeamNG.Earth completely, then start it normally."
             if operation == "install"
             else "Restore ready. Close BeamNG.Earth completely, then start it normally."
         ),
@@ -1578,7 +1579,7 @@ def _prepare_source(root, config, status, payload_dir, operation, token, server_
             )
             if all_match:
                 record = dict(previous, patchTier=patch_tier, solverMode=solver_mode, state="installed", token=token, serverPid=server_pid,
-                              message="Bridge & Rail fixes are already installed.")
+                              message="Bridge, Rail & Tunnel fixes are already installed.")
                 atomic_json(sidecar, record)
                 atomic_json(status, record)
                 return record
@@ -1715,7 +1716,7 @@ def apply_now(record):
         record,
         state="installed" if record["operation"] == "install" else "restored",
         message=(
-            "Bridge & Rail fixes installed."
+            "Bridge, Rail & Tunnel fixes installed."
             if record["operation"] == "install"
             else "Original BeamNG.Earth restored."
         ),

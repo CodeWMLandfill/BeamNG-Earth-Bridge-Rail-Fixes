@@ -1,5 +1,5 @@
 /**
- * BeamNG.Earth Anonymous Issue & Bridge Report Collector (Cloudflare Worker).
+ * BeamNG.Earth Anonymous Bridge, Rail & Tunnel Report Collector (Cloudflare Worker).
  *
  * Pure ES module with zero npm or Node-specific dependencies. Compatible with
  * Cloudflare Workers runtime and Node.js >= 20 (`node --test`).
@@ -27,7 +27,7 @@ const DEFAULT_RATE_LIMIT_MAX = 6;
 const DEFAULT_RATE_LIMIT_WINDOW_SEC = 60;
 const MAX_TRACKED_IPS = 4096;
 
-const ALLOWED_KINDS = new Set(["bridge", "rail", "road", "other"]);
+const ALLOWED_KINDS = new Set(["bridge", "rail", "tunnel", "road", "other"]);
 const ALLOWED_TOP_LEVEL_KEYS = new Set([
   "lat",
   "lon",

@@ -3,9 +3,19 @@
 ## v0.4.0
 
 ### Highlights
-- Support **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` solver mode, `PLANS_FORMAT = 55`) and **v1.10.1-beta.dev.574** (`earthfast 621`, native `server_v2` dual solver payload, `13` full-overlay modules, `PLANS_FORMAT = 78`) in `full_solver` mode, while routing intermediate (`dev.567`) and unknown future ABIs safely to `client_and_reporter` (`client_only`) mode.
+- Expand official add-on scope and branding to **BeamNG.Earth - Bridge, Rail & Tunnel Fixes** (`v0.4.0`), adding **`tunnel`** to `Ctrl+Shift+B` spot-report categories (`bridge`, `rail`, `tunnel`, `road`, `other`) while keeping all option keys, state folders, and `beamng_earth_bridge_rail_fixes.py` asset filenames backward-compatible.
+- Ship a **dual-payload `full_solver` architecture** supporting **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` solver mode, `PLANS_FORMAT = 55`) and **v1.10.1-beta.dev.574** (`earthfast 621`, native `server_v2` overlay across `14` solver modules, `PLANS_FORMAT = 78`), while routing intermediate (`dev.567`) and unknown future ABIs safely to `client_and_reporter` (`client_only`) mode.
 - Update surgical `roads.lua` patching (`createWalk_railcol`) so both `v1.10.1-beta` and `v1.10.1-beta.dev.574+` (`M.isCliffCollider(q.what)`) layouts patch cleanly and idempotently.
-- Merge Wave 5 and `dev.574` bridge, corridor, tunnel, and railway solver improvements: tall-abutment head-slope soffit grading, sustained parallel link-to-mainline deck pairing, buried-deck footprint excavation, cross-cell divided carriageway continuity, terrain step-ribbon trimming, continuous portal floor decks, capped portal scree skirts, 24 m open-mouth throat hole punching, collinear rail-trail suppression, and graded railway bridge underpass clearance with motorway sleeper exclusion (`railways`, `railprofile`, `rails`, `grading`, `roadmesh`, `roads`).
+
+### Bridges, Ramps & Divided Corridors
+- Smooth tall-abutment head-slope soffits, pair sustained parallel link-to-mainline decks, excavate buried-deck footprints, preserve cross-cell divided carriageway continuity, and trim terrain step-ribbons along split bridge approaches (`grading`, `carriageways`, `roads`, `roadmesh`, `bridgetypes`).
+
+### Railways & Crossings
+- Enforce graded railway bridge underpass clearance and motorway sleeper exclusion (`railways`, `railprofile`, `rails`).
+- Suppress phantom steel rails and crossings on ground abandoned railway beds converted into collinear bikeways/trails while preserving all physically present tracks (`heritage`, `osm_rails=yes`, active `osm_electrified`, and tracks running beside street sidewalks).
+
+### Tunnels, Portals & Multi-Bore Clearance
+- Seal open-mouth portal collars and continuous portal floor decks, cap hillside portal scree skirts below natural ground/headwall lines, punch 24 m open-mouth portal throats across steep terrain cells, and prevent staggered or curved neighboring bores from clipping headwalls, wingwalls, or seam bulkheads into adjacent driving lanes (`portals`, `roadmesh`, `roads`, `tunnellids`).
 
 ## v0.3.1
 

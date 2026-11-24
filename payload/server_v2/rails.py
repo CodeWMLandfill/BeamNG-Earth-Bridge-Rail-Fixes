@@ -230,7 +230,7 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None, records=None)
                     continue
             elif kind is None:
                 continue
-            kept = bool(meshed and wear and railways.RAIL_LIFECYCLE and railways.heritage(feats, i))
+            kept = bool(meshed and wear and railways.rails_still_present(feats, i))
             for part in roads.ground_parts(feats, i):
                 xy = _enu(frame, np.asarray(part, np.float64))
                 if len(xy) < 2 or not _near(xy, box, reach + 20.0):

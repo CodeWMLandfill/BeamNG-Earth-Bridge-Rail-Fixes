@@ -1,4 +1,4 @@
-"""1-Click Install & Uninstall helper for BeamNG.Earth Bridge & Rail Fixes.
+"""1-Click Install & Uninstall helper for BeamNG.Earth - Bridge, Rail & Tunnel Fixes.
 
 Pure Python standard library only. Provides automatic BeamNG.Earth (.exe and
 source tree) + BeamNG.drive user-folder discovery, compatibility pre-checks,
@@ -32,7 +32,7 @@ if str(RESOURCES_DIR) not in sys.path:
 
 import patch_server  # noqa: E402
 
-APP_TITLE = "BeamNG.Earth - Bridge & Rail Fixes"
+APP_TITLE = "BeamNG.Earth - Bridge, Rail & Tunnel Fixes"
 STATE_FOLDER_NAME = "BeamNG-Earth-Bridge-Rail-Fixes"
 RECEIPT_FILENAME = "install_receipt.json"
 LAST_TARGET_FILENAME = "last_target.txt"
@@ -892,7 +892,7 @@ def perform_install(
                 installReceipt=str(receipt_path),
                 lastTargetFile=str(last_target_path),
                 completionNotice=(
-                    "Bridge & Rail Fixes installed! Press Ctrl+Shift+B anytime in game to report a broken bridge or rail."
+                    "Bridge, Rail & Tunnel Fixes installed! Press Ctrl+Shift+B anytime in game to report a broken bridge, rail, or tunnel."
                     if notify_on_defer
                     else ""
                 ),
@@ -1340,7 +1340,7 @@ def run_interactive(action, args, ui=None):
     relaunch_after = bool(args.relaunch)
 
     if running_pids:
-        verb = "install Bridge & Rail Fixes" if action == "install" else "restore original BeamNG.Earth"
+        verb = "install Bridge, Rail & Tunnel Fixes" if action == "install" else "restore original BeamNG.Earth"
         ok = ui.ask_yes_no(
             f"BeamNG.Earth is currently open.\n\n"
             f"Close BeamNG.Earth automatically now, {verb}, and start it again when finished?",
@@ -1354,7 +1354,7 @@ def run_interactive(action, args, ui=None):
             relaunch_after = True
 
     if action == "install":
-        ui.say("Applying Bridge & Rail Fixes and verifying SHA-256 backups...")
+        ui.say("Applying Bridge, Rail & Tunnel Fixes and verifying SHA-256 backups...")
         result = perform_install(
             target,
             state_root=state_root,
@@ -1369,10 +1369,10 @@ def run_interactive(action, args, ui=None):
             return 0
         synced_n = len(result.get("syncedUserDirs") or ())
         msg = (
-            f"Success! Bridge & Rail Fixes is now installed.\n\n"
+            f"Success! Bridge, Rail & Tunnel Fixes is now installed.\n\n"
             f"Target: {target}\n"
             + (f"Synced BeamNG.drive mod folder(s): {synced_n}\n" if synced_n else "")
-            + "\nIn-game hotkey: Press Ctrl+Shift+B anytime while driving to silently report a broken bridge, rail, or road.\n"
+            + "\nIn-game hotkey: Press Ctrl+Shift+B anytime while driving to silently report a broken bridge, rail, tunnel, or road.\n"
             + ("BeamNG.Earth is starting up now." if relaunch_after else "You can now start BeamNG.Earth normally.")
         )
         ui.info(msg)
@@ -1404,13 +1404,13 @@ def run_interactive(action, args, ui=None):
     ui.info(
         f"Original BeamNG.Earth has been restored cleanly!\n\n"
         f"Restored: {target}\n"
-        f"All Bridge & Rail Fixes mod overrides, backups, and receipts have been removed."
+        f"All Bridge, Rail & Tunnel Fixes mod overrides, backups, and receipts have been removed."
     )
     return 0
 
 
 def build_arg_parser():
-    parser = argparse.ArgumentParser(description="1-Click Install & Uninstall for BeamNG.Earth Bridge & Rail Fixes.")
+    parser = argparse.ArgumentParser(description="1-Click Install & Uninstall for BeamNG.Earth - Bridge, Rail & Tunnel Fixes.")
     parser.add_argument("action", nargs="?", choices=("install", "uninstall", "auto"), default="auto")
     parser.add_argument("--uninstall", action="store_true", help="Restore original BeamNG.Earth and remove overrides")
     parser.add_argument("--target", type=Path, help="Explicit path to BeamNG.Earth.exe or source folder")
@@ -1439,7 +1439,7 @@ def main(argv=None):
         receipt = read_json_safe(state_root / RECEIPT_FILENAME, {})
         if receipt.get("state") == "installed" and not args.yes:
             uninstall_now = ui.ask_yes_no(
-                "Bridge & Rail Fixes is already installed.\n\n"
+                "Bridge, Rail & Tunnel Fixes is already installed.\n\n"
                 "Click Yes to UNINSTALL and restore original BeamNG.Earth, or No to RE-INSTALL / repair.",
                 default=True,
             )
