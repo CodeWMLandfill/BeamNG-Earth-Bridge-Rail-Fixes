@@ -3,8 +3,9 @@
 ## v0.4.0
 
 ### Highlights
-- Support **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta.dev.567** (`earthfast 607` / `v2host`) in full solver mode (`full_solver`, via `direct` mode up to `v1.10.1-beta` and `bridged_v2` runtime hooks on `dev.567`), while retaining automatic `client_and_reporter` fallback for future unknown ABIs (`PLANS_FORMAT = 55`).
-- Merge Wave 5 bridge, corridor, tunnel, and railway solver improvements: tall-abutment head-slope soffit grading, sustained parallel link-to-mainline deck pairing, buried-deck footprint excavation, cross-cell divided carriageway continuity, terrain step-ribbon trimming, split twin-tunnel headroom compensation, and graded railway bridge underpass clearance with motorway sleeper exclusion (`railways`, `railprofile`, `rails`, `grading`, `roadmesh`, `roads`).
+- Support **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` solver mode, `PLANS_FORMAT = 55`) and **v1.10.1-beta.dev.574** (`earthfast 621`, native `server_v2` dual solver payload, `13` full-overlay modules, `PLANS_FORMAT = 77`) in `full_solver` mode, while routing intermediate (`dev.567`) and unknown future ABIs safely to `client_and_reporter` (`client_only`) mode.
+- Update surgical `roads.lua` patching (`createWalk_railcol`) so both `v1.10.1-beta` and `v1.10.1-beta.dev.574+` (`M.isCliffCollider(q.what)`) layouts patch cleanly and idempotently.
+- Merge Wave 5 and `dev.574` bridge, corridor, tunnel, and railway solver improvements: tall-abutment head-slope soffit grading, sustained parallel link-to-mainline deck pairing, buried-deck footprint excavation, cross-cell divided carriageway continuity, terrain step-ribbon trimming, continuous portal floor decks and collar sealing, and graded railway bridge underpass clearance with motorway sleeper exclusion (`railways`, `railprofile`, `rails`, `grading`, `roadmesh`, `roads`).
 
 ## v0.3.1
 
