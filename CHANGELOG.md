@@ -6,6 +6,7 @@
 - Expand official add-on scope and branding to **BeamNG.Earth - Bridge, Rail & Tunnel Fixes** (`v0.4.0`), adding **`tunnel`** to `Ctrl+Shift+B` spot-report categories (`bridge`, `rail`, `tunnel`, `road`, `other`) while keeping all option keys, state folders, and `beamng_earth_bridge_rail_fixes.py` asset filenames backward-compatible.
 - Ship a **dual-payload `full_solver` architecture** supporting **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` solver mode, `PLANS_FORMAT = 55`) and **v1.10.1-beta.dev.574** (`earthfast 621`, native `server_v2` overlay across `14` solver modules, `PLANS_FORMAT = 78`), while routing intermediate (`dev.567`) and unknown future ABIs safely to `client_and_reporter` (`client_only`) mode.
 - Update surgical `roads.lua` patching (`createWalk_railcol`) so both `v1.10.1-beta` and `v1.10.1-beta.dev.574+` (`M.isCliffCollider(q.what)`) layouts patch cleanly and idempotently.
+- Harden symmetric add-on stacking and shared telemetry collector coexistence so **Bridge, Rail & Tunnel Fixes** (`Ctrl+Shift+B`) and **Traffic and AutoDrive fixes** (`Ctrl+Shift+T`) install, run, and restore cleanly side-by-side in either order.
 
 ### Bridges, Ramps & Divided Corridors
 - Smooth tall-abutment head-slope soffits, pair sustained parallel link-to-mainline decks, excavate buried-deck footprints, preserve cross-cell divided carriageway continuity, and trim terrain step-ribbons along split bridge approaches (`grading`, `carriageways`, `roads`, `roadmesh`, `bridgetypes`).

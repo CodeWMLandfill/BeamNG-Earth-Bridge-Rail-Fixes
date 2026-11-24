@@ -73,7 +73,7 @@ LOOK_SIDE = {0: 2.2, 1: FACE_SIDE, 2: 2.0, 3: FACE_SIDE}    # m of headwall besi
 
 
 def _others(roads, cells, frame, parts):
-    """fast.Others of the roads a mouth's walls keep off: the ground roads and the tunnel parts round the tile."""
+    """fast.Others of the roads a mouth's walls keep off: (idx, half_w, xy, road_id, is_tunnel_part)."""
     import mapgeom
     lines = []
     for feats in cells:
@@ -87,14 +87,15 @@ def _others(roads, cells, frame, parts):
                 e, n = mapgeom.enu_xy(feats, frame, ring)
                 xy = np.c_[e, n]
                 if len(xy) >= 2:
-                    lines.append((len(lines), sp.width / 2, xy))
+                    lines.append((len(lines), sp.width / 2, xy, None, False))
     import roadmesh
-    for _fid, spec, xy, _z, _lon in parts:
+    for fid, spec, xy, _z, _lon in parts:
         xy = np.asarray(xy, np.float64)[:, :2]
         if len(xy) >= 2:
             # (a twin bore's tube and its collar, not only its carriageway: the two headwalls stopped on each other's
             # roads and overlapped by the shoulders between)
-            lines.append((len(lines), spec.width / 2 + roadmesh.TUNNEL_SHOULDER + TWIN_GAP, xy))
+            lines.append((len(lines), spec.width / 2 + roadmesh.TUNNEL_SHOULDER + TWIN_GAP, xy,
+                          roads._tunnel_road(fid), True))
     return lines
 
 
@@ -108,11 +109,14 @@ def _crossing(xy, p, t):
     return abs(float(u[0] * t[0] + u[1] * t[1])) < 0.7071
 
 
-def _through(lines, p, reach):
-    """The indices of the lines passing within reach of p: the mouth's own carriageways (the tunnel's parts, its
-    approach, a twin's two roads): not kept off."""
+def _through(lines, p, reach, own_roads=None):
+    """The indices of the lines passing within reach of p: the mouth's own carriageways (not separate parallel or
+    staggered tunnel bores when own_roads is given): not kept off."""
     own = set()
-    for k, _hw, xy in lines:
+    for row in lines:
+        k, _hw, xy = row[0], row[1], row[2]
+        if own_roads is not None and len(row) >= 5 and row[4] and row[3] not in own_roads:
+            continue
         a, b = xy[:-1], xy[1:]
         d = b - a
         t = np.clip(((p - a) * d).sum(1) / np.maximum((d * d).sum(1), 1e-12), 0.0, 1.0)
@@ -152,31 +156,36 @@ def fit(roads, tunnels, cells, chunks, parts):
             p = xy[at]
             if others is None:
                 others = _others(roads, cells, tunnels.frame, parts)
-            own = _through(others, p, hw)
-            oth = fast.Others([ln for ln in others if ln[0] not in own])
+            fid_c = c.get("fid")
+            own_roads = ({roads._tunnel_road(fid_c)} | set(c.get("twin_roads") or ())) if fid_c is not None else None
+            own = _through(others, p, hw, own_roads=own_roads)
+            oth = fast.Others([ln[:3] for ln in others if ln[0] not in own])
+            oth_tun = fast.Others([ln[:3] for ln in others if ln[0] not in own and len(ln) >= 5 and ln[4]])
             sides = []
-            for sg in (1.0, -1.0):          # how far the headwall reaches before another road
+            wing_ok = []
+            ws = np.asarray(WING_S, np.float64)
+            for sg in (1.0, -1.0):          # how far the headwall reaches before another road or parallel bore
                 reach = FACE_SIDE
-                for dd in np.arange(FACE_STEP, FACE_SIDE + 1e-9, FACE_STEP):
-                    if not oth.clear(p + ul * sg * (hw + dd), None, ROAD_GAP):
-                        reach = max(float(dd) - FACE_STEP, FACE_SIDE_MIN)
+                blocked_by_tun = False
+                for dd in np.arange(0.0, FACE_SIDE + 1e-9, FACE_STEP):
+                    q_probe = p + ul * sg * (hw + dd)
+                    if not oth.clear(q_probe, None, ROAD_GAP):
+                        blocked_by_tun = not oth_tun.clear(q_probe, None, ROAD_GAP)
+                        reach = max(float(dd) - FACE_STEP, 0.0 if blocked_by_tun else FACE_SIDE_MIN)
                         break
                 sides.append(reach)
-            fx = np.array([-(hw + v) for v in FACE_X[::-1]] + [-0.5 * hw, 0.0, 0.5 * hw] + [hw + v for v in FACE_X])
-            look = None
-            ws = np.asarray(WING_S, np.float64)
-            wing_ok = []
-            for sg, reach in zip((1.0, -1.0), sides):
-                ok = reach >= FACE_SIDE - 1e-9
+                ok = (reach >= FACE_SIDE - 1e-9) and not blocked_by_tun
                 if ok:
                     lp = [p + ul * sg * (hw + reach + 0.5) + out * s for s in ws]
                     ok = all(oth.clear(q, None, ROAD_GAP) for q in lp)
                 wing_ok.append(ok)
+            fx = np.array([-(hw + v) for v in FACE_X[::-1]] + [-0.5 * hw, 0.0, 0.5 * hw] + [hw + v for v in FACE_X])
+            look = None
             # (ROAD_OVER_ON: which of the headwall's ground samples lie on another road's carriageway, a road crossing
             # over the mouth among them: one through it at more than 45 degrees to the tube, not its own approach)
             over = None
             if ROAD_OVER_ON:
-                cross = fast.Others([ln for ln in others if ln[0] not in own or _crossing(ln[2], p, t)])
+                cross = fast.Others([ln[:3] for ln in others if ln[0] not in own or _crossing(ln[2], p, t)])
                 over = np.array([[not cross.clear(p + ul * x - out * s_in, None, 0.0) for x in fx]
                                  for s_in in WALL_IN + FACE_IN], bool)
             ends.append({"p": p, "ul": ul, "out": out, "fx": fx, "sides": sides, "wing_ok": wing_ok, "at": at,

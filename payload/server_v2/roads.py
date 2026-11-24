@@ -12894,7 +12894,10 @@ def twin_tunnels(parts):
             reach = (sa.width + sb.width) / 2 + 2 * roadmesh.TUNNEL_SHOULDER + 1.0      # their tubes would overlap
             d, q = _line_near(P, xb)
             near = d < reach
-            if near.mean() < TWIN_SHARE:
+            if not (bool(near[0]) and bool(near[-1]) and float(near.mean()) >= 0.95):
+                continue
+            db_ends, _ = _line_near(np.asarray([xb[0], xb[-1]], np.float64), xa)
+            if float(db_ends.max()) >= reach:
                 continue
             tb = np.r_[0.0, np.cumsum(dnp.hypot(*np.diff(xb, axis=0).T))]
             _, qb = _line_near(q, xb)           # (q on xb: its floor by the arc to it)
@@ -12903,10 +12906,34 @@ def twin_tunnels(parts):
             zq = dnp.interp(sb_at, tb, np.asarray(zb, np.float64))
             if np.abs(Z[near] - zq[near]).max() > TWIN_DZ_M:
                 continue
+            conflict3 = False
+            med_a, med_b = float(np.median(Z)), float(np.median(zq[near]))
+            for m, (fm, sm, xm, zm, _) in enumerate(parts):
+                if m in (i, j) or len(xm) < 2:
+                    continue
+                if _tunnel_road(fm) in (_tunnel_road(fa), _tunnel_road(fb)):
+                    continue
+                xm_arr = np.asarray(xm, np.float64)
+                zm_arr = np.asarray(zm, np.float64)
+                if not np.isfinite(zm_arr).all():
+                    continue
+                med_m = float(np.median(zm_arr))
+                rm = max(sa.width, sb.width) / 2.0 + float(sm.width) / 2.0 + 2.0 * roadmesh.TUNNEL_SHOULDER + 1.0
+                if abs(med_a - med_m) <= roadmesh.TUNNEL_H + 1.0:
+                    dm_a, _ = _line_near(P, xm_arr)
+                    if (dm_a < rm).any():
+                        conflict3 = True
+                        break
+                if abs(med_b - med_m) <= roadmesh.TUNNEL_H + 1.0:
+                    dm_b, _ = _line_near(xb, xm_arr)
+                    if (dm_b < rm).any():
+                        conflict3 = True
+                        break
+            if conflict3:
+                continue
             mid = np.c_[(P + q) / 2, (Z + zq) / 2]
-            k0, k1 = int(np.flatnonzero(near)[0]), int(np.flatnonzero(near)[-1])     # (where they run side by side)
             width = float(np.median(d[near])) + (sa.width + sb.width) / 2
-            out.append((i, j, mid[k0:k1 + 1], width))
+            out.append((i, j, mid, width))
             taken.update((i, j))
             break
     return out
@@ -12945,6 +12972,41 @@ def _part_tunnel_h(tunnels, fid):
     if getattr(tunnels, "height", None) is not None:
         return float(tunnels.height(fid))
     return float(roadmesh.TUNNEL_H)
+
+
+def _lipschitz_inward(vals, ds, max_slope=0.20):
+    """Clamp vals along arc steps ds so |dv|/ds <= max_slope while never exceeding input vals (inward-safe)."""
+    out = np.asarray(vals, np.float64).copy()
+    k = len(out)
+    if k < 2:
+        return out
+    for idx in range(1, k):
+        step = max_slope * float(ds[idx - 1])
+        if out[idx] > out[idx - 1] + step:
+            out[idx] = out[idx - 1] + step
+    for idx in range(k - 2, -1, -1):
+        step = max_slope * float(ds[idx])
+        if out[idx] > out[idx + 1] + step:
+            out[idx] = out[idx + 1] + step
+    return out
+
+
+def _trim_flag_runs(flags):
+    """Split contiguous edge intervals 0..K-1 into (a, b, is_trim) runs whenever the trim mask changes."""
+    k = len(flags)
+    if k < 2:
+        return []
+    ed = flags[:-1] | flags[1:]
+    runs = []
+    i = 0
+    while i < k - 1:
+        tr = bool(ed[i])
+        j = i + 1
+        while j < k - 1 and bool(ed[j]) == tr:
+            j += 1
+        runs.append((i, j, tr))
+        i = j
+    return runs
 
 
 def _seam_trim_runs(wall_l, wall_r, deck_l, deck_r, half_n, full_wall):
@@ -13039,6 +13101,11 @@ def _make_part_jobs(n, parts, twin_pairs, twinned, tunnels, layouts):
     deck_r = np.full(K, half_n, np.float64)
     wall_l = np.full(K, full_wall, np.float64)
     wall_r = np.full(K, full_wall, np.float64)
+    exp_l = np.full(K, full_wall, np.float64)
+    exp_r = np.full(K, full_wall, np.float64)
+    shared_l = np.zeros(K, bool)
+    shared_r = np.zeros(K, bool)
+    no_tube_m = np.zeros(K, bool)
     P_xy, P_z = P[:, :2], P[:, 2]
 
     for fid_m, spec_m, xy_m, z_m in cands:
@@ -13050,31 +13117,69 @@ def _make_part_jobs(n, parts, twin_pairs, twinned, tunnels, layouts):
         par = np.abs((T_n * T_q).sum(1)) >= 0.70
         L_seam = 0.5 * (d + half_n - half_m) - 0.05
         L_other = 0.5 * (d + half_m - half_n) - 0.05
-        hit = (d < reach) & z_ov & par & (L_seam >= max(0.35 * half_n, 0.5)) & (L_other >= max(0.35 * half_m, 0.5))
+        lat = ((q - P_xy) * U_n).sum(1)
+        n_walk = spec.cls in WALK_TUNNEL_CLASSES
+        m_walk = spec_m.cls in WALK_TUNNEL_CLASSES
+        if n_walk != m_walk:
+            shared = (d < reach) & z_ov & par & (d < half_n + half_m + 0.25)
+            if shared.any():
+                if n_walk:
+                    no_tube_m |= shared
+                else:
+                    req_w = np.abs(lat) + half_m + roadmesh.TUNNEL_SHOULDER
+                    sl_sh = shared & (lat > 0.0)
+                    sr_sh = shared & (lat < 0.0)
+                    if sl_sh.any():
+                        shared_l |= sl_sh
+                        exp_l = np.where(sl_sh, np.maximum(exp_l, req_w), exp_l)
+                    if sr_sh.any():
+                        shared_r |= sr_sh
+                        exp_r = np.where(sr_sh, np.maximum(exp_r, req_w), exp_r)
+        else:
+            shared = np.zeros(K, bool)
+        hit = (d < reach) & z_ov & par & ~shared & (L_seam >= max(0.35 * half_n, 0.5)) & (L_other >= max(0.35 * half_m, 0.5))
         if not hit.any():
             continue
-        lat = ((q - P_xy) * U_n).sum(1)
         left_hit = hit & (lat > 0.0)
         right_hit = hit & (lat < 0.0)
-        trim_deck = (
-            (spec.cls not in WALK_TUNNEL_CLASSES and spec_m.cls not in WALK_TUNNEL_CLASSES)
-            or (d < max(half_n, half_m))
-        )
+        if not n_walk and not m_walk:
+            trim_deck = np.ones(K, bool)
+        elif n_walk and not m_walk:
+            trim_deck = d < max(half_n, half_m)
+        else:
+            trim_deck = np.zeros(K, bool)
+        L_wall = L_seam
+        if not n_walk and m_walk:
+            L_wall = np.maximum(L_seam, half_n)
+        elif n_walk and not m_walk:
+            L_wall = np.maximum(np.minimum(L_seam, d - np.maximum(L_other, half_m) - 0.10), max(0.35 * half_n, 0.5))
         if left_hit.any():
-            wall_l = np.where(left_hit, np.minimum(wall_l, L_seam), wall_l)
+            wall_l = np.where(left_hit, np.minimum(wall_l, L_wall), wall_l)
             deck_l = np.where(left_hit & trim_deck, np.minimum(deck_l, L_seam), deck_l)
         if right_hit.any():
-            wall_r = np.where(right_hit, np.minimum(wall_r, L_seam), wall_r)
+            wall_r = np.where(right_hit, np.minimum(wall_r, L_wall), wall_r)
             deck_r = np.where(right_hit & trim_deck, np.minimum(deck_r, L_seam), deck_r)
 
-    runs = _seam_trim_runs(wall_l, wall_r, deck_l, deck_r, half_n, full_wall)
-    if not any(t for _, _, t in runs):
+    any_w = bool((wall_l < full_wall - 0.05).any() or (wall_r < full_wall - 0.05).any()
+                 or shared_l.any() or shared_r.any() or no_tube_m.any())
+    any_d = bool((deck_l < half_n - 0.05).any() or (deck_r < half_n - 0.05).any())
+    if not any_w and not any_d:
         return [(fid, (pts[0, :2], pts[-1, :2]), floor_lines(spec, spec.width, pts, in_twin), spec, full_len, base_meta)]
+
+    ds = dnp.hypot(*np.diff(P_xy, axis=0).T)
+    wall_l_in = _lipschitz_inward(wall_l, ds, 0.20)
+    wall_r_in = _lipschitz_inward(wall_r, ds, 0.20)
+    exp_l = -_lipschitz_inward(-exp_l, ds, 0.20)
+    exp_r = -_lipschitz_inward(-exp_r, ds, 0.20)
+    wall_l = np.where(shared_l, exp_l, wall_l_in)
+    wall_r = np.where(shared_r, exp_r, wall_r_in)
+    deck_l = _lipschitz_inward(deck_l, ds, 0.20)
+    deck_r = _lipschitz_inward(deck_r, ds, 0.20)
 
     jobs = []
     last_k = K - 1
-    full_w = np.full(K, full_wall, np.float64)
-    deck_runs = _seam_trim_runs(full_w, full_w, deck_l, deck_r, half_n, full_wall)
+    dtrim_mask = (deck_l < half_n - 0.02) | (deck_r < half_n - 0.02)
+    deck_runs = _trim_flag_runs(dtrim_mask) if dtrim_mask.any() else [(0, last_k, False)]
     for a, b, is_dtrim in deck_runs:
         seg = P[a:b + 1]
         dmeta = (
@@ -13087,27 +13192,47 @@ def _make_part_jobs(n, parts, twin_pairs, twinned, tunnels, layouts):
             has_up,
             has_cap,
         )
-        if not is_dtrim:
+        if not is_dtrim or look_d is None:
             dlines = floor_lines(spec, spec.width, seg, True)
             if dlines:
                 jobs.append((fid, (seg[0, :2], seg[-1, :2]), dlines, spec, full_len, dmeta))
             continue
-        dl = float(deck_l[a:b + 1].min())
-        dr = float(deck_r[a:b + 1].min())
-        w_deck = round(dl + dr, 3)
+        dl_s = deck_l[a:b + 1]
+        dr_s = deck_r[a:b + 1]
+        w_arr = dl_s + dr_s
+        w_max = round(float(np.max(w_arr)), 3)
+        w_min = round(float(np.min(w_arr)), 3)
         pts_deck = seg.copy()
-        pts_deck[:, :2] += U_n[a:b + 1] * (0.5 * (dl - dr))
-        sp_deck = spec._replace(width=w_deck)
-        dlines = floor_lines(sp_deck, w_deck, pts_deck, True)
+        pts_deck[:, :2] += U_n[a:b + 1] * (0.5 * (dl_s - dr_s))[:, None]
+        sp_deck = spec._replace(width=w_min)
+        dlines = [({**look_d, "deck": True, "tunnel": True, "no_tube": True, "var_width": True},
+                   w_max, np.c_[pts_deck, w_arr])]
+        dlines.extend(_part_extras_lines(sp_deck, pts_deck, lon, layouts, fid))
         if dlines:
             jobs.append((fid, (pts_deck[0, :2], pts_deck[-1, :2]), dlines, spec, full_len, dmeta))
 
     if in_twin:
         return jobs
 
-    for a, b, is_trim in runs:
+    shared_any = shared_l | shared_r
+    if no_tube_m.any():
+        tube_runs = _trim_flag_runs(no_tube_m)
+        skip_shared = True
+    elif shared_any.any():
+        tube_runs = _trim_flag_runs(shared_any)
+        skip_shared = False
+    else:
+        tube_runs = [(0, last_k, False)]
+        skip_shared = False
+    for a, b, is_shared in tube_runs:
+        if skip_shared and is_shared:
+            continue
         seg = P[a:b + 1]
-        pmeta = (
+        wl_seg = (np.where(shared_l[a:b + 1], wall_l[a:b + 1], exp_l[a:b + 1])
+                  if (is_shared and not skip_shared and shared_l[a:b + 1].any()) else wall_l[a:b + 1])
+        wr_seg = (np.where(shared_r[a:b + 1], wall_r[a:b + 1], exp_r[a:b + 1])
+                  if (is_shared and not skip_shared and shared_r[a:b + 1].any()) else wall_r[a:b + 1])
+        tmeta = (
             m0 if a == 0 else False,
             m1 if b == last_k else False,
             u0 if a == 0 else None,
@@ -13117,23 +13242,9 @@ def _make_part_jobs(n, parts, twin_pairs, twinned, tunnels, layouts):
             has_up,
             has_cap,
         )
-        if not is_trim:
-            tlines = [({**TUNNEL, "tunnel": True, "tube_only": True}, spec.width, seg)]
-            jobs.append((fid, (seg[0, :2], seg[-1, :2]), tlines, spec, full_len, pmeta))
-            continue
-
-        dl = float(deck_l[a:b + 1].min())
-        dr = float(deck_r[a:b + 1].min())
-        wl = float(wall_l[a:b + 1].min())
-        wr = float(wall_r[a:b + 1].min())
-        w_tube = wl + wr - 2.0 * roadmesh.TUNNEL_SHOULDER
-        if w_tube >= 0.4:
-            pts_tube = seg.copy()
-            pts_tube[:, :2] += U_n[a:b + 1] * (0.5 * (wl - wr))
-            strim = [bool(wl < full_wall - 0.05 or dl < half_n - 0.05),
-                     bool(wr < full_wall - 0.05 or dr < half_n - 0.05)]
-            tlines = [({**TUNNEL, "tunnel": True, "tube_only": True, "seam_trim": strim}, round(w_tube, 3), pts_tube)]
-            jobs.append((fid, (pts_tube[0, :2], pts_tube[-1, :2]), tlines, spec, full_len, pmeta))
+        tlines = [({**TUNNEL, "tunnel": True, "tube_only": True, "var_wall": True},
+                   spec.width, np.c_[seg, wl_seg, wr_seg])]
+        jobs.append((fid, (seg[0, :2], seg[-1, :2]), tlines, spec, full_len, tmeta))
     return jobs
 
 
@@ -13181,7 +13292,8 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
             ln0 = float(dnp.hypot(*np.diff(mid[:, :2], axis=0).T).sum())
             has_th = getattr(tunnels, "height", None) is not None
             th_tw = _twin_tube_height(parts, i, j, mid, tunnels.height) if has_th else None
-            tw_look = {**TUNNEL, "tunnel": True, "tube_only": True}
+            tw_look = {**TUNNEL, "tunnel": True, "tube_only": True,
+                       "twin_roads": [_tunnel_road(parts[i][0]), _tunnel_road(parts[j][0])]}
             if th_tw is not None:
                 tw_look["tunnel_h_override"] = th_tw
             jobs.append((f0, (mid[0, :2], mid[-1, :2]),
@@ -13196,7 +13308,7 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
             if look.get("tunnel") and getattr(tunnels, "frame", None) is not None:
                 # Whole sections, in a global datum: neighbouring tiles deduplicate them; anchor rebases and
                 # geotile pivots cannot put the water exclusion at a different height from its mesh.
-                q = simplify(np.asarray(line, np.float64), ztol=.1)
+                q = simplify(np.asarray(line, np.float64)[:, :3], ztol=.1)
                 import geotiles
                 la, lo, h = geotiles.world_to_geodetic(tunnels.frame, q)
                 nodes = np.c_[np.round(la, 8), np.round(lo, 8), np.round(h, 3)].tolist()
@@ -13204,12 +13316,18 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
                 identity = hashlib.sha1(json.dumps([nodes, w, height], separators=(",", ":")).encode()).hexdigest()[:16]
                 guard = {"id": f"{fid}:{identity}", "r": w / 2 + roadmesh.TUNNEL_SHOULDER + 1.,
                          "h": height, "nodes": nodes}
+            is_var = bool(look.get("var_width") or look.get("var_wall"))
             for piece in clip_polyline(line, *exact):
-                for c in split(densify(simplify(piece, ztol=SIMPLIFY_Z_M))):
+                raw_pieces = split(densify(piece)) if is_var else split(densify(simplify(piece, ztol=SIMPLIFY_Z_M)))
+                for c in raw_pieces:
                     if len(c) >= 2:
-                        ch = _chunk(look, w, c)
+                        ch = _chunk(look, w, c[:, :3])
                         ch["fixed"] = True
                         ch["fid"] = fid
+                        if look.get("var_width") and c.shape[1] >= 4:
+                            ch["ws"] = [round(float(val), 3) for val in c[:, 3]]
+                        if look.get("var_wall") and c.shape[1] >= 5:
+                            ch["wall_lr"] = [[round(float(wl_v), 3), round(float(wr_v), 3)] for wl_v, wr_v in c[:, 3:5]]
                         if look.get("tunnel"):
                             if guard is not None:
                                 ch["waterguard"] = guard
@@ -13221,6 +13339,8 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
                             for flag in ("no_tube", "tube_only"):
                                 if look.get(flag):
                                     ch[flag] = True
+                            if look.get("twin_roads"):
+                                ch["twin_roads"] = list(look["twin_roads"])
                             if look.get("seam_trim"):
                                 ch["seam_trim"] = list(look["seam_trim"])
                             if th_ov is not None:

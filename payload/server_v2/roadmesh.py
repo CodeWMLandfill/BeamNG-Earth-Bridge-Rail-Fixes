@@ -2455,8 +2455,9 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     cov_ctx = [(r, c) for r, c in zip(cr, context)] + _ground_carriageways(list(chunks) + list(ground))
     covered = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
     medians = _median_gaps([(r, c) for r, c in rb],
-                           [(r, c) for r, c in zip(ribbons(list(context)), context) if r[5] is not None],
-                           skip={n for n, (_r, c) in enumerate(rb) if c.get("rch")})
+                           [(r, c) for r, c in zip(ribbons(list(context)), context)
+                            if r[5] is not None and not c.get("tunnel")],
+                           skip={n for n, (_r, c) in enumerate(rb) if c.get("rch") or c.get("tunnel")})
     tops = {}               # slab depth -> the indices of its pieces' tops in P (_slabs_from_tops)
     for n, ((left, right, v, m, layer, z), c) in enumerate(rb):
         active_field = junctions.get(c.get('fid'))
@@ -3031,6 +3032,10 @@ def _slab_reach(c, v, med, sl, sr, wide, left, right):
         f = np.asarray(rc["f"], np.int64)[j]
         ml, mr = sl > 0, sr > 0         # (over an exit's union: no median there, _sheet_medians)
         return (rl, rr, (f & 1 > 0) & ~ml, (f & 2 > 0) & ~mr, (f & 4 > 0) & ~ml, (f & 8 > 0) & ~mr)
+    if med is None:
+        z_f = np.zeros(len(sl), np.float64)
+        b_f = np.zeros(len(sl), bool)
+        return (_reach(wide, z_f), _reach(wide, z_f), b_f, b_f, b_f, b_f)
     gl_, gr_, ol_, or_, vl_, vr_ = _sheet_medians(med, sl, sr)
     (xl, cl), (xr, cr_) = _opposite(gl_, ol_, *_noses(gl_), vl_), _opposite(gr_, or_, *_noses(gr_), vr_)
     return (_smooth_reach(_reach(wide, xl), left), _smooth_reach(_reach(wide, xr), right), cl, cr_,
@@ -3226,8 +3231,9 @@ def parapet_runs(chunks, context=(), _rb=None, ground=(), pads=()):
     cov_ctx = [(r, c) for r, c in zip(cr, context)] + approaches
     covered = _parapet_cover([(r, c) for r, c in rb], cov_ctx)
     medians = _median_gaps([(r, c) for r, c in rb],
-                           [(r, c) for r, c in zip(ribbons(list(context)), context) if r[5] is not None],
-                           skip={n for n, (_r, c) in enumerate(rb) if c.get("rch")})
+                           [(r, c) for r, c in zip(ribbons(list(context)), context)
+                            if r[5] is not None and not c.get("tunnel")],
+                           skip={n for n, (_r, c) in enumerate(rb) if c.get("rch") or c.get("tunnel")})
     out = face_runs
     for n, ((left, right, v, _m, _layer, z), c) in enumerate(rb):
         if c.get("surface_ref") or c.get("tunnel"):       # deck() draws the tunnel floor without parapets
@@ -3440,10 +3446,11 @@ def _smooth_wall_face(b, tw, thick):
     return b, thick
 
 
-def _retaining_walls(walls, origin, P, T, UV, M, nv):
+def _retaining_walls(walls, origin, P, T, UV, M, nv, bore_envs=()):
     """roads.retaining_walls' walls as stone (material index 2): the face toward the road, the top, the ends;
     appended to P, T, UV, M. Returns the new vertex count."""
     for w in walls:
+        p_wall_start = len(P)
         b = np.asarray(w["base"], np.float64)
         top, foot, tw = np.asarray(w["top"]), np.asarray(w["foot"]), np.asarray(w["toward"], np.float64)
         k = len(b)
@@ -3539,7 +3546,158 @@ def _retaining_walls(walls, origin, P, T, UV, M, nv):
             T.append(tri)
             M.append(mat)
             nv += len(pts)
+        if bore_envs:
+            ref_pt = b[:, :2].mean(0) - origin[:2]
+            _clip_exterior_outside_bores(P, None, bore_envs, p_wall_start, ref_pt=ref_pt)
     return nv
+
+
+def _tunnel_road_key(fid):
+    """Feature road key matching roads._tunnel_road without importing roads."""
+    if fid is None:
+        return None
+    s = str(fid).split("#", 1)[0]
+    return s.rsplit(".", 1)[0] if "." in s else s
+
+
+def _interp_wall_lr(c, mid_ref, hw):
+    """Interpolate (wl, wr) along ribbon centerline mid_ref from chunk wall_lr, clamped to [0.4, hw]."""
+    wlr_raw = c.get("wall_lr")
+    if wlr_raw is None or len(wlr_raw) < 2 or len(mid_ref) < 2:
+        return None, None
+    cn = np.asarray(c["n"], np.float64)[:, :2]
+    wlr = np.asarray(wlr_raw, np.float64)
+    if len(cn) != len(wlr):
+        return None, None
+    sn = np.r_[0.0, np.cumsum(dnp.hypot(*np.diff(cn, axis=0).T))]
+    sm = np.r_[0.0, np.cumsum(dnp.hypot(*np.diff(mid_ref, axis=0).T))]
+    sq = sm * (sn[-1] / max(float(sm[-1]), 1e-9)) if sn[-1] > 1e-9 else sm
+    wl = np.maximum(dnp.interp(sq, sn, wlr[:, 0]), 0.4)
+    wr = np.maximum(dnp.interp(sq, sn, wlr[:, 1]), 0.4)
+    return wl, wr
+
+
+def _precompute_bore_envs(rb, origin):
+    """Precompute 3D interior clearance prisms (origin-relative) for all tunnel tubes in rb."""
+    envs = []
+    ox, oy, oz = float(origin[0]), float(origin[1]), float(origin[2])
+    oxy = np.array([ox, oy], np.float64)
+    for (left, right, _v, _, _, z), c in rb:
+        mid = (left + right) * 0.5
+        if len(mid) < 2:
+            continue
+        lat = left - right
+        lw = np.maximum(dnp.hypot(lat[:, 0], lat[:, 1]), 1e-9)
+        hw = float(np.median(lw)) / 2.0 + TUNNEL_SHOULDER
+        th = float(c.get("tunnel_h") or TUNNEL_H)
+        wl, wr = _interp_wall_lr(c, mid, hw)
+        if wl is None:
+            hl = np.full(len(mid), hw, np.float64)
+            hr = np.full(len(mid), hw, np.float64)
+        else:
+            hl, hr = wl, wr
+        mid_loc = mid - oxy
+        z_loc = np.asarray(z, np.float64) - oz
+        p0 = mid_loc[:-1]
+        p1 = mid_loc[1:]
+        ab = p1 - p0
+        l2 = np.maximum((ab * ab).sum(1), 1e-12)
+        seg_len = np.sqrt(l2)
+        s = np.r_[0.0, np.cumsum(seg_len)]
+        L = float(s[-1])
+        t = ab / np.maximum(seg_len, 1e-9)[:, None]
+        u = np.c_[-t[:, 1], t[:, 0]]
+        portal = tuple(bool(x) for x in (c.get("portal") or (False, False)))
+        s_lo = -3.0 if portal[0] else -TUNNEL_OVERLAP
+        s_hi = L + 3.0 if portal[1] else L + TUNNEL_OVERLAP
+        hw_max = max(float(np.max(hl)), float(np.max(hr))) + 3.5
+        r_key = _tunnel_road_key(c.get("fid"))
+        own_keys = ({r_key} if r_key else set()) | set(c.get("twin_roads") or ())
+        envs.append({
+            "mid": mid_loc, "z": z_loc, "p0": p0, "ab": ab, "l2": l2, "seg_len": seg_len,
+            "s": s, "L": L, "u": u, "hl": hl, "hr": hr, "th": th,
+            "s_lo": s_lo, "s_hi": s_hi, "road_key": r_key, "own_keys": own_keys,
+            "x_min": float(mid_loc[:, 0].min()) - hw_max, "x_max": float(mid_loc[:, 0].max()) + hw_max,
+            "y_min": float(mid_loc[:, 1].min()) - hw_max, "y_max": float(mid_loc[:, 1].max()) + hw_max,
+            "z_lo": float(z_loc.min()) - 0.6, "z_hi": float(z_loc.max()) + th,
+        })
+    return envs
+
+
+def _clip_exterior_outside_bores(P, owner_idx, bore_envs, start_p_idx, ref_pt=None,
+                                 z_top_extra=0.0, z_bot_extra=0.0):
+    """Push exterior vertices emitted in P[start_p_idx:] outside any sibling bore's 3D clearance prism."""
+    if not bore_envs or start_p_idx >= len(P):
+        return
+    owner_keys = bore_envs[owner_idx]["own_keys"] if owner_idx is not None else ()
+    owner_mid = bore_envs[owner_idx]["mid"] if owner_idx is not None else None
+    for env_idx, env in enumerate(bore_envs):
+        if owner_idx is not None and (env_idx == owner_idx or (env["road_key"] and env["road_key"] in owner_keys)):
+            continue
+        p0, ab, l2, seg_len = env["p0"], env["ab"], env["l2"], env["seg_len"]
+        s, L, u, hl, hr, z_e, th_e = env["s"], env["L"], env["u"], env["hl"], env["hr"], env["z"], env["th"]
+        s_lo, s_hi = env["s_lo"], env["s_hi"]
+        n_seg = len(p0)
+        for arr in P[start_p_idx:]:
+            if len(arr) == 0:
+                continue
+            ax_min, ax_max = float(arr[:, 0].min()), float(arr[:, 0].max())
+            ay_min, ay_max = float(arr[:, 1].min()), float(arr[:, 1].max())
+            az_min, az_max = float(arr[:, 2].min()), float(arr[:, 2].max())
+            if (ax_max < env["x_min"] or ax_min > env["x_max"]
+                    or ay_max < env["y_min"] or ay_min > env["y_max"]
+                    or az_max < env["z_lo"] - z_bot_extra or az_min > env["z_hi"] + z_top_extra):
+                continue
+            dx = arr[:, 0:1] - p0[None, :, 0]
+            dy = arr[:, 1:2] - p0[None, :, 1]
+            t0 = (dx * ab[None, :, 0] + dy * ab[None, :, 1]) / l2[None, :]
+            tc = np.clip(t0, 0.0, 1.0)
+            px = p0[None, :, 0] + tc * ab[None, :, 0]
+            py = p0[None, :, 1] + tc * ab[None, :, 1]
+            dd = dnp.hypot(arr[:, 0:1] - px, arr[:, 1:2] - py)
+            ks = np.argmin(dd, axis=1)
+            span_core_z = bool(z_bot_extra > 0.0 and az_max >= env["z_lo"] + 0.10 and az_min <= env["z_hi"] - 0.05)
+            for vi in range(len(arr)):
+                kk = int(ks[vi])
+                tu = float(t0[vi, kk])
+                tcl = float(tc[vi, kk])
+                if kk == 0 and tu < 0.0:
+                    s_m = tu * float(seg_len[0])
+                    ax_x = float(p0[0, 0] + tu * ab[0, 0])
+                    ax_y = float(p0[0, 1] + tu * ab[0, 1])
+                elif kk == n_seg - 1 and tu > 1.0:
+                    s_m = L + (tu - 1.0) * float(seg_len[-1])
+                    ax_x = float(p0[-1, 0] + tu * ab[-1, 0])
+                    ax_y = float(p0[-1, 1] + tu * ab[-1, 1])
+                else:
+                    s_m = float(s[kk] + tcl * seg_len[kk])
+                    ax_x = float(px[vi, kk])
+                    ax_y = float(py[vi, kk])
+                if s_m < s_lo or s_m > s_hi:
+                    continue
+                z_m = float(z_e[kk] + tcl * (z_e[kk + 1] - z_e[kk]))
+                zv = float(arr[vi, 2])
+                if zv < z_m - 0.50 - z_bot_extra or zv > z_m + th_e - 0.05 + z_top_extra:
+                    continue
+                ux, uy = float(u[kk, 0]), float(u[kk, 1])
+                hl_m = float(hl[kk] + tcl * (hl[kk + 1] - hl[kk]))
+                hr_m = float(hr[kk] + tcl * (hr[kk + 1] - hr[kk]))
+                lat_v = (float(arr[vi, 0]) - ax_x) * ux + (float(arr[vi, 1]) - ax_y) * uy
+                if (-hr_m - 0.05) < lat_v < (hl_m + 0.05):
+                    if ref_pt is not None:
+                        rx, ry = float(ref_pt[0]), float(ref_pt[1])
+                    elif owner_mid is not None:
+                        oj = int(np.argmin(dnp.hypot(owner_mid[:, 0] - arr[vi, 0], owner_mid[:, 1] - arr[vi, 1])))
+                        rx, ry = float(owner_mid[oj, 0]), float(owner_mid[oj, 1])
+                    else:
+                        rx, ry = float(arr[vi, 0]), float(arr[vi, 1])
+                    lat_ref = (rx - ax_x) * ux + (ry - ax_y) * uy
+                    if zv < z_m - 0.50 and not (span_core_z and abs(lat_ref) > 0.45 * min(hl_m, hr_m)):
+                        continue
+                    sgn = 1.0 if lat_ref >= 0.0 else -1.0
+                    push = (hl_m if sgn > 0.0 else hr_m) + 0.05
+                    arr[vi, 0] = ax_x + ux * (sgn * push)
+                    arr[vi, 1] = ax_y + uy * (sgn * push)
 
 
 def tunnel(chunks, origin, walls=()):
@@ -3553,12 +3711,15 @@ def tunnel(chunks, origin, walls=()):
         return None
     P, T, UV, M = [], [], [], []           # M: per T entry its material index (0 concrete, 1 lamps, 2 stone, 3 dark stone,
                                             # 4 soil)
-    nv = _retaining_walls(walls, np.asarray(origin, np.float64), P, T, UV, M, 0) if walls else 0
-    for (left, right, v, _, _, z), c in rb:
+    origin_arr = np.asarray(origin, np.float64)
+    bore_envs = _precompute_bore_envs(rb, origin_arr) if rb else []
+    nv = _retaining_walls(walls, origin_arr, P, T, UV, M, 0, bore_envs=bore_envs) if walls else 0
+    for bi, ((left, right, v, _, _, z), c) in enumerate(rb):
         # a piece ending at a tile edge reaches TUNNEL_OVERLAP past it: the next tile's piece meets it there without a
         # hairline of daylight (2026-10-17, inside Eisenhower)
         portal = c.get("portal") or (False, False)
         left, right, z = left.copy(), right.copy(), z.copy()
+        mid0 = (left + right) / 2
         for at, nb in ((0, 1), (-1, -2)):
             if portal[0 if at == 0 else 1] or len(left) < 2:
                 continue
@@ -3579,10 +3740,17 @@ def tunnel(chunks, origin, walls=()):
                                                             # tube's inside: 5, TUNNEL_INNER)
         sec = _tunnel_section(hw, th, low, box=low and not stone and portals.ON)    # (a major road's low tube: a box)
         k, m = len(mid), len(sec)
+        wl_k, wr_k = _interp_wall_lr(c, mid0, hw)
         rows = np.empty((m, k, 3))
-        for j, (off, h) in enumerate(sec):
-            rows[j, :, :2] = mid + u * off
-            rows[j, :, 2] = z + h
+        if wl_k is not None:
+            for j, (off, h) in enumerate(sec):
+                scale = (wl_k / max(hw, 1e-6)) if off >= 0.0 else (wr_k / max(hw, 1e-6))
+                rows[j, :, :2] = mid + u * (off * scale)[:, None]
+                rows[j, :, 2] = z + h
+        else:
+            for j, (off, h) in enumerate(sec):
+                rows[j, :, :2] = mid + u * off
+                rows[j, :, 2] = z + h
         rows -= origin
         # inward: towards the tube's axis (a point th / 2 over the floor's centre)
         axis = np.c_[mid, z + th / 2] - origin
@@ -3611,12 +3779,13 @@ def tunnel(chunks, origin, walls=()):
             nv += 2 * k
         # the lamps: under the vault along both lines, every other step, faced down (a long tunnel's; not under an arch)
         if not low:
-            nv = _tunnel_lamps(P, T, UV, M, nv, mid, u, z, hw, origin)
+            nv = _tunnel_lamps(P, T, UV, M, nv, mid, u, z, hw, origin, wl_k=wl_k, wr_k=wr_k)
         fits = c.get("fit") or (None, None)
         seam_trim = c.get("seam_trim") or (False, False)
         has_seam_trim = bool(seam_trim[0] or seam_trim[1])
+        has_var_trim = wl_k is not None and (float(wl_k.min()) < hw - 0.05 or float(wr_k.min()) < hw - 0.05)
         new_portal = portals.ON
-        if new_portal and not low and not has_seam_trim and c.get("ground") is not None and len(c["ground"]) == len(c["n"]) and k >= 2:
+        if new_portal and not low and not (has_seam_trim or has_var_trim) and c.get("ground") is not None and len(c["ground"]) == len(c["n"]) and k >= 2:
             # the tube's outside where the ground does not cover it (portals.cover: a box, soil on its top); the
             # chunk's ground at the ribbon's rows, by the arc along it
             cn = np.asarray(c["n"], np.float64)[:, :2]
@@ -3628,9 +3797,11 @@ def tunnel(chunks, origin, walls=()):
                 if f_ is not None and (c.get("portal") or (False, False))[e_]:
                     d_ = sm if e_ == 0 else sm[-1] - sm
                     gr = np.where(d_ <= portals.setback(f_) + 0.5 if portals.setback(f_) > 0 else False, np.inf, gr)
+            p_cov_start = len(P)
             nv = _add_blocks(P, T, UV, M, nv, portals.cover(mid - np.asarray(origin, np.float64)[:2], u, z - origin[2],
                                                              gr - origin[2], hw, th, (False, False), CONCRETE_UV_M,
                                                              SOIL_UV_M, sec), 0)
+            _clip_exterior_outside_bores(P, bi, bore_envs, p_cov_start, z_top_extra=4.5, z_bot_extra=4.5)
         pups = c.get("portal_up") or (None, None)
         caps = c.get("cap_m") or (None, None)       # (a road over the mouth: its stone top shorter, TunnelProfiles.caps)
         for end, at, pup, cap_m in zip(c.get("portal") or (False, False), (0, k - 1), pups, caps):
@@ -3638,12 +3809,22 @@ def tunnel(chunks, origin, walls=()):
                 continue
             p_idx_start = len(P)
             fitd = fits[0 if at == 0 else 1] if new_portal else None
+            end_trim_l = bool(wl_k[at] < hw - 0.05) if wl_k is not None else bool(seam_trim[0])
+            end_trim_r = bool(wr_k[at] < hw - 0.05) if wr_k is not None else bool(seam_trim[1])
+            end_has_trim = end_trim_l or end_trim_r
+            wl_end = float(wl_k[at]) if wl_k is not None else hw
+            wr_end = float(wr_k[at]) if wr_k is not None else hw
+            sec_end = sec
+            if wl_k is not None and (abs(wl_end - hw) > 0.05 or abs(wr_end - hw) > 0.05):
+                sec_end = sec.copy()
+                sec_end[sec_end[:, 0] >= 0.0, 0] *= wl_end / max(hw, 1e-6)
+                sec_end[sec_end[:, 0] < 0.0, 0] *= wr_end / max(hw, 1e-6)
             if fitd is not None:
-                if has_seam_trim:
+                if end_has_trim:
                     fitd = dict(fitd)
-                    if seam_trim[0]:
+                    if end_trim_l:
                         fitd["sl"], fitd["wl"] = 0.0, None
-                    if seam_trim[1]:
+                    if end_trim_r:
                         fitd["sr"], fitd["wr"] = 0.0, None
                 # the mouth's structure from the ground round it (portals.structure: collar, headwall, wing walls);
                 # in concrete (a park's low arch: stone)
@@ -3658,8 +3839,11 @@ def tunnel(chunks, origin, walls=()):
                 stone_p = stone if low else False     # (a full tube's mouth: concrete, its hood or box; stone only
                                                       # on a park's low arch)
                 nv = _add_blocks(P, T, UV, M, nv, portals.structure(
-                    fitd, np.r_[mid[at], z[at]] - origin, ul, outv, sec, th, hw, STONE_UV_M if stone_p else CONCRETE_UV_M,
+                    fitd, np.r_[mid[at], z[at]] - origin, ul, outv, sec_end, th, hw, STONE_UV_M if stone_p else CONCRETE_UV_M,
                     near, low), 2 if stone_p else 0, 2 if (low and stone_p) else 7)
+                _clip_exterior_outside_bores(P, bi, bore_envs, p_idx_start,
+                                             ref_pt=mid[at] - origin_arr[:2], z_top_extra=4.5, z_bot_extra=4.5)
+                p_skirt_start = len(P)
                 if not low:
                     bore_len = float(dnp.hypot(*np.diff(mid, axis=0).T).sum()) if len(mid) >= 2 else 0.0
                     nv = _portal_hill_skirt(
@@ -3674,59 +3858,61 @@ def tunnel(chunks, origin, walls=()):
                     nv = _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, hw + min(float(fitd["sl"]), float(fitd["sr"])),
                                    soil + (LOW_PORTAL_UP - ARCH_CAP_OVER), th, origin,
                                    LOW_CAP_M if cap_m is None else min(LOW_CAP_M, float(cap_m)), 2 if stone_p else 0)
-                if has_seam_trim:
+                if end_has_trim:
                     cx_p = float(mid[at, 0] - origin[0])
                     cy_p = float(mid[at, 1] - origin[1])
                     ux_p, uy_p = float(ul[0]), float(ul[1])
                     for p_arr in P[p_idx_start:]:
                         lat_v = (p_arr[:, 0] - cx_p) * ux_p + (p_arr[:, 1] - cy_p) * uy_p
-                        if seam_trim[0]:
-                            ov_l = np.maximum(0.0, lat_v - hw)
+                        if end_trim_l:
+                            ov_l = np.maximum(0.0, lat_v - wl_end)
                             p_arr[:, 0] -= ov_l * ux_p
                             p_arr[:, 1] -= ov_l * uy_p
-                        if seam_trim[1]:
-                            ov_r = np.minimum(0.0, lat_v + hw)
+                        if end_trim_r:
+                            ov_r = np.minimum(0.0, lat_v + wr_end)
                             p_arr[:, 0] -= ov_r * ux_p
                             p_arr[:, 1] -= ov_r * uy_p
-                continue
-            # the face: from the opening's outline out to a frame PORTAL_FRAME wider and higher, both sides
-            inner = rows[:, at]
-            o = sec.copy()
-            up, side = (LOW_PORTAL_UP, LOW_PORTAL_SIDE) if low else (PORTAL_FRAME, PORTAL_FRAME)
-            if pup is not None:     # to the ground over the portal (TunnelProfiles.portal_ups); a low arch's at least
-                # LOW_PORTAL_UP unless capped under a lower overpass road (_road_caps)
-                if low:
-                    up = max(0.15, float(pup)) if cap_m is not None else max(LOW_PORTAL_UP, float(pup))
-                else:
-                    up = float(pup)
-            o[:, 0] = np.sign(o[:, 0]) * (np.abs(o[:, 0]) + side)
-            # its foot under the ground (2 m into a hillside; a low arch's mouth is flat: just under its floor, or the
-            # face's bottom stood as a dark wedge beside the opening)
-            if low:     # a flat top over the arch (a parapet), not following its curve
-                o[:, 1] = np.where(o[:, 1] > 0.0, th + up, -0.3)
             else:
-                o[:, 1] = np.where(o[:, 1] > 0.0, o[:, 1] + up, -2.0)
-            outer = np.empty((m, 3))
-            outer[:, :2] = mid[at] + u[at] * o[:, :1]
-            outer[:, 2] = z[at] + o[:, 1]
-            outer -= origin
-            P.append(np.concatenate([inner, outer]))
-            sc = STONE_UV_M if stone else 4.0
-            UV.append(np.column_stack((np.concatenate((sec[:, 0], o[:, 0])) / sc, np.concatenate((sec[:, 1], o[:, 1])) / sc)))
-            i = np.arange(m - 1)
-            A, A1, B, B1 = nv + i, nv + i + 1, nv + m + i, nv + m + i + 1
-            tri = np.concatenate([np.stack([A, B, B1], 1), np.stack([A, B1, A1], 1)])
-            T.append(tri)   # seen from outside and from in the tube without cancelling face_normal_sum
-            M.append(2 if stone else 0)
-            nv += 2 * m
-            P.append(np.concatenate([inner, outer]))
-            UV.append(UV[-1])
-            T.append(tri[:, ::-1] + 2 * m)
-            M.append(2 if stone else 0)
-            nv += 2 * m
-            if low and (cap_m is None or cap_m >= LOW_CAP_MIN):
-                nv = _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, float(np.max(o[:, 0])), float(o[:, 1].max()), th, origin,
-                               LOW_CAP_M if cap_m is None else min(LOW_CAP_M, float(cap_m)), 2 if stone else 0)
+                # the face: from the opening's outline out to a frame PORTAL_FRAME wider and higher, both sides
+                inner = rows[:, at]
+                o = sec_end.copy()
+                up, side = (LOW_PORTAL_UP, LOW_PORTAL_SIDE) if low else (PORTAL_FRAME, PORTAL_FRAME)
+                if pup is not None:     # to the ground over the portal (TunnelProfiles.portal_ups); a low arch's at least
+                    # LOW_PORTAL_UP unless capped under a lower overpass road (_road_caps)
+                    if low:
+                        up = max(0.15, float(pup)) if cap_m is not None else max(LOW_PORTAL_UP, float(pup))
+                    else:
+                        up = float(pup)
+                o[:, 0] = np.sign(o[:, 0]) * (np.abs(o[:, 0]) + side)
+                # its foot under the ground (2 m into a hillside; a low arch's mouth is flat: just under its floor, or the
+                # face's bottom stood as a dark wedge beside the opening)
+                if low:     # a flat top over the arch (a parapet), not following its curve
+                    o[:, 1] = np.where(o[:, 1] > 0.0, th + up, -0.3)
+                else:
+                    o[:, 1] = np.where(o[:, 1] > 0.0, o[:, 1] + up, -2.0)
+                outer = np.empty((m, 3))
+                outer[:, :2] = mid[at] + u[at] * o[:, :1]
+                outer[:, 2] = z[at] + o[:, 1]
+                outer -= origin
+                P.append(np.concatenate([inner, outer]))
+                sc = STONE_UV_M if stone else 4.0
+                UV.append(np.column_stack((np.concatenate((sec_end[:, 0], o[:, 0])) / sc, np.concatenate((sec_end[:, 1], o[:, 1])) / sc)))
+                i = np.arange(m - 1)
+                A, A1, B, B1 = nv + i, nv + i + 1, nv + m + i, nv + m + i + 1
+                tri = np.concatenate([np.stack([A, B, B1], 1), np.stack([A, B1, A1], 1)])
+                T.append(tri)   # seen from outside and from in the tube without cancelling face_normal_sum
+                M.append(2 if stone else 0)
+                nv += 2 * m
+                P.append(np.concatenate([inner, outer]))
+                UV.append(UV[-1])
+                T.append(tri[:, ::-1] + 2 * m)
+                M.append(2 if stone else 0)
+                nv += 2 * m
+                if low and (cap_m is None or cap_m >= LOW_CAP_MIN):
+                    nv = _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, float(np.max(o[:, 0])), float(o[:, 1].max()), th, origin,
+                                   LOW_CAP_M if cap_m is None else min(LOW_CAP_M, float(cap_m)), 2 if stone else 0)
+            _clip_exterior_outside_bores(P, bi, bore_envs, p_skirt_start if fitd is not None else p_idx_start,
+                                         ref_pt=mid[at] - origin_arr[:2])
     allm = [TUNNEL_SIDE, TUNNEL_LIGHT, TUNNEL_STONE, TUNNEL_STONE_IN, TUNNEL_SOIL, TUNNEL_INNER, WALL_SCREE,
             PORTAL_COLLAR]
     Tall = np.concatenate(T)
@@ -3829,7 +4015,7 @@ def _portal_hill_skirt(P, T, UV, M, nv, fitd, p0, ul, outv, th, hw, face_mat, fa
     # adding extra bore_climb (which double-counted hillside height and created skyward blocks above the brow).
     hill_mat = 6 if (st in (0, 2) or max_fg > th + 3.0) else 4
     hill_uv = SCREE_UV_M if hill_mat == 6 else SOIL_UV_M
-    s2_max = min(max(5.2, min(0.45 * max(bore_len - sb, 0.0), 7.5)), 7.5)
+    s2_max = min(max(5.2, min(0.45 * max(bore_len - sb, 0.0), 7.0)), 7.0)
     s0_in, s1_in, s2_in = cop_in, 0.5 * (cop_in + s2_max), s2_max
     h_s0 = h_brow.copy()
     h_s2 = np.maximum(h_s0 + 0.25, gx + 0.45)
@@ -3917,7 +4103,7 @@ def _arch_cap(P, T, UV, M, nv, mid, u, z, at, k, side, top, th, origin, depth=No
     return nv
 
 
-def _tunnel_lamps(P, T, UV, M, nv, mid, u, z, hw, origin):
+def _tunnel_lamps(P, T, UV, M, nv, mid, u, z, hw, origin, wl_k=None, wr_k=None):
     """Lamp fixtures along both walls of a tube (material TUNNEL_LIGHT, index 1): TUNNEL_LAMP_L long every
     TUNNEL_LAMP_EVERY m, just under the springing, faced into the tube; appended to P, T, UV, M; returns the new vertex
     count. (Two dashed strips under the vault read as lane markings on the ceiling: the Caldecott Tunnel on Mapillary
@@ -3936,7 +4122,13 @@ def _tunnel_lamps(P, T, UV, M, nv, mid, u, z, hw, origin):
         zc = float(dnp.interp(sc, s, z))
         uu = u[j]
         for side in (-1.0, 1.0):
-            e = p + uu * side * (hw - TUNNEL_LAMP_IN)
+            if side > 0.0 and wl_k is not None:
+                hw_s = float(dnp.interp(sc, s, wl_k))
+            elif side < 0.0 and wr_k is not None:
+                hw_s = float(dnp.interp(sc, s, wr_k))
+            else:
+                hw_s = hw
+            e = p + uu * side * (hw_s - TUNNEL_LAMP_IN)
             quad = [[*(e + t * a * TUNNEL_LAMP_L / 2), zc + h + b * TUNNEL_LAMP_W / 2] for a in (-1, 1) for b in (-1, 1)]
             q = np.asarray(quad, np.float64) - origin
             P.append(q)
