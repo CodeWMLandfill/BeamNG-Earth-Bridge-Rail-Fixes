@@ -6,6 +6,8 @@ workers_dev = true
 [vars]
 # Target GitHub repository slug ("owner/repo") where reports and issues are published.
 GITHUB_REPO = "CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes"
+# Dedicated target repository for Traffic and AutoDrive fixes reports (falls back to GITHUB_REPO if unset or inaccessible):
+AUTODRIVE_GITHUB_REPO = "CodeWMLandfill/BeamNG-Earth-Traffic-and-AutoDrive-Fixes"
 # Dedicated orphan branch used to archive report JSON and screenshot blobs.
 REPORTS_BRANCH = "reports"
 # Fallback in-isolate sliding window limits (used when RATE_LIMITER binding is unset).

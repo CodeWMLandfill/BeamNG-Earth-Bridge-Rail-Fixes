@@ -27,13 +27,29 @@ const DEFAULT_RATE_LIMIT_MAX = 6;
 const DEFAULT_RATE_LIMIT_WINDOW_SEC = 60;
 const MAX_TRACKED_IPS = 4096;
 
-const ALLOWED_KINDS = new Set(["bridge", "rail", "tunnel", "road", "other"]);
+const ALLOWED_KINDS = new Set([
+  "bridge",
+  "rail",
+  "tunnel",
+  "road",
+  "other",
+  "autodrive",
+  "traffic",
+  "overtake",
+  "routing",
+]);
+const AUTODRIVE_ADDON_IDS = new Set([
+  "beamng-earth-autodrive-fixes",
+  "beamng-earth-traffic-and-autodrive-fixes",
+  "beamng-earth-traffic-autodrive-fixes",
+]);
 const ALLOWED_TOP_LEVEL_KEYS = new Set([
   "lat",
   "lon",
   "kind",
   "summary",
   "note",
+  "addonId",
   "earthVersion",
   "addonVersion",
   "headingDeg",
@@ -42,6 +58,8 @@ const ALLOWED_TOP_LEVEL_KEYS = new Set([
   "anchorId",
   "camera",
   "nearest",
+  "drivingTelemetry",
+  "experimentalFlags",
   "screenshot",
   "loading_incomplete",
   "loading_reason",
@@ -507,7 +525,9 @@ function validateAndSanitizeReport(raw) {
     throw new ValidationError("lon must be a finite number in [-180, 180]");
   }
   if (typeof raw.kind !== "string" || !ALLOWED_KINDS.has(raw.kind)) {
-    throw new ValidationError('kind must be one of: "bridge", "rail", "road", "other"');
+    throw new ValidationError(
+      'kind must be one of: "bridge", "rail", "tunnel", "road", "other", "autodrive", "traffic", "overtake", "routing"'
+    );
   }
 
   const report = {
@@ -516,6 +536,10 @@ function validateAndSanitizeReport(raw) {
     kind: raw.kind,
   };
 
+  if (raw.addonId !== undefined && raw.addonId !== null) {
+    const addonId = sanitizeText(raw.addonId, MAX_SHORT_TEXT_CHARS, "addonId", false);
+    if (addonId) report.addonId = addonId;
+  }
   if (raw.summary !== undefined && raw.summary !== null) {
     const summary = sanitizeText(raw.summary, MAX_SUMMARY_CHARS, "summary", false);
     if (summary) report.summary = summary;
@@ -562,6 +586,35 @@ function validateAndSanitizeReport(raw) {
       MAX_NEAREST_JSON_BYTES,
       "nearest"
     );
+  }
+  if (raw.drivingTelemetry !== undefined && raw.drivingTelemetry !== null) {
+    report.drivingTelemetry = sanitizeStructuredObject(
+      raw.drivingTelemetry,
+      MAX_NEAREST_DEPTH,
+      MAX_NEAREST_JSON_BYTES,
+      "drivingTelemetry"
+    );
+  }
+  if (raw.experimentalFlags !== undefined && raw.experimentalFlags !== null) {
+    if (!Array.isArray(raw.experimentalFlags)) {
+      throw new ValidationError("experimentalFlags must be an array of strings");
+    }
+    if (raw.experimentalFlags.length > MAX_NEAREST_ARRAY_LEN) {
+      throw new ValidationError(
+        `experimentalFlags exceeds maximum length (${MAX_NEAREST_ARRAY_LEN})`
+      );
+    }
+    const flags = [];
+    for (const item of raw.experimentalFlags) {
+      if (typeof item !== "string") {
+        throw new ValidationError("experimentalFlags entries must be strings");
+      }
+      const cleanedFlag = sanitizeText(item, MAX_SHORT_TEXT_CHARS, "experimentalFlags", false);
+      if (cleanedFlag) flags.push(cleanedFlag);
+    }
+    if (flags.length > 0) {
+      report.experimentalFlags = flags;
+    }
   }
   if (raw.loading_incomplete !== undefined && raw.loading_incomplete !== null) {
     if (typeof raw.loading_incomplete !== "boolean") {
@@ -738,18 +791,30 @@ function resolveWorkerName(env) {
   return WORKER_NAME_RE.test(candidate) ? candidate : DEFAULT_WORKER_NAME;
 }
 
-function resolveGitHubConfig(env) {
-  const repo = typeof env?.GITHUB_REPO === "string" ? env.GITHUB_REPO.trim() : "";
+function resolveGitHubConfig(env, addonId = "") {
+  const defaultRepo = typeof env?.GITHUB_REPO === "string" ? env.GITHUB_REPO.trim() : "";
+  const autodriveRepo =
+    typeof env?.AUTODRIVE_GITHUB_REPO === "string" ? env.AUTODRIVE_GITHUB_REPO.trim() : "";
+  const defaultValid = REPO_SLUG_RE.test(defaultRepo);
+  const autodriveValid = REPO_SLUG_RE.test(autodriveRepo);
+  const useAutodriveRepo =
+    typeof addonId === "string" && AUTODRIVE_ADDON_IDS.has(addonId) && autodriveValid;
+  const repo = useAutodriveRepo ? autodriveRepo : defaultRepo;
+  const fallbackRepo =
+    useAutodriveRepo && defaultValid && defaultRepo !== autodriveRepo ? defaultRepo : "";
   const token = typeof env?.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
   const branch = resolveBranch(env);
   const workerName = resolveWorkerName(env);
   const repoValid = REPO_SLUG_RE.test(repo);
+  const anyRepoValid = defaultValid || autodriveValid;
   return {
     repo,
+    fallbackRepo,
     token,
     branch,
     workerName,
     repoConfigured: Boolean(repoValid && token.length > 0),
+    anyRepoConfigured: Boolean(anyRepoValid && token.length > 0),
   };
 }
 
@@ -1021,11 +1086,20 @@ function formatIssuePayload(config, id, createdAt, report, reportPath, shotPath)
     ["Archive JSON", `[\`${reportPath}\`](${jsonArchiveUrl})`],
   ];
 
+  if (report.addonId !== undefined) {
+    rows.push(["Addon ID", `\`${escapeCodeCell(report.addonId)}\``]);
+  }
   if (report.earthVersion !== undefined) {
     rows.push(["Earth Version", `\`${escapeCodeCell(report.earthVersion)}\``]);
   }
   if (report.addonVersion !== undefined) {
     rows.push(["Addon Version", `\`${escapeCodeCell(report.addonVersion)}\``]);
+  }
+  if (report.experimentalFlags !== undefined) {
+    rows.push([
+      "Experimental Flags",
+      report.experimentalFlags.map((f) => `\`${escapeCodeCell(f)}\``).join(", "),
+    ]);
   }
   if (report.anchorId !== undefined) {
     rows.push(["Anchor ID", `\`${escapeCodeCell(report.anchorId)}\``]);
@@ -1082,6 +1156,15 @@ function formatIssuePayload(config, id, createdAt, report, reportPath, shotPath)
       "## Nearest Features",
       "",
       buildFencedBlock(JSON.stringify(report.nearest, null, 2), "json")
+    );
+  }
+
+  if (report.drivingTelemetry) {
+    lines.push(
+      "",
+      "## Driving Telemetry",
+      "",
+      buildFencedBlock(JSON.stringify(report.drivingTelemetry, null, 2), "json")
     );
   }
 
@@ -1211,8 +1294,8 @@ export default {
         );
       }
 
-      const ghConfig = resolveGitHubConfig(env);
-      if (!ghConfig.repoConfigured) {
+      const baseGhConfig = resolveGitHubConfig(env);
+      if (!baseGhConfig.anyRepoConfigured) {
         return jsonResponse(
           { ok: false, error: "Collector GitHub repository is not configured" },
           503,
@@ -1223,6 +1306,14 @@ export default {
       try {
         const rawBody = await readJsonBodyBounded(request, MAX_BODY_BYTES);
         const { report, screenshot } = validateAndSanitizeReport(rawBody);
+        const ghConfig = resolveGitHubConfig(env, report.addonId || "");
+        if (!ghConfig.repoConfigured) {
+          return jsonResponse(
+            { ok: false, error: "Collector GitHub repository is not configured" },
+            503,
+            env
+          );
+        }
 
         const now = new Date();
         const createdAt = now.toISOString();
@@ -1240,24 +1331,49 @@ export default {
         };
         const archiveJsonText = `${JSON.stringify(archiveRecord, null, 2)}\n`;
 
-        await commitArchiveToGitHub(
-          ghConfig,
-          reportPath,
-          archiveJsonText,
-          shotPath,
-          screenshot,
-          createdAt
-        );
+        let activeGhConfig = ghConfig;
+        try {
+          await commitArchiveToGitHub(
+            activeGhConfig,
+            reportPath,
+            archiveJsonText,
+            shotPath,
+            screenshot,
+            createdAt
+          );
+        } catch (archiveErr) {
+          if (
+            archiveErr instanceof UpstreamGitHubError &&
+            (archiveErr.upstreamStatus === 403 || archiveErr.upstreamStatus === 404) &&
+            activeGhConfig.fallbackRepo
+          ) {
+            activeGhConfig = {
+              ...activeGhConfig,
+              repo: activeGhConfig.fallbackRepo,
+              fallbackRepo: "",
+            };
+            await commitArchiveToGitHub(
+              activeGhConfig,
+              reportPath,
+              archiveJsonText,
+              shotPath,
+              screenshot,
+              createdAt
+            );
+          } else {
+            throw archiveErr;
+          }
+        }
 
         const issuePayload = formatIssuePayload(
-          ghConfig,
+          activeGhConfig,
           id,
           createdAt,
           report,
           reportPath,
           shotPath
         );
-        const issue = await openGitHubIssue(ghConfig, issuePayload);
+        const issue = await openGitHubIssue(activeGhConfig, issuePayload);
 
         return jsonResponse(
           {
