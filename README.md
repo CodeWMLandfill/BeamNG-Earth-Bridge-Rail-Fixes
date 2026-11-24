@@ -6,18 +6,18 @@ Fixes broken bridges, ramps, piers, divided highways, railway crossings, and lan
 
 ## Global Feature & Archetype Completion Metrics
 
-Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-16T00:57:16Z`):
+Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-24T00:17:53Z`):
 
 - **Global Shard Coverage:** `128 / 128` shards (`100.0%`) - **8,949,779** structures categorized worldwide
-- **Archetype Elimination Progress:** `11 / 234` structural archetypes cleared (`116,243` structures eliminated by archetype, `1,153,504` directly verified clean)
-- **Overall Feature Completion:** `1,269,747 / 8,949,779` (`14.19%`)
+- **Archetype Elimination Progress:** `11 / 234` structural archetypes cleared (`0` structures eliminated by archetype, `1,158,710` directly verified clean)
+- **Overall Feature Completion:** `1,158,710 / 8,949,779` (`12.95%`)
 
 | Category | Categorized | Verified Clean | Archetypes Cleared | Completion % |
 | --- | ---: | ---: | ---: | ---: |
-| Bridges | 5,838,327 | 478,786 | 1 / 91 | 10.19% |
-| Railways | 1,934,028 | 388,635 | 7 / 51 | 20.09% |
-| Tunnels | 1,177,424 | 286,083 | 3 / 92 | 24.30% |
-| **Combined Total** | **8,949,779** | **1,153,504** | **11 / 234** | **14.19%** |
+| Bridges | 5,838,327 | 479,782 | 0 / 91 | 8.22% |
+| Railways | 1,934,028 | 390,421 | 8 / 51 | 20.19% |
+| Tunnels | 1,177,424 | 288,507 | 3 / 92 | 24.50% |
+| **Combined Total** | **8,949,779** | **1,158,710** | **11 / 234** | **12.95%** |
 
 ## Before & After
 
@@ -69,4 +69,4 @@ Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screensh
 ## Requirements
 
 - **Windows 10 or 11** (64-bit).
-- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** or newer (newer `v1.10.1-beta.dev.*` builds automatically use forward-compatible client & reporter mode; older versions are skipped safely with a clear notice).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta.dev.567** in full solver mode (`direct` or `bridged_v2`), with automatic forward-compatible client & reporter fallback for newer `dev.*` builds (older versions are skipped safely with a clear notice).

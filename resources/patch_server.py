@@ -23,8 +23,8 @@ import tempfile
 import uuid
 import zlib
 
-VERSION = "0.3.1"
-MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_3_1"
+VERSION = "0.4.0"
+MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_4_0"
 TAG = "earthBridgeRailFixes"
 MAX_SOLVER_FAST_VERSION = 305
 MAX_BRIDGED_SOLVER_FAST_VERSION = 607
@@ -39,6 +39,7 @@ V2_FULL_OVERLAY_MODULES = (
     "guardrails",
     "furniture",
     "roadlanes",
+    "railprofile",
     "bridgetypes",
     "carriageways",
     "fences",

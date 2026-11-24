@@ -21,7 +21,7 @@ import os
 import sys as _brf_sys
 import queue
 
-_BRF_ADDON_REV = "0.3.0"
+_BRF_ADDON_REV = "0.4.0"
 if not os.environ.get("BNE_BRF_ADDON_REV_PIN") and os.environ.get("BNE_BRF_ADDON_REV") != _BRF_ADDON_REV:
     os.environ["BNE_BRF_ADDON_REV"] = _BRF_ADDON_REV
     _brf_revisit = _brf_sys.modules.get("revisit")

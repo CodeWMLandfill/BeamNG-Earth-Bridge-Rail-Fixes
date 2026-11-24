@@ -961,10 +961,10 @@ def _height_grid(frame, elev, xy, q=None, cell=GRID_M, tris=None):
     if tris is not None:
         tris = np.asarray(tris, np.int64)
         xy = xy[np.unique(tris)]
-    i0 = int(np.floor(xy[:, 0].min() / cell)) - 1
-    j0 = int(np.floor(xy[:, 1].min() / cell)) - 1
-    i1 = int(np.ceil(xy[:, 0].max() / cell)) + 1
-    j1 = int(np.ceil(xy[:, 1].max() / cell)) + 1
+    i0 = int(np.floor(xy[:, 0].min() / cell)) - 2
+    j0 = int(np.floor(xy[:, 1].min() / cell)) - 2
+    i1 = int(np.ceil(xy[:, 0].max() / cell)) + 2
+    j1 = int(np.ceil(xy[:, 1].max() / cell)) + 2
     nx, ny = i1 - i0 + 1, j1 - j0 + 1
     if tris is None or not len(tris):
         gx, gy = np.meshgrid(np.arange(i0, i1 + 1) * cell, np.arange(j0, j1 + 1) * cell)
@@ -975,10 +975,10 @@ def _height_grid(frame, elev, xy, q=None, cell=GRID_M, tris=None):
             u = np.rint(u / q) * q
         return np.ascontiguousarray(u), i0, j0
     pt = xy[np.searchsorted(np.unique(tris), tris)]     # (m, 3, 2) the triangles' corners
-    lo_i = np.clip(np.floor(pt[..., 0].min(1) / cell).astype(np.int64) - 1 - i0, 0, nx - 1)
-    hi_i = np.clip(np.floor(pt[..., 0].max(1) / cell).astype(np.int64) + 1 - i0, 0, nx - 1)
-    lo_j = np.clip(np.floor(pt[..., 1].min(1) / cell).astype(np.int64) - 1 - j0, 0, ny - 1)
-    hi_j = np.clip(np.floor(pt[..., 1].max(1) / cell).astype(np.int64) + 1 - j0, 0, ny - 1)
+    lo_i = np.clip(np.floor(pt[..., 0].min(1) / cell).astype(np.int64) - 2 - i0, 0, nx - 1)
+    hi_i = np.clip(np.ceil(pt[..., 0].max(1) / cell).astype(np.int64) + 2 - i0, 0, nx - 1)
+    lo_j = np.clip(np.floor(pt[..., 1].min(1) / cell).astype(np.int64) - 2 - j0, 0, ny - 1)
+    hi_j = np.clip(np.ceil(pt[..., 1].max(1) / cell).astype(np.int64) + 2 - j0, 0, ny - 1)
     w = hi_i - lo_i + 1
     cnt = w * (hi_j - lo_j + 1)
     if int(cnt.sum()) > 8 * nx * ny:                    # (big triangles over most of the box: all of it)
@@ -1106,6 +1106,178 @@ def _hold_upper_steps(fP, fT, src, P, T_sub, tl_sub, grid, i0, j0, cell=GRID_M):
     z_lat = np.where(fy > fx, au + fy * (cu - au) + fx * (du - cu), au + fx * (bu - au) + fy * (du - bu))
     z_lat = np.where(np.isfinite(z_lat), z_lat, fP[hit, 2])
     fP[hit, 2] = np.minimum(v_ceil[hit], np.maximum(z_lat, v_floor[hit]))
+
+
+BURIED_STEP_M = 0.50  # m: draped sub-triangles deeper under 1 m / 2 m terrain are behind an overhanging step wall
+
+
+def _terrain_step_env(xy, grid, i0, j0, cell=GRID_M):
+    """Upper envelope of 1 m and 2 m terrain block interpolations at xy (n, 2)."""
+    ny, nx = grid.shape
+    gx, gy = xy[:, 0] / cell - i0, xy[:, 1] / cell - j0
+    li = np.clip(np.floor(gx).astype(np.int64), 0, nx - 2)
+    lj = np.clip(np.floor(gy).astype(np.int64), 0, ny - 2)
+    fx, fy = np.clip(gx - li, 0.0, 1.0), np.clip(gy - lj, 0.0, 1.0)
+    a1, b1, c1, d1 = grid[lj, li], grid[lj, li + 1], grid[lj + 1, li], grid[lj + 1, li + 1]
+    z_env = np.where(fy > fx, a1 + fy * (c1 - a1) + fx * (d1 - c1), a1 + fx * (b1 - a1) + fy * (d1 - b1))
+    if cell < 1.5 and nx >= 3 and ny >= 3:
+        for px0 in (0, 1):
+            i2 = np.clip(((li - px0) // 2) * 2 + px0, 0, nx - 3)
+            tx2 = np.clip((gx - i2) * 0.5, 0.0, 1.0)
+            for py0 in (0, 1):
+                j2 = np.clip(((lj - py0) // 2) * 2 + py0, 0, ny - 3)
+                ty2 = np.clip((gy - j2) * 0.5, 0.0, 1.0)
+                z00 = np.where(np.isfinite(grid[j2, i2]), grid[j2, i2], z_env)
+                z10 = np.where(np.isfinite(grid[j2, i2 + 2]), grid[j2, i2 + 2], z_env)
+                z01 = np.where(np.isfinite(grid[j2 + 2, i2]), grid[j2 + 2, i2], z_env)
+                z11 = np.where(np.isfinite(grid[j2 + 2, i2 + 2]), grid[j2 + 2, i2 + 2], z_env)
+                z2 = (1.0 - ty2) * ((1.0 - tx2) * z00 + tx2 * z10) + ty2 * ((1.0 - tx2) * z01 + tx2 * z11)
+                z_env = np.where(np.isfinite(z2), np.maximum(z_env, z2), z_env)
+    return z_env
+
+
+def _bisect_step_edge(fP, fUV, u_pos, u_neg, grid, i0, j0, cell=GRID_M):
+    """Interpolate vertices along edges u_pos -> u_neg right on the unburied side of the -BURIED_STEP_M contour."""
+    p0, p1 = fP[u_pos], fP[u_neg]
+    uv0, uv1 = fUV[u_pos], fUV[u_neg]
+    t_lo = np.zeros(len(u_pos), dtype=np.float64)
+    t_hi = np.ones(len(u_pos), dtype=np.float64)
+    for _ in range(5):
+        tm = 0.5 * (t_lo + t_hi)
+        pm = p0 + tm[:, None] * (p1 - p0)
+        zm = _terrain_step_env(pm[:, :2], grid, i0, j0, cell)
+        ok = ~np.isfinite(zm) | ((pm[:, 2] - zm) >= -BURIED_STEP_M)
+        t_lo = np.where(ok, tm, t_lo)
+        t_hi = np.where(ok, t_hi, tm)
+    p_cut = p0 + t_lo[:, None] * (p1 - p0)
+    uv_cut = uv0 + t_lo[:, None] * (uv1 - uv0)
+    return p_cut, uv_cut
+
+
+def _trim_buried_step_tris(fP, fUV, fT, src, grid, i0, j0, cell=GRID_M):
+    """Clip or drop draped sub-triangles clamped behind an overhanging terrain step or embankment (> BURIED_STEP_M
+    below the 1 m or 2 m terrain block envelope) while keeping the unburied adjacent lane intact."""
+    if not len(fP) or not len(fT):
+        return fP, fUV, fT, src
+    ny, nx = grid.shape
+    if nx < 2 or ny < 2:
+        return fP, fUV, fT, src
+    ga, gb, gc, gd = grid[:-1, :-1], grid[:-1, 1:], grid[1:, :-1], grid[1:, 1:]
+    c_min = np.minimum(np.minimum(ga, gb), np.minimum(gc, gd))
+    c_max = np.maximum(np.maximum(ga, gb), np.maximum(gc, gd))
+    step_cells = np.isfinite(c_min) & np.isfinite(c_max) & ((c_max - c_min) > FOLLOW_STEP_M)
+    if not step_cells.any():
+        return fP, fUV, fT, src
+    near = np.zeros((ny, nx), dtype=np.int32)
+    for dj in range(-2, 3):
+        j_src0, j_src1 = max(0, -dj), min(ny - 1, ny - 1 - dj)
+        for di in range(-2, 3):
+            i_src0, i_src1 = max(0, -di), min(nx - 1, nx - 1 - di)
+            if j_src1 > j_src0 and i_src1 > i_src0:
+                near[j_src0 + dj:j_src1 + dj, i_src0 + di:i_src1 + di] |= step_cells[j_src0:j_src1, i_src0:i_src1]
+    sat = np.zeros((ny + 1, nx + 1), dtype=np.int32)
+    sat[1:, 1:] = np.cumsum(np.cumsum(near > 0, axis=0), axis=1)
+
+    def _touches_near(tris):
+        pts = fP[tris, :2]
+        x0 = np.clip(np.floor(pts[:, :, 0].min(axis=1) / cell).astype(np.int64) - i0, 0, nx - 1)
+        x1 = np.clip(np.floor(pts[:, :, 0].max(axis=1) / cell).astype(np.int64) - i0 + 1, 1, nx)
+        y0 = np.clip(np.floor(pts[:, :, 1].min(axis=1) / cell).astype(np.int64) - j0, 0, ny - 1)
+        y1 = np.clip(np.floor(pts[:, :, 1].max(axis=1) / cell).astype(np.int64) - j0 + 1, 1, ny)
+        return (sat[y1, x1] - sat[y0, x1] - sat[y1, x0] + sat[y0, x0]) > 0
+
+    hit = _touches_near(fT)
+    if not hit.any():
+        return fP, fUV, fT, src
+    safe_T, safe_src = [fT[~hit]], [src[~hit]]
+    cand_T, cand_src = fT[hit], src[hit]
+    for _ in range(6):
+        if not len(cand_T):
+            break
+        in_near = _touches_near(cand_T)
+        if (~in_near).any():
+            safe_T.append(cand_T[~in_near])
+            safe_src.append(cand_src[~in_near])
+            cand_T, cand_src = cand_T[in_near], cand_src[in_near]
+            if not len(cand_T):
+                break
+        e01 = ((fP[cand_T[:, 0], :2] - fP[cand_T[:, 1], :2]) ** 2).sum(axis=1)
+        e12 = ((fP[cand_T[:, 1], :2] - fP[cand_T[:, 2], :2]) ** 2).sum(axis=1)
+        e20 = ((fP[cand_T[:, 2], :2] - fP[cand_T[:, 0], :2]) ** 2).sum(axis=1)
+        need = np.maximum(e01, np.maximum(e12, e20)) > 4.0
+        if not need.any():
+            break
+        sub, s_need = cand_T[need], cand_src[need]
+        which = np.argmax(np.c_[e01[need], e12[need], e20[need]], axis=1)
+        rr = np.arange(len(sub))
+        a = sub[rr, which]
+        b = sub[rr, (which + 1) % 3]
+        c = sub[rr, (which + 2) % 3]
+        m_idx = len(fP) + rr
+        fP = np.vstack([fP, 0.5 * (fP[a] + fP[b])])
+        fUV = np.vstack([fUV, 0.5 * (fUV[a] + fUV[b])])
+        cand_T = np.vstack([cand_T[~need], np.c_[a, m_idx, c], np.c_[m_idx, b, c]])
+        cand_src = np.concatenate([cand_src[~need], s_need, s_need])
+
+    if len(cand_T):
+        v_env = _terrain_step_env(fP[:, :2], grid, i0, j0, cell)
+        v_ok = ~np.isfinite(v_env) | ((fP[:, 2] - v_env) >= -BURIED_STEP_M)
+        tok = v_ok[cand_T]
+        npos = tok.sum(axis=1)
+        m3 = npos == 3
+        if m3.any():
+            t3, s3 = cand_T[m3], cand_src[m3]
+            ctr3 = fP[t3].mean(axis=1)
+            c_env3 = _terrain_step_env(ctr3[:, :2], grid, i0, j0, cell)
+            ok3 = ~np.isfinite(c_env3) | ((ctr3[:, 2] - c_env3) >= -BURIED_STEP_M)
+            safe_T.append(t3[ok3])
+            safe_src.append(s3[ok3])
+        m1 = npos == 1
+        if m1.any():
+            t1, s1 = cand_T[m1], cand_src[m1]
+            sh1 = np.argmax(tok[m1], axis=1)
+            r1 = np.arange(len(t1))
+            p0 = t1[r1, sh1]
+            n1 = t1[r1, (sh1 + 1) % 3]
+            n2 = t1[r1, (sh1 + 2) % 3]
+            pe1, uve1 = _bisect_step_edge(fP, fUV, p0, n1, grid, i0, j0, cell)
+            pe2, uve2 = _bisect_step_edge(fP, fUV, p0, n2, grid, i0, j0, cell)
+            ie1 = len(fP) + r1
+            ie2 = len(fP) + len(t1) + r1
+            fP = np.vstack([fP, pe1, pe2])
+            fUV = np.vstack([fUV, uve1, uve2])
+            nt1 = np.c_[p0, ie1, ie2]
+            ar1 = np.linalg.norm(np.cross(fP[nt1[:, 1]] - fP[nt1[:, 0]], fP[nt1[:, 2]] - fP[nt1[:, 0]]), axis=1)
+            v1 = ar1 > 1e-5
+            safe_T.append(nt1[v1])
+            safe_src.append(s1[v1])
+        m2 = npos == 2
+        if m2.any():
+            t2, s2 = cand_T[m2], cand_src[m2]
+            neg_pos = np.argmin(tok[m2], axis=1)
+            sh2 = (neg_pos + 1) % 3
+            r2 = np.arange(len(t2))
+            p0 = t2[r2, sh2]
+            p1 = t2[r2, (sh2 + 1) % 3]
+            n2 = t2[r2, (sh2 + 2) % 3]
+            pe1, uve1 = _bisect_step_edge(fP, fUV, p1, n2, grid, i0, j0, cell)
+            pe0, uve0 = _bisect_step_edge(fP, fUV, p0, n2, grid, i0, j0, cell)
+            ie1 = len(fP) + r2
+            ie0 = len(fP) + len(t2) + r2
+            fP = np.vstack([fP, pe1, pe0])
+            fUV = np.vstack([fUV, uve1, uve0])
+            qa = np.c_[p0, p1, ie1]
+            qb = np.c_[p0, ie1, ie0]
+            nt2 = np.vstack([qa, qb])
+            ns2 = np.concatenate([s2, s2])
+            ar2 = np.linalg.norm(np.cross(fP[nt2[:, 1]] - fP[nt2[:, 0]], fP[nt2[:, 2]] - fP[nt2[:, 0]]), axis=1)
+            v2 = ar2 > 1e-5
+            safe_T.append(nt2[v2])
+            safe_src.append(ns2[v2])
+
+    out_T = np.vstack([t for t in safe_T if len(t)]) if any(len(t) for t in safe_T) else np.empty((0, 3), np.int64)
+    out_src = np.concatenate([s for s in safe_src if len(s)]) if any(len(s) for s in safe_src) else np.empty(0, np.int64)
+    return fP, fUV, out_T, out_src
 
 
 def _shared(P, UV, T):
@@ -1594,6 +1766,9 @@ def build(frame, chunks, elev, origin, lift=0.0, clip=None, follow=False, q=None
                     continue
                 fP, fUV, fT, src = follow_ground(P[:, :2], UV, T[mask], grid, i0, j0, tol=tol)
                 _hold_upper_steps(fP, fT, src, P, T[mask], TL[mask], grid, i0, j0)
+                fP, fUV, fT, src = _trim_buried_step_tris(fP, fUV, fT, src, grid, i0, j0)
+                if not len(fT):
+                    continue
                 lifts = TL[mask][src]
                 vl = np.zeros(len(fP))              # (a cut piece's points are its fan's: one lift each, set once)
                 for kk in range(3):

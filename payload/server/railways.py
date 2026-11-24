@@ -176,6 +176,134 @@ def _flushed(frame, cells, box, rails, prof, ground, tunnels):
     return out
 
 
+def _lift_decks_over_graded(frame, rails, zbs, zgs, underpasses, ground, levels=None,
+                            cells=None, box=None, reach=REACH_M):
+    """Raise bridge spans in zbs where graded ground, underpasses, or lower road bridges exceed the raw-DEM
+    clearance solved by railprofile.beds, while keeping ground/tunnel beds and ground-to-bridge abutments exact."""
+    decks = [n for n, (_f, _c, k, _xy) in enumerate(rails) if k == "bridge"]
+    if not decks:
+        return zbs
+    lines = [xy for *_, xy in rails]
+    _nodes, edges, _adj = roads._chain_graph(lines)
+    pin_z = {}
+    for n, ((_f, _c, kind, _xy), (a, b, _s)) in enumerate(zip(rails, edges)):
+        if kind != "bridge":
+            pin_z.setdefault(a, []).append(float(zbs[n][0]))
+            pin_z.setdefault(b, []).append(float(zbs[n][-1]))
+    pin_h = {nd: float(np.mean(vals)) for nd, vals in pin_z.items()}
+    rail_boxes = _rail_boxes(rails)
+    crossings_up = []
+    for item in (underpasses or ()):
+        line, half = item[0], item[1]
+        is_surface = isinstance(item, _SurfaceUnderpass)
+        is_tunnel = not is_surface
+        masks = _underpass_masks(rails, line, half, DECK_HALF_M + STEP_M, rail_boxes,
+                                 min_sin=0.0 if is_surface else UNDERPASS_MIN_SIN,
+                                 overlap=is_surface)
+        if any(masks[n].any() for n in decks):
+            crossings_up.append((line, half, masks, is_tunnel))
+    up_samples = []
+    for ln, _hw, _masks, is_tunnel in crossings_up:
+        if is_tunnel:
+            pts = ln[[0, -1]]
+        else:
+            s_ln = _arc(ln)
+            pts = _resample(ln, STEP_M) if len(ln) >= 2 and float(np.diff(s_ln).max()) > STEP_M + 1e-6 else ln
+        up_samples.append((pts, _arc(pts) / max(float(_arc(pts)[-1]), 1e-9)))
+    if up_samples:
+        all_up = np.concatenate([pts for pts, _t in up_samples])
+        z_up_all = np.asarray(ground(all_up), np.float64).ravel()
+        up_z, k = [], 0
+        for pts, t_pts in up_samples:
+            up_z.append((t_pts, z_up_all[k:k + len(pts)]))
+            k += len(pts)
+    else:
+        up_z = []
+    road_decks = ((_bridge_context(frame, cells, box, reach, rails, ground, levels=levels)
+                   if cells is not None and box is not None else None) or ())
+    road_deck_boxes = ([np.array([float(r_xy[:, 0].min()), float(r_xy[:, 1].min()),
+                                  float(r_xy[:, 0].max()), float(r_xy[:, 1].max())], np.float64)
+                        for r_xy, *_ in road_decks] if road_decks else [])
+    part_lv = [round(float(levels.get(id(xy), 1.0)), 3) if levels is not None else 1.0 for *_, xy in rails]
+    deck_grade = [max(LINE_GRADE.get(cls, GRADE), roads.DECK_MAX_GRADE) for _f, cls, _k, _xy in rails]
+    out = [np.asarray(z, np.float64).copy() for z in zbs]
+    solved_rail_decks = []
+    for tier_lv in sorted({part_lv[n] for n in decks}):
+        tier = [n for n in decks if part_lv[n] == tier_lv]
+        t_idx = {}
+        for n in tier:
+            t_idx.setdefault(edges[n][0], len(t_idx))
+            t_idx.setdefault(edges[n][1], len(t_idx))
+        t_adj = [[] for _ in range(len(t_idx))]
+        for n in tier:
+            a, b, s = edges[n]
+            ua, ub = t_idx[a], t_idx[b]
+            w = float(deck_grade[n]) * float(s[-1])
+            t_adj[ua].append((ub, w))
+            t_adj[ub].append((ua, w))
+        pin_seeds = {t_idx[nd]: pin_h[nd] for nd in t_idx if nd in pin_h}
+        if pin_seeds:
+            base_pin = min(pin_seeds.values())
+            d_pin = roads._dijkstra(t_adj, {u: h - base_pin for u, h in pin_seeds.items()})
+            cap_node = [base_pin + d if np.isfinite(d) else np.inf for d in d_pin]
+        else:
+            cap_node = [np.inf] * len(t_idx)
+        for n in tier:
+            cls, xy = rails[n][1], rails[n][3]
+            rail_half = TRAM_DECK_HALF_M if cls == "tram" else DECK_HALF_M
+            a, b, s = edges[n]
+            ua, ub = t_idx[a], t_idx[b]
+            g_n = deck_grade[n]
+            cap_a = cap_node[ua] + g_n * s if np.isfinite(cap_node[ua]) else np.full(len(s), np.inf)
+            cap_b = cap_node[ub] + g_n * (s[-1] - s) if np.isfinite(cap_node[ub]) else np.full(len(s), np.inf)
+            cap_n = np.maximum(np.minimum(cap_a, cap_b), out[n])
+            req = np.maximum(out[n], zgs[n] + DECK_D - BALLAST_H)
+            for (line, _half, masks, _is_tun), (t_pts, z_pts) in zip(crossings_up, up_z):
+                over = masks[n]
+                if over.any():
+                    _distance, t = _underpass_distance(xy, line)
+                    z_under = np.interp(t[over], t_pts, z_pts)
+                    req[over] = np.maximum(req[over], z_under + UNDERPASS_CLEAR_M + DECK_D - BALLAST_H)
+            for (r_xy, r_arc, r_hw, r_lv, _r_veh, r_z), r_box in zip(road_decks, road_deck_boxes):
+                if r_lv < tier_lv - 0.5 and _box_pad_overlap(rail_boxes[n], r_box, r_hw + rail_half + 1.0):
+                    dist, s_on, _ = _polyline_overlap(xy, r_xy)
+                    over = dist <= r_hw + rail_half + 0.5
+                    if over.any():
+                        z_r_at = np.interp(s_on[over], r_arc, r_z)
+                        req[over] = np.maximum(req[over], z_r_at + UNDERPASS_CLEAR_M + DECK_D - BALLAST_H)
+            for l_xy, l_arc, l_hw, l_box, l_z in solved_rail_decks:
+                if _box_pad_overlap(rail_boxes[n], l_box, l_hw + rail_half + 1.0):
+                    dist, s_on, _ = _polyline_overlap(xy, l_xy)
+                    over = dist <= l_hw + rail_half + 0.5
+                    if over.any():
+                        z_l_at = np.interp(s_on[over], l_arc, l_z)
+                        req[over] = np.maximum(req[over], z_l_at + UNDERPASS_CLEAR_M + DECK_D)
+            req = np.minimum(req, cap_n)
+            out[n] = np.minimum(_envelope(s, req, grade=g_n), cap_n)
+        if len(tier) > 1:
+            t_seeds = {}
+            for n in tier:
+                a, b, _s = edges[n]
+                ua, ub = t_idx[a], t_idx[b]
+                t_seeds[ua] = max(t_seeds.get(ua, -np.inf), float(out[n][0]))
+                t_seeds[ub] = max(t_seeds.get(ub, -np.inf), float(out[n][-1]))
+            t_top = max(t_seeds.values())
+            t_d = roads._dijkstra(t_adj, {u: t_top - h for u, h in t_seeds.items()})
+            for n in tier:
+                a, b, s = edges[n]
+                ua, ub = t_idx[a], t_idx[b]
+                g_n = deck_grade[n]
+                cap_a = cap_node[ua] + g_n * s if np.isfinite(cap_node[ua]) else np.full(len(s), np.inf)
+                cap_b = cap_node[ub] + g_n * (s[-1] - s) if np.isfinite(cap_node[ub]) else np.full(len(s), np.inf)
+                cap_n = np.maximum(np.minimum(cap_a, cap_b), zbs[n])
+                reach_z = np.maximum(t_top - t_d[ua] - g_n * s, t_top - t_d[ub] - g_n * (s[-1] - s))
+                out[n] = np.minimum(_envelope(s, np.maximum(out[n], reach_z), grade=g_n), cap_n)
+        for n in tier:
+            rail_half = TRAM_DECK_HALF_M if rails[n][1] == "tram" else DECK_HALF_M
+            solved_rail_decks.append((rails[n][3], edges[n][2], rail_half, rail_boxes[n], out[n]))
+    return out
+
+
 def _beds(frame, rails, ground, underpasses, load=None, elev=None, raw=None, levels=None,
           cells=None, box=None, reach=REACH_M):
     """railways.profile of rails, its beds from railprofile's lattice of node profiles (the same bed in every tile and
@@ -196,9 +324,21 @@ def _beds(frame, rails, ground, underpasses, load=None, elev=None, raw=None, lev
                if cells is not None and box is not None else None)
         old = profile(rails, ground, underpasses, levels=levels, context=ctx)
         if new is None:
+            if railprofile.ENABLED and railprofile.JOIN_ON and rails:
+                joined = railprofile.join_beds(rails, [zb for zb, _zg in old])
+                return [(z, zg) for z, (_zb, zg) in zip(joined, old)]
             return old
-        return [(np.where(np.isfinite(z), z, zb), zg) for z, (zb, zg) in zip(new, old)]
-    return [(z, np.asarray(ground(xy), np.float64)) for z, (_f, _c, _k, xy) in zip(new, rails)]
+        merged = [np.where(np.isfinite(z), z, zb) for z, (zb, _zg) in zip(new, old)]
+        zgs = [zg for _zb, zg in old]
+        if raw is None and any(k == "bridge" for _f, _c, k, _xy in rails):
+            merged = _lift_decks_over_graded(frame, rails, merged, zgs, underpasses, ground,
+                                             levels=levels, cells=cells, box=box, reach=reach)
+        return list(zip(merged, zgs))
+    zgs = [np.asarray(ground(xy), np.float64) for _f, _c, _k, xy in rails]
+    if raw is None and any(k == "bridge" for _f, _c, k, _xy in rails):
+        new = _lift_decks_over_graded(frame, rails, new, zgs, underpasses, ground,
+                                      levels=levels, cells=cells, box=box, reach=reach)
+    return list(zip(new, zgs))
 
 
 def grade_plans(frame, cells, box, elev, load=None):
@@ -1055,13 +1195,19 @@ def _crossings(frame, cells, box, reach=REACH_M, parts_fn=roads.ground_parts, sp
         cls_arr = feats.attrs.get("class") if with_class else None
         for i in _box_hits(feats.boxes(frame), near):
             sp = specs[i]
-            fid = str(feats.ids[i])
-            if sp is None or fid in seen:
+            if sp is None:
                 continue
-            seen.add(fid)
+            fid = str(feats.ids[i])
             cls = str(getattr(sp, "cls", None) or (cls_arr[i] if cls_arr is not None else "")) if with_class else None
             for ring in parts_fn(feats, i):
                 e, n = mapgeom.enu_xy(feats, frame, ring)
+                if len(e) < 2:
+                    continue
+                key = (fid, round(float(e[0]), 1), round(float(n[0]), 1),
+                       round(float(e[-1]), 1), round(float(n[-1]), 1))
+                if key in seen:
+                    continue
+                seen.add(key)
                 xy = np.column_stack((e, n))
                 out.append((xy, sp.width / 2, cls) if with_class else (xy, sp.width / 2))
     return out
@@ -1180,9 +1326,6 @@ def motorway_crossings(frame, cells, box, reach=REACH_M):
             c = str(clss[i])
             base = c[:-5] if c.endswith("_link") else c
             fid = str(feats.ids[i])
-            if fid in seen:
-                continue
-            seen.add(fid)
             st = roads.STYLE.get(c) or roads.STYLE.get(base)
             if st is None or roads.unbuilt(feats, i):
                 continue
@@ -1193,6 +1336,11 @@ def motorway_crossings(frame, cells, box, reach=REACH_M):
             for ring in roads.ground_parts(feats, i):
                 e, n = mapgeom.enu_xy(feats, frame, ring)
                 if len(e) >= 2:
+                    key = (fid, round(float(e[0]), 1), round(float(n[0]), 1),
+                           round(float(e[-1]), 1), round(float(n[-1]), 1))
+                    if key in seen:
+                        continue
+                    seen.add(key)
                     out.append((np.column_stack((e, n)), half, base))
     return out
 
@@ -1305,7 +1453,7 @@ def _through_motorways(feats):
 def _motorway_ground(frame, cells, box, reach=REACH_M):
     """[(xy (k, 2), half width)] of ground motorway carriageways near box (not links, not bridges or tunnels)."""
     near = (box[0] - reach, box[1] - reach, box[2] + reach, box[3] + reach)
-    half = roads.STYLE["motorway"][0] / 2.0
+    default_half = roads.STYLE["motorway"][0] / 2.0
     seen, out = set(), []
     for feats in cells:
         if feats is None or len(feats) == 0 or "class" not in feats.attrs:
@@ -1315,9 +1463,14 @@ def _motorway_ground(frame, cells, box, reach=REACH_M):
         if not np.any(big):
             continue
         through = _through_motorways(feats)
+        rs = None
         for i in _box_hits(feats.boxes(frame), near, big):
             if not through[i]:
                 continue
+            if rs is None:
+                rs = roads.road_specs(feats)
+            sp = rs[i] if i < len(rs) else None
+            half = float(sp.width) / 2.0 if sp is not None else default_half
             for ring in roads.ground_parts(feats, i):
                 e, n = mapgeom.enu_xy(feats, frame, ring)
                 if len(e) < 2:
@@ -2469,10 +2622,11 @@ def tunnel_hole_mask(parts_, u, cx, cy, square):
     return mask
 
 
-def _deck(mesh, p, uu, t, v, ballast, concrete):
+def _deck(mesh, p, uu, t, v, ballast, concrete, bottom=None):
     """A bridge's deck: ballast on a concrete trough, its edge walls over the ballast, its underside DECK_D down."""
     up = np.array([0.0, 0.0, 1.0])
     out_l = np.c_[uu, np.zeros(len(p))]
+    bot = t - DECK_D if bottom is None else bottom
     mesh.strip(np.c_[p + uu * (DECK_HALF_M - DECK_WALL_T), t], np.c_[p - uu * (DECK_HALF_M - DECK_WALL_T), t],
                0.0, 2 * DECK_HALF_M / 3.0, v, ballast, up)
     for sg in (1, -1):
@@ -2481,23 +2635,59 @@ def _deck(mesh, p, uu, t, v, ballast, concrete):
         hi = t + DECK_WALL_H
         mesh.strip(np.c_[e_in, t], np.c_[e_in, hi], 0.0, 0.2, v / 1.5, concrete, -o)
         mesh.strip(np.c_[e_in, hi], np.c_[e_out, hi], 0.0, 0.1, v / 1.5, concrete, up)
-        mesh.strip(np.c_[e_out, hi], np.c_[e_out, t - DECK_D], 0.0, 0.6, v / 1.5, concrete, o)
-    mesh.strip(np.c_[p + uu * DECK_HALF_M, t - DECK_D], np.c_[p - uu * DECK_HALF_M, t - DECK_D],
+        mesh.strip(np.c_[e_out, hi], np.c_[e_out, bot], 0.0, 0.6, v / 1.5, concrete, o)
+    mesh.strip(np.c_[p + uu * DECK_HALF_M, bot], np.c_[p - uu * DECK_HALF_M, bot],
                0.0, 1.0, v / 1.5, concrete, -up)
 
 
-def _tram_deck(mesh, p, uu, t, v, concrete):
+def _tram_deck(mesh, p, uu, t, v, concrete, bottom=None):
     """An embedded tram track's concrete slab, not a mainline ballast trough.
     t is the common ballast-top datum; keep its underside identical to _deck
     so grading and pier placement consume the same structural depth."""
     up = np.array([0.0, 0.0, 1.0])
     out_l = np.c_[uu, np.zeros(len(p))]
     left, right = p + uu * TRAM_DECK_HALF_M, p - uu * TRAM_DECK_HALF_M
-    top, bottom = t - BALLAST_H + FLUSH_LIFT_M, t - DECK_D
+    top = t - BALLAST_H + FLUSH_LIFT_M
+    bot = t - DECK_D if bottom is None else bottom
     mesh.strip(np.c_[left, top], np.c_[right, top], 0.0, 0.9, v, concrete, up)
     for edge, normal in ((left, out_l), (right, -out_l)):
-        mesh.strip(np.c_[edge, top], np.c_[edge, bottom], 0.0, 0.5, v, concrete, normal)
-    mesh.strip(np.c_[left, bottom], np.c_[right, bottom], 0.0, 0.9, v, concrete, -up)
+        mesh.strip(np.c_[edge, top], np.c_[edge, bot], 0.0, 0.5, v, concrete, normal)
+    mesh.strip(np.c_[left, bot], np.c_[right, bot], 0.0, 0.9, v, concrete, -up)
+
+
+def _deck_mw_bottom(p, uu, t, dh, mw_crossers, ground):
+    """Taper a bridge deck's underside up at motorway trench-rim abutments so the 1.4 m hanging belly does not
+    dip within MOTORWAY_EXCLUDE_DZ of an embankment slope inside the motorway half-width."""
+    bot = t - DECK_D
+    if not mw_crossers or len(p) < 2:
+        return bot
+    near_mw = _blocked(p, t - BALLAST_H, mw_crossers, pad=dh + 2.0, dz=1e9)
+    seg_mw = near_mw[:-1] | near_mw[1:]
+    if not np.any(seg_mw):
+        return bot
+    idx = np.flatnonzero(seg_mw)
+    mid = 0.5 * (p[idx] + p[idx + 1])
+    umu = 0.5 * (uu[idx] + uu[idx + 1])
+    probes = np.vstack([
+        p[idx], p[idx + 1], mid,
+        mid + umu * (0.5 * dh), mid - umu * (0.5 * dh),
+    ])
+    zg_p = np.asarray(ground(probes), np.float64).reshape(5, len(idx))
+    bed_seg = np.minimum(t[idx], t[idx + 1]) - BALLAST_H
+    valid = zg_p < (bed_seg[None, :] - 0.5)
+    zg_hi = np.where(valid, zg_p, -np.inf).max(axis=0)
+    req_bot = zg_hi + MOTORWAY_EXCLUDE_DZ + 0.35
+    need = np.isfinite(req_bot) & (req_bot > np.minimum(bot[idx], bot[idx + 1]))
+    if not np.any(need):
+        return bot
+    bot = bot.copy()
+    max_bot = t - BALLAST_H - 0.10
+    for k_pos in np.flatnonzero(need):
+        s_i = int(idx[k_pos])
+        target = float(req_bot[k_pos])
+        bot[s_i] = max(bot[s_i], min(float(max_bot[s_i]), target))
+        bot[s_i + 1] = max(bot[s_i + 1], min(float(max_bot[s_i + 1]), target))
+    return bot
 
 
 def _piers(s, xy, u, t, zg, i, j):
@@ -3230,6 +3420,16 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
     if not rails and not walk:
         return (None, []) if return_decks else None
     cu = coarse_underpasses(frame, cells, box, rails, elev=bed_elev, ground=far_ground or ground) if rails else []
+    if rails and bed_elev is not None:
+        seen_cu = {(round(float(it[0][0, 0]), 1), round(float(it[0][0, 1]), 1),
+                    round(float(it[0][-1, 0]), 1), round(float(it[0][-1, 1]), 1)) for it in cu if len(it[0])}
+        for it in coarse_underpasses(frame, cells, box, rails, elev=None, ground=ground):
+            if len(it[0]):
+                ck = (round(float(it[0][0, 0]), 1), round(float(it[0][0, 1]), 1),
+                      round(float(it[0][-1, 0]), 1), round(float(it[0][-1, 1]), 1))
+                if ck not in seen_cu:
+                    seen_cu.add(ck)
+                    cu.append(it)
     prof = (_beds(frame, rails, ground, tunnels + cu, load, bed_elev,
                   levels=part_levels, cells=cells, box=box, reach=REACH_M) if rails else [])
     keep = [n for n in range(len(rails)) if n not in _drop]
@@ -3306,10 +3506,17 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
                 top = zb + BALLAST_H
                 finals[n_part] = zb
             # Suppress ground railway mesh inside motorways and trim motorway-facing ballast/fill shoulders.
-            mw_mask = _mw_blocked(xy, zb, zg, mw_crossers, half_g - RAIL_HEAD / 2 + COLLIDER_W + 0.01)
+            mw_pad = half_g - RAIL_HEAD / 2 + COLLIDER_W + 0.01
+            mw_mask = _mw_blocked(xy, zb, zg, mw_crossers, mw_pad)
+            if mw_crossers:
+                mw_mask = mw_mask | (
+                    _blocked(xy, zb, mw_crossers, pad=mw_pad, dz=1e9)
+                    & (np.abs(zb - zg) <= MOTORWAY_EXCLUDE_DZ + 0.45)
+                )
             cut = blk | mw_mask | ~inside
+            mw_deck_clear = zb > zg + MOTORWAY_EXCLUDE_DZ + 0.45
             over_mw = (_blocked(xy, zb, mw_crossers, pad=BALLAST_TOP_M, dz=1e9)
-                       & ~cut & (zb > zg + MOTORWAY_EXCLUDE_DZ)) if mw_crossers else None
+                       & ~cut & mw_deck_clear) if mw_crossers else None
             # the ballast's sides to the ground beside: wider where the bed stands high (a ramp's embankment)
             near = BALLAST_TOP_M + BALLAST_SLOPE * (BALLAST_H + BALLAST_FOOT_M)
             feet = []
@@ -3337,9 +3544,18 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
             top_l = np.minimum(BALLAST_TOP_M, np.maximum(0.0, feet[0][0] - 0.02))
             top_r = np.minimum(BALLAST_TOP_M, np.maximum(0.0, feet[1][0] - 0.02))
         else:
+            dh_mw = TRAM_DECK_HALF_M if cls == "tram" else DECK_HALF_M
             mw_mask = None
+            if kind == "bridge" and mw_crossers:
+                mw_mask = _mw_blocked(xy, zb, zg, mw_crossers, dh_mw)
+                in_mw_b = _blocked(xy, zb, mw_crossers, pad=dh_mw, dz=1e9)
+                if np.any(in_mw_b):
+                    zg_l = np.asarray(ground(xy[in_mw_b] + u[in_mw_b] * dh_mw), np.float64)
+                    zg_r = np.asarray(ground(xy[in_mw_b] - u[in_mw_b] * dh_mw), np.float64)
+                    zg_edge = np.maximum(zg[in_mw_b], np.maximum(zg_l, zg_r))
+                    mw_mask[in_mw_b] |= np.abs(zb[in_mw_b] - zg_edge) <= MOTORWAY_EXCLUDE_DZ + 0.45
             over_mw = None
-            cut = ~inside
+            cut = (~inside | mw_mask) if mw_mask is not None else ~inside
         if kind == "ground":
             bed_cut = (cut | over_mw) if over_mw is not None else cut
             (fl, zl), (fr, zr) = feet
@@ -3358,14 +3574,17 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
                 deck_mask = over_mw.copy()
                 deck_mask[:-1] |= over_mw[1:]
                 deck_mask[1:] |= over_mw[:-1]
+                deck_mask &= (~_blocked(xy, zb, mw_crossers, pad=DECK_HALF_M, dz=1e9)) | mw_deck_clear
+                dh_g = TRAM_DECK_HALF_M if cls == "tram" else DECK_HALF_M
                 for di, dj in _runs(cut | ~deck_mask):
                     dsl = slice(di, dj + 1)
                     dkm = _thin_run(xy[dsl], stride)
                     dp, duu, dt, dv = xy[dsl][dkm], u[dsl][dkm], top[dsl][dkm], s[dsl][dkm] / 3.0
+                    dbot_g = _deck_mw_bottom(dp, duu, dt, dh_g, mw_crossers, ground)
                     if cls == "tram":
-                        _tram_deck(mesh, dp, duu, dt, dv, concrete)
+                        _tram_deck(mesh, dp, duu, dt, dv, concrete, bottom=dbot_g)
                     else:
-                        _deck(mesh, dp, duu, dt, dv, ballast_w, concrete)
+                        _deck(mesh, dp, duu, dt, dv, ballast_w, concrete, bottom=dbot_g)
         for i, j in _runs(cut):
             sl = slice(i, j + 1)
             km = _thin_run(xy[sl], stride)
@@ -3373,10 +3592,12 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
             if kind == "tunnel":
                 _tunnel(mesh, p, uu, t, v, ballast_w, concrete, i == 0, j == len(xy) - 1)
             elif kind != "ground":
+                dh = TRAM_DECK_HALF_M if cls == "tram" else DECK_HALF_M
+                dbot = _deck_mw_bottom(p, uu, t, dh, mw_crossers, ground)
                 if cls == "tram":
-                    _tram_deck(mesh, p, uu, t, v, concrete)
+                    _tram_deck(mesh, p, uu, t, v, concrete, bottom=dbot)
                 else:
-                    _deck(mesh, p, uu, t, v, ballast_w, concrete)
+                    _deck(mesh, p, uu, t, v, ballast_w, concrete, bottom=dbot)
                 part_crossers = base_pier_crossers + [
                     (xy2, TRAM_DECK_HALF_M if cls2 == "tram" else DECK_HALF_M, zb2)
                     for m_part, cls2, xy2, zb2 in rail_bridges
@@ -3398,10 +3619,18 @@ def tile_mesh(frame, tx, ty, cells, ground, sign_style=None, far_ground=None, re
                 mesh.strip(np.c_[b, st], np.c_[b, st + RAIL_H], 0.0, 0.05, v, steel_w, -out_l)
             if cls != "tram" and emit_sleepers:
                 sp = _sleepers(s, xy, u, top, i, j, SLEEPERS_GONE[w])
-                if sp is not None and kind == "ground" and mw_crossers:
+                if sp is not None and mw_crossers:
                     sp_z = 0.5 * (sp[3] + sp[4])
-                    sp_keep = ~_mw_blocked(sp[0], sp_z, ground(sp[0]), mw_crossers, SLEEPER_L / 2 + 0.01)
-                    sp = tuple(a[sp_keep] for a in sp) if np.any(sp_keep) else None
+                    if kind == "ground":
+                        sp_keep = ~_mw_blocked(sp[0], sp_z, ground(sp[0]), mw_crossers, SLEEPER_L / 2 + 0.01)
+                        sp = tuple(a[sp_keep] for a in sp) if np.any(sp_keep) else None
+                    elif kind == "bridge":
+                        in_mw = _blocked(sp[0], sp_z, mw_crossers, pad=SLEEPER_L / 2 + 0.01, dz=1e9)
+                        if np.any(in_mw):
+                            sp_zg = np.asarray(ground(sp[0][in_mw]), np.float64)
+                            sp_keep = np.ones(len(sp_z), bool)
+                            sp_keep[in_mw] = np.abs(sp_z[in_mw] - sp_zg) > MOTORWAY_EXCLUDE_DZ + 0.1
+                            sp = tuple(a[sp_keep] for a in sp) if np.any(sp_keep) else None
                 if sp is not None:
                     small.append((sp, SLEEPER_W / 2, SLEEPER_L / 2, mesh.mat(SLEEPER_WORN[w])))
         if cls != "tram" and emit_collider:       # (the rails' physics, on straight through a level crossing)

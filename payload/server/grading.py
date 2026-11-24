@@ -542,8 +542,17 @@ TWIN_CLIMB_REACH_M = 60.0    # m from a bridge where a lone climbing carriageway
 TWIN_GORE_EDGE_MAX_M = 1.5   # m: max asphalt edge gap where a ground _link gore shares its mainline roadbed
 TWIN_GORE_RAW_MAX_M = 1.2    # m: max raw DEM gap for a ground _link gore merge
 TWIN_GORE_ALIGN = 0.96       # |ua . ub| along a parallel _link gore taper
+TWIN_LINK_EDGE_MAX_M = 6.0   # m: max edge gap between a mainline deck and a link's deck still run as one divided road
+TWIN_LINK_ALIGN = 0.98       # |ua . ub| along such a pair (a diverging ramp leaves this at once)
+TWIN_LINK_MIN_ROWS = 12      # rows a parallel link-deck pair needs to count as a sustained run (about 96 m)
 CW_STREET_END_W = 10.0 * _cw.LENGTH_BIAS  # anchor weight on a loose ground end meeting a non-family street
 ABUT_SHOULDER_TAPER_M = 8.0  # m before a bridge abutment over which an unpaved road shoulder tapers to road_half
+SOFFIT_ABUT_M = 8.0         # m from an abutment past which the ground under a span is the elevation's again (the audit's rule)
+HEAD_SLOPE_GRADE = 0.99     # m/m: a raised abutment's head slope down into its span (the old fixed slope: 1 m steps)
+HEAD_SLOPE_MAX_GRADE = 1.5  # m/m: steepest a tall abutment's head slope is made to reach the ground by SOFFIT_ABUT_M
+UNDER_FILL_OK_M = 0.35      # m of fill left under a span at SOFFIT_ABUT_M (the audit's limit is 0.40)
+SOFFIT_GROUND_CLEAR_M = 0.50  # m the ground inside a deck's own footprint stays under its soffit (the audit's limit is 0.45)
+DECK_BURIED_TOL_M = 0.30    # m the elevation must stand over that before a deck's footprint is cut down to it
 
 
 def _merge_span_chains(parts):
@@ -1029,10 +1038,13 @@ def _cw_twin_pairs(chains, samples, data, boxes, pre_stage=None):
         hw = np.fromiter((float(parts[int(i)][6]) for i in pi), dtype=np.float64, count=len(pi))
         near_br = _samples_near_bridge(s, br_arr, TWIN_APPROACH_M)
         climb_br = _samples_near_bridge(s, br_arr, TWIN_CLIMB_REACH_M)
-        qual = (near_br & ~link) | (~br_arr)
+        # (a link's own deck samples too: only the sustained parallel-link rule below pairs them, a ramp across a
+        # gore is not a twin)
+        qual = (near_br & ~link) | (~br_arr) | (br_arr & link)
         meta.append((qual, _unit_tangents(xy), _bridge_levels_along(parts, pi, br_arr, s),
                      hw, link, br_arr, near_br, climb_br, raw_arr, t_arr))
     out, seen = [], set()
+    link_rows = {}
     for na in range(len(chains)):
         qual_a, tang_a, lv_a, hw_a, link_a, br_a, near_br_a, climb_br_a, raw_a, t_a = meta[na]
         qual_idx_a = np.flatnonzero(qual_a)
@@ -1098,6 +1110,17 @@ def _cw_twin_pairs(chains, samples, data, boxes, pre_stage=None):
                 else:
                     ok_c = np.zeros(len(jb_all), dtype=bool)
                 ok = ok_a | ok_b | ok_c
+                if deck_stage_ok and br_a[ia] and np.isfinite(lv_a[ia]):
+                    # (decks side by side with a link's: a divided road one carriageway of which the map tags a link
+                    # runs at the mainline's height wherever their edges stay close: paired only on a sustained run)
+                    ok_d = (br_b_sub & (bool(link_a[ia]) | link_b_sub) & (sep >= TWIN_SEP_MIN_M)
+                            & (sep <= TWIN_SEP_MAX_M) & (edge_gaps <= TWIN_LINK_EDGE_MAX_M)
+                            & (np.abs(along) <= TWIN_ALONG_M) & (align >= TWIN_LINK_ALIGN)
+                            & (np.abs(lb - lv_a[ia]) <= 1e-6))
+                    ok_d &= ~ok
+                else:
+                    ok_d = np.zeros(len(jb_all), dtype=bool)
+                ok = ok | ok_d
                 if not np.any(ok):
                     continue
                 score = np.where(ok, sep + np.abs(along), np.inf)
@@ -1105,6 +1128,7 @@ def _cw_twin_pairs(chains, samples, data, boxes, pre_stage=None):
                 if not np.isfinite(score[k]):
                     continue
                 jb = int(jb_all[k])
+                is_link_pair = bool(ok_d[k])
                 edge_gap = float(edge_gaps[k])
                 both_ground = (not bool(br_a[ia])) and (not bool(br_b[jb]))
                 step_mod = 2 if edge_gap <= 6.0 else (3 if both_ground else TWIN_EVERY)
@@ -1129,7 +1153,13 @@ def _cw_twin_pairs(chains, samples, data, boxes, pre_stage=None):
                     else:
                         continue
                 seen.add(key)
-                out.append((na, ia, nb, jb, tol_m))
+                if is_link_pair:
+                    link_rows.setdefault((na, nb), []).append((na, ia, nb, jb, tol_m))
+                else:
+                    out.append((na, ia, nb, jb, tol_m))
+    for rows_l in link_rows.values():
+        if len(rows_l) >= TWIN_LINK_MIN_ROWS:
+            out.extend(rows_l)
     return out
 
 
@@ -5681,7 +5711,7 @@ class _Planner:
                 out.append((nu, ju, nl, jl, clear))
         return out
 
-    def _cw_z_at(self, line, pts, fid=None, require_bridge=False):
+    def _cw_z_at(self, line, pts, fid=None, require_bridge=False, _border_ends_out=None):
         """Heights of points pts (n, 2) on the family part line (of feature fid) from its carriageway's profile, or
         None. The part is the one under the arc-length midpoint (a 2-vertex bridge's middle, not its end vertex),
         with smooth Partition-of-Unity blending across z=14 cell borders inside CW_MARGIN_M."""
@@ -5713,7 +5743,35 @@ class _Planner:
             revisit.fault()         # also on later reads of the session's memoized failed region
             return None
         if require_bridge and not any(q[2] for q in reg.get("parts", ())):
-            return None
+            if _border_ends_out is None or len(line) < 2:
+                return None
+            ela, elo, _ = self.frame.enu_to_geodetic(line[:, 0], line[:, 1], 0.0)
+            ela_a = np.asarray(ela, np.float64)
+            elo_a = np.asarray(elo, np.float64)
+            pad_deg = 90.0 / 111320.0
+            cos_la = max(0.05, math.cos(math.radians(float(la[0]))))
+            pad_lo = pad_deg / cos_la
+            cand_cks = [
+                ck_nb for ck_nb in mapcells.cells_for_points(ela_a, elo_a, pad_deg, pad_lo)
+                if ck_nb != home
+            ]
+            br_bounds = []
+            for ck_nb in cand_cks:
+                try:
+                    nb_reg = self._cw_region(ck_nb)
+                except Exception:
+                    continue
+                if not nb_reg.get("failed") and any(q[2] for q in nb_reg.get("parts", ())):
+                    b_lo0, b_la0, b_lo1, b_la1 = (float(v) for v in ck_nb.bounds())
+                    br_bounds.append((b_la0 - pad_deg, b_lo0 - pad_lo, b_la1 + pad_deg, b_lo1 + pad_lo))
+            if not br_bounds:
+                return None
+            in_br = np.zeros(len(line), dtype=bool)
+            for la0_b, lo0_b, la1_b, lo1_b in br_bounds:
+                in_br |= (ela_a >= la0_b) & (ela_a <= la1_b) & (elo_a >= lo0_b) & (elo_a <= lo1_b)
+            if not in_br.any():
+                return None
+            _border_ends_out.append(in_br)
         best = None
         for q in reg["parts"]:
             if fid is not None and q[4] != fid:
@@ -5755,7 +5813,7 @@ class _Planner:
                 got_a = tuple(
                     r_dict["prof"][qq[0]]
                     for qq in r_dict["parts"]
-                    if qq[4] == fid and qq[0] in r_dict["prof"] and (not require_bridge or qq[2])
+                    if qq[4] == fid and qq[0] in r_dict["prof"]
                 )
                 alt_cache[rk] = got_a
             return got_a
@@ -5954,10 +6012,26 @@ class _Planner:
             xy = np.asarray(p.xy, np.float64)[:, :2]
             if len(xy) < 2:
                 continue
-            z = self._cw_z_at(xy, xy, str(fid).split(":")[0], require_bridge=True)
+            border_ends = []
+            z = self._cw_z_at(xy, xy, str(fid).split(":")[0], require_bridge=True, _border_ends_out=border_ends)
             if z is None:
                 continue
             pz = np.asarray(p.z, np.float64)
+            if border_ends:
+                in_br = border_ends[0]
+                if not np.all(in_br):
+                    s_b = np.r_[0.0, np.cumsum(np.hypot(*np.diff(xy, axis=0).T))]
+                    L_b = float(s_b[-1])
+                    if L_b > 1e-6:
+                        s_br = s_b[in_br]
+                        idx_r = np.searchsorted(s_br, s_b)
+                        d_r = np.where(idx_r < len(s_br), np.abs(s_br[np.minimum(idx_r, len(s_br) - 1)] - s_b), np.inf)
+                        d_l = np.where(idx_r > 0, np.abs(s_b - s_br[np.maximum(idx_r - 1, 0)]), np.inf)
+                        d_b = np.where(in_br, 0.0, np.minimum(d_l, d_r))
+                        dz_end = float(np.max(np.abs(pz[in_br] - z[in_br])))
+                        run_b = max(90.0, min(max(90.0, L_b - 20.0), dz_end * math.pi / (2.0 * 0.05)))
+                        w_cw = 0.5 * (1.0 + np.cos(math.pi * np.clip(d_b / run_b, 0.0, 1.0)))
+                        z = pz + w_cw * (z - pz)
             if n in keep_ramp and float(np.max(pz - z)) > 0.20:
                 continue
             if n in blend_ramp and float(np.max(pz - z)) > 0.20:
@@ -7751,6 +7825,14 @@ class _Planner:
                     if d_ceil_r is not None:
                         ceil_out[raised_rem] = np.minimum(ceil_out[raised_rem], np.maximum(base_flat[rri], d_ceil_r))
                 out[rem] = ceil_out
+                # (and the ground inside a deck's own footprint is never over the deck, whatever its fill: a bridge
+                # whose end stands in a cutting ran under the hill beside it, the deck 1 m under the ground)
+                d_foot = self._interior_deck_ceil(e[rem], n[rem], plans, lift, soffit=True)
+                if d_foot is not None:
+                    # (only where the elevation itself stands over the deck's soffit by more than the ceiling's own
+                    # slack: the deck's height here is read from its ends)
+                    buried = base_flat[rem] > d_foot + DECK_BURIED_TOL_M
+                    out[rem] = np.where(buried, np.minimum(out[rem], d_foot), out[rem])
         keep = self._over_tunnels(e, n)
         keep0 = keep if roads_only else self._over_tunnels(e, n, 0.0)
         spare_open = None
@@ -8205,7 +8287,7 @@ class _Planner:
             fast._ef.over_tunnel(mask, ee, nn, np.ascontiguousarray(p.xy[:, :2], np.float64), hw, 0.0)
         return mask if mask.any() else None
 
-    def _interior_deck_ceil(self, eq, nq, plans, lift):
+    def _interior_deck_ceil(self, eq, nq, plans, lift, soffit=False):
         """Compute z_deck - 0.35 m ceiling for points lying strictly inside an elevated bridge's interior deck
         footprint (>= 5 m from ends, dist <= bridge_half), or None if no points fall inside an interior slab."""
         if not len(eq) or not plans:
@@ -8337,7 +8419,8 @@ class _Planner:
                             y0 = float(xy[:, 1].min()) - hw_slab
                             x1 = float(xy[:, 0].max()) + hw_slab
                             y1 = float(xy[:, 1].max()) + hw_slab
-                            valid_decks.append((x0, y0, x1, y1, xy, seg, slen, s_br, L_br, hw_slab, z0, z1, j0, j1))
+                            valid_decks.append((x0, y0, x1, y1, xy, seg, slen, s_br, L_br, hw_slab, z0, z1, j0, j1,
+                                                float(roadsmod.deck_depth(roadsmod.geom_span([xy])))))
                         if valid_decks:
                             dbx0 = np.array([d[0] for d in valid_decks], np.float64)
                             dby0 = np.array([d[1] for d in valid_decks], np.float64)
@@ -8359,7 +8442,7 @@ class _Planner:
         z_ceil = np.full(len(eq), np.inf, np.float64)
         any_hit = False
         for d_idx in hit_d:
-            x0, y0, x1, y1, xy, seg, slen, s_br, L_br, hw_slab, z0, z1, j0, j1 = valid_decks[int(d_idx)]
+            x0, y0, x1, y1, xy, seg, slen, s_br, L_br, hw_slab, z0, z1, j0, j1, dk_depth = valid_decks[int(d_idx)]
             cand = np.flatnonzero((eq >= x0) & (eq <= x1) & (nq >= y0) & (nq <= y1))
             if not len(cand):
                 continue
@@ -8383,7 +8466,7 @@ class _Planner:
             if in_slab.any():
                 z_deck = z0 + (s_q[in_slab] / L_br) * (z1 - z0)
                 hi = cand[in_slab]
-                z_ceil[hi] = np.minimum(z_ceil[hi], z_deck - 0.35)
+                z_ceil[hi] = np.minimum(z_ceil[hi], z_deck - (dk_depth + SOFFIT_GROUND_CLEAR_M if soffit else 0.35))
                 any_hit = True
         return z_ceil if any_hit else None
 
@@ -8443,7 +8526,11 @@ class _Planner:
                         hi = hi[raised]
                         pr_s = proj[slope][raised]
                         lat_s = lat[slope][raised]
-                        z_long = z_ab - 0.99 * (pr_s - 0.55)
+                        z_long = z_ab - HEAD_SLOPE_GRADE * (pr_s - 0.55)
+                        # (a tall abutment's head slope steepens to come down to the ground by SOFFIT_ABUT_M as well: at
+                        # 0.99 m/m an 11 m rise was still 3 m up under the span 9 m out, HEAD_SLOPE_MAX_GRADE at most)
+                        need_g = (z_ab - bq[hi] - UNDER_FILL_OK_M) / max(SOFFIT_ABUT_M - 0.55 - 0.05, 1.0)
+                        z_long = np.minimum(z_long, z_ab - np.clip(need_g, HEAD_SLOPE_GRADE, HEAD_SLOPE_MAX_GRADE) * (pr_s - 0.55))
                         for q in plans:
                             if q is p or (p_rid is not None and getattr(q, "rid", None) == p_rid) or len(q.xy) < 2:
                                 continue

@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.4.0
+
+### Highlights
+- Support **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta.dev.567** (`earthfast 607` / `v2host`) in full solver mode (`full_solver`, via `direct` mode up to `v1.10.1-beta` and `bridged_v2` runtime hooks on `dev.567`), while retaining automatic `client_and_reporter` fallback for future unknown ABIs (`PLANS_FORMAT = 55`).
+- Merge Wave 5 bridge, corridor, tunnel, and railway solver improvements: tall-abutment head-slope soffit grading, sustained parallel link-to-mainline deck pairing, buried-deck footprint excavation, cross-cell divided carriageway continuity, terrain step-ribbon trimming, split twin-tunnel headroom compensation, and graded railway bridge underpass clearance with motorway sleeper exclusion (`railways`, `railprofile`, `rails`, `grading`, `roadmesh`, `roads`).
+
 ## v0.3.1
 
 ### Highlights

@@ -149,12 +149,15 @@ def tram_lines(frame, tx, ty, cells):
             continue
         hit = (np.asarray(feats.attrs["subtype"]).astype(str) == "rail") & (np.asarray(feats.attrs["class"]).astype(str) == "tram")
         for i in np.flatnonzero(hit):
-            if str(feats.ids[i]) in seen:
-                continue
-            seen.add(str(feats.ids[i]))
+            fid = str(feats.ids[i])
             for part in roads.ground_parts(feats, i):
                 xy = _enu(frame, np.asarray(part, np.float64))
                 if len(xy) >= 2 and _near(xy, box, 60.0):
+                    pkey = (fid, round(float(xy[0, 0]), 1), round(float(xy[0, 1]), 1),
+                            round(float(xy[-1, 0]), 1), round(float(xy[-1, 1]), 1))
+                    if pkey in seen:
+                        continue
+                    seen.add(pkey)
                     out.append((xy, EMBEDDED["w"] / 2))
     return out
 
@@ -179,9 +182,10 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
         far = (fb[:, 2] < llb[0]) | (fb[:, 0] > llb[2]) | (fb[:, 3] < llb[1]) | (fb[:, 1] > llb[3])
         specs = None
         for i in range(len(feats)):
+            if far[i]:
+                continue                        # (no part of it near the tile: converting each to find that out was
+                                                # most of this, 2026-10-25)
             fid = str(feats.ids[i])
-            if fid in seen:
-                continue
             # the lines railways.py builds as a 3D track (mpsteppe's PR #287; railways.drawn, worn ones too): only where
             # they cross a carriageway (its street track across the road, which railways.py leaves to the road),
             # nothing on open ground
@@ -198,24 +202,26 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
                     continue
             elif kind is None:
                 continue
-            seen.add(fid)
-            if far[i]:
-                continue                        # (no part of it near the tile: converting each to find that out was
-                                                # most of this, 2026-10-25)
-            for k, part in enumerate(roads.ground_parts(feats, i)):
+            for part in roads.ground_parts(feats, i):
                 xy = _enu(frame, np.asarray(part, np.float64))
                 if len(xy) < 2 or not _near(xy, box, reach + 20.0):
                     continue
+                pkey = ("r" if kind is None else "t", fid,
+                        round(float(xy[0, 0]), 1), round(float(xy[0, 1]), 1),
+                        round(float(xy[-1, 0]), 1), round(float(xy[-1, 1]), 1))
+                if pkey in seen:
+                    continue
+                seen.add(pkey)
                 if kind is None:
                     cname = str(getattr(specs[i], "cls", None) or cls[i])
                     if cname in ("motorway", "motorway_link"):
-                        motorways[(fid, k)] = (xy, specs[i].width / 2)
+                        motorways[pkey] = (xy, specs[i].width / 2)
                         continue            # an interstate has no at-grade railway crossing (no street track on it)
                     base = cname[:-5] if cname.endswith("_link") else cname
-                    carriageways[(fid, k)] = (xy, specs[i].width / 2)
-                    cw_class[(fid, k)] = base
+                    carriageways[pkey] = (xy, specs[i].width / 2)
+                    cw_class[pkey] = base
                     if sweden and specs[i].urban:
-                        town_ways[(fid, k)] = carriageways[(fid, k)]
+                        town_ways[pkey] = carriageways[pkey]
                 else:
                     tracks.append((kind, xy, meshed, wear))
     if not tracks:
@@ -263,14 +269,14 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
     def in_street(pts):
         return roads._on_carriageways(pts, town_ways, GATUSPAR_M) if town_ways else np.zeros(len(pts), bool)
 
-    def on_motorway(pts):
-        return roads._on_carriageways(pts, motorways, 0.0) if motorways else np.zeros(len(pts), bool)
+    def on_motorway(pts, pad=0.0):
+        return roads._on_carriageways(pts, motorways, pad) if motorways else np.zeros(len(pts), bool)
 
-    def _outside_motorway(pts):
+    def _outside_motorway(pts, pad=0.0):
         if len(pts) < 2 or not motorways:
             return [pts] if len(pts) >= 2 else []
-        mw = on_motorway(pts)
-        mid = on_motorway(0.5 * (pts[:-1] + pts[1:]))
+        mw = on_motorway(pts, pad)
+        mid = on_motorway(0.5 * (pts[:-1] + pts[1:]), pad)
         if not mw.any() and not mid.any():
             return [pts]
         edge_ok = (~mw[:-1]) & (~mw[1:]) & (~mid)
@@ -286,8 +292,8 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
             i = j + 1
         return out
 
-    def no_sleeper(pts):
-        return on_road(pts) | in_street(pts) | on_motorway(pts)
+    def no_sleeper(pts, pad=0.0):
+        return on_road(pts) | in_street(pts) | on_motorway(pts, pad)
 
     ballast, sleepers, rails = [], [], []
     todo = []
@@ -304,8 +310,9 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
         off = GAUGE_M[kind] / 2 + HEAD_M / 2
         full = roads.densify(xy, SAMPLE_M)
         s = np.r_[0.0, np.cumsum(np.hypot(*np.diff(full, axis=0).T))]
+        sl_pad = sl / 2 + 0.05
         def skip_sleeper(pts):
-            return no_sleeper(pts) if kind == "tram" else (on_road(pts) | on_motorway(pts))
+            return no_sleeper(pts, sl_pad) if kind == "tram" else (on_road(pts) | on_motorway(pts, sl_pad))
 
         for a, b in (() if meshed else _sleepers(full, s, step, sl, box, skip_sleeper)):
             sleepers.append(_chunk(SLEEPER, sw, (a, b)))
@@ -339,11 +346,13 @@ def tile_chunks(frame, tx, ty, cells, country=None, urban_fn=None):
                         if len(part) < 2:
                             continue
                         if paved:
-                            ballast.append(_chunk(EMBEDDED, EMBEDDED["w"], part))
-                            rails.append(_chunk(STREET_TRACK, STREET_TRACK["w"], part))
+                            for p_in in _outside_motorway(part, EMBEDDED["w"] / 2):
+                                ballast.append(_chunk(EMBEDDED, EMBEDDED["w"], p_in))
+                                rails.append(_chunk(STREET_TRACK, STREET_TRACK["w"], p_in))
                             continue
-                        ballast.append(_chunk(BALLAST, bw, part))
-                        for side in (off, -off):
-                            for rpts in _outside_motorway(roads.offset_polyline(part, side)):
-                                rails.append(_chunk(RAIL, HEAD_M, rpts))
+                        for p_in in _outside_motorway(part, bw / 2):
+                            ballast.append(_chunk(BALLAST, bw, p_in))
+                            for side in (off, -off):
+                                for rpts in _outside_motorway(roads.offset_polyline(p_in, side), HEAD_M / 2):
+                                    rails.append(_chunk(RAIL, HEAD_M, rpts))
     return ballast + sleepers + rails

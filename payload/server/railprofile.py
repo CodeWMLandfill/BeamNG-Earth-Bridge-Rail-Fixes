@@ -74,6 +74,200 @@ def _smooth_flat(xy, off, z, which):
                                     SMOOTH_STEPS, MAX_CUT_M, PIN_M)
 
 
+def _propagate_switch_lifts(rails, off, z0, z1, inside):
+    """Carry switch-join lifts across connected bridge spans and short ground leads so a crossover or turnout
+    splitted across a bridge (ground -> bridge -> ground) does not leave its bridge span sunk in a trench."""
+    if not any(k == "bridge" and c != "tram" for _f, c, k, _xy in rails):
+        return z1
+    dz_all = z1 - z0
+    if not np.any(np.abs(dz_all) > 1e-3):
+        return z1
+    import railways
+    import roads
+    sub = [n for n, (_f, c, k, rxy) in enumerate(rails) if k in ("ground", "bridge") and c != "tram" and len(rxy) >= 2]
+    if not sub:
+        return z1
+    lines = [np.asarray(rails[n][3], np.float64)[:, :2] for n in sub]
+    _nodes, edges, adj = roads._chain_graph(lines)
+    tun_pts = [
+        np.asarray(rxy, np.float64)[idx, :2]
+        for _f, _c, k, rxy in rails if k == "tunnel" and len(rxy) >= 2
+        for idx in (0, -1)
+    ]
+    tun_nodes = set()
+    if tun_pts:
+        tp = np.vstack(tun_pts)
+        for u, nxy in enumerate(_nodes):
+            if np.any(np.hypot(tp[:, 0] - nxy[0], tp[:, 1] - nxy[1]) <= roads.CHAIN_SNAP_M):
+                tun_nodes.add(u)
+    has_box = inside is not None and all(math.isfinite(float(v)) for v in inside)
+    bx0, by0, bx1, by1 = (tuple(float(v) for v in inside) if has_box else (0.0, 0.0, 0.0, 0.0))
+
+    seen_u = [False] * len(adj)
+    edge_of_node = [[] for _ in range(len(adj))]
+    for ei, (ua, ub, _s) in enumerate(edges):
+        edge_of_node[ua].append(ei)
+        edge_of_node[ub].append(ei)
+
+    out = z1.copy()
+    for start_u in range(len(adj)):
+        if seen_u[start_u] or not edge_of_node[start_u]:
+            continue
+        stack = [start_u]
+        seen_u[start_u] = True
+        comp_nodes = []
+        comp_edges = set()
+        while stack:
+            u = stack.pop()
+            comp_nodes.append(u)
+            for ei in edge_of_node[u]:
+                comp_edges.add(ei)
+                ua, ub, _s = edges[ei]
+                v = ub if u == ua else ua
+                if not seen_u[v]:
+                    seen_u[v] = True
+                    stack.append(v)
+        comp_e = sorted(comp_edges)
+        if not any(rails[sub[ei]][2] == "bridge" for ei in comp_e):
+            continue
+        sw_anchors = {}
+        max_sw_dz = 0.0
+        for ei in comp_e:
+            n = sub[ei]
+            if rails[n][2] != "ground":
+                continue
+            ua, ub, _s = edges[ei]
+            i0, i1 = int(off[n]), int(off[n + 1]) - 1
+            for u_end, idx in ((ua, i0), (ub, i1)):
+                d_end = abs(float(z1[idx] - z0[idx]))
+                if d_end > 1e-3:
+                    sw_anchors.setdefault(u_end, []).append(float(z1[idx]))
+                    if d_end > max_sw_dz:
+                        max_sw_dz = d_end
+        if not sw_anchors:
+            continue
+        sw_z = {u: float(np.mean(vals)) for u, vals in sw_anchors.items()}
+        min_grade = min(railways.LINE_GRADE.get(rails[sub[ei]][1], railways.GRADE) for ei in comp_e)
+        reach_m = max(JOIN_REACH_M, max_sw_dz / max(min_grade, 1e-3))
+
+        # Measure ground-run distance from switch anchors (bridges cost 0 so far-side ground ramps get full reach).
+        c_map = {u: k for k, u in enumerate(comp_nodes)}
+        g_adj = [[] for _ in range(len(comp_nodes))]
+        for ei in comp_e:
+            n = sub[ei]
+            ua, ub, s = edges[ei]
+            w = 0.0 if rails[n][2] == "bridge" else float(s[-1])
+            g_adj[c_map[ua]].append((c_map[ub], w))
+            g_adj[c_map[ub]].append((c_map[ua], w))
+        d_sw = roads._dijkstra(g_adj, {c_map[u]: 0.0 for u in sw_z})
+
+        # Build vertex-level graph across the component, merging shared chain nodes.
+        vid_of = []
+        v_pin = {}
+        n_verts = 0
+        node_vid = {}
+        for u in comp_nodes:
+            node_vid[u] = n_verts
+            if u in sw_z:
+                v_pin[n_verts] = sw_z[u]
+            elif u in tun_nodes:
+                # Keep tunnel portals at their pre-join bed height.
+                ei0 = edge_of_node[u][0]
+                n0 = sub[ei0]
+                idx0 = int(off[n0]) if edges[ei0][0] == u else int(off[n0 + 1]) - 1
+                v_pin[n_verts] = float(z0[idx0])
+            n_verts += 1
+        segs = []
+        for ei in comp_e:
+            n = sub[ei]
+            _f, _c, kind, rxy = rails[n]
+            ua, ub, s = edges[ei]
+            m = len(s)
+            i0 = int(off[n])
+            vids = [0] * m
+            vids[0] = node_vid[ua]
+            vids[-1] = node_vid[ub]
+            for k in range(1, m - 1):
+                vids[k] = n_verts
+                n_verts += 1
+            vid_of.append((ei, n, kind, s, i0, vids))
+            for k in range(m):
+                vk = vids[k]
+                px, py = float(rxy[k, 0]), float(rxy[k, 1])
+                if has_box and (px < bx0 or px > bx1 or py < by0 or py > by1):
+                    v_pin.setdefault(vk, float(z1[i0 + k]))
+                elif kind == "ground" and vk not in v_pin:
+                    dg_a = d_sw[c_map[ua]] + float(s[k])
+                    dg_b = d_sw[c_map[ub]] + float(s[-1] - s[k])
+                    if min(dg_a, dg_b) >= reach_m:
+                        v_pin[vk] = float(z1[i0 + k])
+            for k in range(m - 1):
+                ds = max(float(s[k + 1] - s[k]), 1e-3)
+                segs.append((vids[k], vids[k + 1], 1.0 / ds))
+
+        free = [v for v in range(n_verts) if v not in v_pin]
+        v_z = np.zeros(n_verts, np.float64)
+        for v, zv in v_pin.items():
+            v_z[v] = zv
+        if free and v_pin:
+            f_idx = {v: k for k, v in enumerate(free)}
+            nf = len(free)
+            if nf <= 800:
+                A = np.zeros((nf, nf), np.float64)
+                rhs = np.zeros(nf, np.float64)
+                for va, vb, cond in segs:
+                    fa, fb = f_idx.get(va), f_idx.get(vb)
+                    if fa is not None:
+                        A[fa, fa] += cond
+                        if fb is not None:
+                            A[fa, fb] -= cond
+                        else:
+                            rhs[fa] += cond * v_z[vb]
+                    if fb is not None:
+                        A[fb, fb] += cond
+                        if fa is not None:
+                            A[fb, fa] -= cond
+                        else:
+                            rhs[fb] += cond * v_z[va]
+                v_z[free] = np.linalg.solve(A, rhs)
+            else:
+                # Iterative harmonic relaxation fallback for very large components.
+                v_adj = [[] for _ in range(nf)]
+                rhs = np.zeros(nf, np.float64)
+                diag = np.zeros(nf, np.float64)
+                for va, vb, cond in segs:
+                    fa, fb = f_idx.get(va), f_idx.get(vb)
+                    if fa is not None:
+                        diag[fa] += cond
+                        if fb is not None:
+                            v_adj[fa].append((fb, cond))
+                        else:
+                            rhs[fa] += cond * v_z[vb]
+                    if fb is not None:
+                        diag[fb] += cond
+                        if fa is not None:
+                            v_adj[fb].append((fa, cond))
+                        else:
+                            rhs[fb] += cond * v_z[va]
+                x = np.full(nf, float(np.mean(list(v_pin.values()))), np.float64)
+                for _ in range(400):
+                    nx = rhs.copy()
+                    for fi, nbrs in enumerate(v_adj):
+                        for fj, cond in nbrs:
+                            nx[fi] += cond * x[fj]
+                    x = nx / np.maximum(diag, 1e-12)
+                v_z[free] = x
+
+        # Preserve any higher existing bridge envelope (e.g. underpass clearance) without dropping below v_z.
+        for _ei, n, kind, s, i0, vids in vid_of:
+            zn = np.array([v_z[v] for v in vids], np.float64)
+            if kind == "bridge":
+                g_n = railways.LINE_GRADE.get(rails[n][1], railways.GRADE)
+                zn = railways._envelope(s, np.maximum(zn, z0[i0:i0 + len(s)]), grade=g_n)
+            out[i0:i0 + len(s)] = zn
+    return out
+
+
 def _join_flat(rails, xy, off, z, inside):
     """join_beds of the beds z (end to end, as _flat's xy / off) of rails: the beds end to end."""
     fast.require(209, "rail_join_beds")
@@ -81,8 +275,10 @@ def _join_flat(rails, xy, off, z, inside):
     group = np.array([ids.setdefault(r[0], len(ids)) for r in rails], np.int64)
     elig = np.array([k == "ground" and c != "tram" for _f, c, k, _xy in rails], bool)
     box = tuple(float(v) for v in inside) if inside is not None else (math.nan,) * 4
-    return fast._ef.rail_join_beds(xy, off, np.ascontiguousarray(z, np.float64), group, elig, box, JOIN_M,
-                                   JOIN_INTERIOR_M, JOIN_REACH_M)
+    z0 = np.ascontiguousarray(z, np.float64)
+    z1 = fast._ef.rail_join_beds(xy, off, z0, group, elig, box, JOIN_M,
+                                 JOIN_INTERIOR_M, JOIN_REACH_M)
+    return _propagate_switch_lifts(rails, off, z0, z1, inside)
 
 
 def join_beds(rails, zbs, inside=None):

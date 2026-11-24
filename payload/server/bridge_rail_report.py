@@ -33,7 +33,7 @@ ALLOWED_RELEASE_URL_PREFIX = (
 )
 MAX_RELEASE_JSON_BYTES = 65536
 ADDON_ID = "beamng-earth-bridge-rail-fixes"
-ADDON_VERSION = "0.3.1"
+ADDON_VERSION = "0.4.0"
 MAX_SHOT_BYTES = int(1.45 * 1024 * 1024)
 ALLOWED_KINDS = ("bridge", "rail", "road", "other")
 BUNDLED_FIXED_REPORTS = {

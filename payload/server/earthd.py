@@ -71,7 +71,7 @@ import re  # noqa: E402
 import secrets  # noqa: E402
 import sys  # noqa: E402
 
-_BRF_ADDON_REV = "0.3.1"
+_BRF_ADDON_REV = "0.4.0"
 if not os.environ.get("BNE_BRF_ADDON_REV_PIN") and os.environ.get("BNE_BRF_ADDON_REV") != _BRF_ADDON_REV:
     os.environ["BNE_BRF_ADDON_REV"] = _BRF_ADDON_REV
     _brf_revisit = sys.modules.get("revisit")

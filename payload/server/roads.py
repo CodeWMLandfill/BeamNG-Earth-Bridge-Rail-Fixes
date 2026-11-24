@@ -29,7 +29,7 @@ import os
 import sys as _brf_sys
 import threading
 
-_BRF_ADDON_REV = "0.3.0"
+_BRF_ADDON_REV = "0.4.0"
 if not os.environ.get("BNE_BRF_ADDON_REV_PIN") and os.environ.get("BNE_BRF_ADDON_REV") != _BRF_ADDON_REV:
     os.environ["BNE_BRF_ADDON_REV"] = _BRF_ADDON_REV
     _brf_revisit = _brf_sys.modules.get("revisit")
@@ -14685,6 +14685,36 @@ LOW_HOLE_STEP = roadmesh.GRID_M + 0.5  # ... the cut a terrain grid step further
 TUNNEL_HOLE_MARGIN = 0.5    # m around the tube a portal's terrain hole reaches (above, below and sideways)
 
 
+def _twin_tube_height(parts, i, j, mid, get_h):
+    """Shared twin tube height above mid[:, 2] so a stepped higher carriageway keeps its full clearance."""
+    import roadmesh
+    th = max(float(get_h(parts[i][0])), float(get_h(parts[j][0])))
+    if len(mid) < 2:
+        return th
+    max_half_dz = 0.0
+    for idx_p in (i, j):
+        pxy = np.asarray(parts[idx_p][2], np.float64)[:, :2]
+        pz = np.asarray(parts[idx_p][3], np.float64)
+        if len(pxy) < 2 or len(pz) != len(pxy):
+            continue
+        ps = np.r_[0.0, np.cumsum(np.hypot(*np.diff(pxy, axis=0).T))]
+        if ps[-1] <= 1e-6:
+            continue
+        _d, q = _line_near(mid[:, :2], pxy)
+        k_seg = [int(np.argmin(np.hypot(*(pxy[:-1] - pt).T) + np.hypot(*(pxy[1:] - pt).T))) for pt in q]
+        s_at = np.array([ps[ks] + float(np.hypot(*(q[n_q] - pxy[ks]))) for n_q, ks in enumerate(k_seg)])
+        z_at = np.interp(np.clip(s_at, 0.0, float(ps[-1])), ps, pz)
+        over = float(np.max(z_at - mid[:, 2]))
+        if over > max_half_dz:
+            max_half_dz = over
+    if max_half_dz <= 1e-4:
+        return th
+    raised = th + max_half_dz
+    if th < roadmesh.TUNNEL_H - 0.05:
+        return min(raised, roadmesh.TUNNEL_H - 0.06)
+    return raised
+
+
 def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
     """Where the terrain block (heights u [iy, ix]: sample (ix, iy) at (cx - half + ix * square, cy - half +
     iy * square), half = n * square / 2) must be a hole for the tunnels `parts` ([(fid, spec, xy, z, lon)]: a
@@ -14702,8 +14732,14 @@ def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
     # covering what is above)
     parts = list(parts)
     n_own = len(parts)
-    parts += [(parts[i][0], parts[i][1]._replace(width=w), mid[:, :2], mid[:, 2], parts[i][4])
-              for i, j, mid, w in twin_tunnels([p for p in parts if np.isfinite(np.asarray(p[3])).all()]) if len(mid) >= 2]
+    clean_parts = [p for p in parts if np.isfinite(np.asarray(p[3])).all()]
+    twin_heights = {}
+    for i, j, mid, w in twin_tunnels(clean_parts):
+        if len(mid) >= 2:
+            twin_heights[len(parts)] = _twin_tube_height(
+                clean_parts, i, j, mid, lambda f: (heights or {}).get(f, roadmesh.TUNNEL_H)
+            )
+            parts.append((clean_parts[i][0], clean_parts[i][1]._replace(width=w), mid[:, :2], mid[:, 2], clean_parts[i][4]))
     fast.require(88, "tunnel_holes")
     u = np.ascontiguousarray(u, np.float64)
     for k_, (_fid, spec, xy, z, _lon) in enumerate(parts):
@@ -14712,7 +14748,7 @@ def tunnel_hole_mask(parts, u, cx, cy, square, heights=None, mouths=None):
         if len(xy) < 2 or not np.isfinite(z).all():
             continue
         hw = spec.width / 2 + roadmesh.TUNNEL_SHOULDER + TUNNEL_HOLE_MARGIN
-        th = (heights or {}).get(_fid, roadmesh.TUNNEL_H)       # heights: a low arch's tube (TunnelProfiles.heights)
+        th = twin_heights.get(k_, (heights or {}).get(_fid, roadmesh.TUNNEL_H))  # heights: a low arch's tube
         low = th < roadmesh.TUNNEL_H - 0.05
         if k_ >= n_own and not low:     # a twin tube's mouths, whatever the height (the low arches' cut, no side reach)
             m0, m1 = (mouths or {}).get(_fid, (True, True))
@@ -16054,14 +16090,20 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
             has_cap = getattr(tunnels, "cap_m", None) is not None
             c0, c1 = tunnels.cap_m(f0) if has_cap else (None, None)
             ln0 = float(np.hypot(*np.diff(mid[:, :2], axis=0).T).sum())
+            has_th = getattr(tunnels, "height", None) is not None
+            th_tw = _twin_tube_height(parts, i, j, mid, tunnels.height) if has_th else None
+            tw_look = {**TUNNEL, "tunnel": True, "tube_only": True}
+            if th_tw is not None:
+                tw_look["tunnel_h_override"] = th_tw
             jobs.append((f0, (mid[0, :2], mid[-1, :2]),
-                         [({**TUNNEL, "tunnel": True, "tube_only": True}, width, mid)],
+                         [(tw_look, width, mid)],
                          parts[i][1], ln0, (m0, m1, u0, u1, c0, c1, has_up, has_cap)))
     for n in range(len(parts)):
         jobs.extend(_make_part_jobs(n, parts, twin_pairs, twinned, tunnels, layouts))
     for fid, ends, lines, spec, length, (m0, m1, u0, u1, c0, c1, has_up, has_cap) in jobs:
         for look, w, line in lines:
             guard = None
+            th_ov = look.get("tunnel_h_override")
             if look.get("tunnel") and getattr(tunnels, "frame", None) is not None:
                 # Whole sections, in a global datum: neighbouring tiles deduplicate them; anchor rebases and
                 # geotile pivots cannot put the water exclusion at a different height from its mesh.
@@ -16069,7 +16111,7 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
                 import geotiles
                 la, lo, h = geotiles.world_to_geodetic(tunnels.frame, q)
                 nodes = np.c_[np.round(la, 8), np.round(lo, 8), np.round(h, 3)].tolist()
-                height = tunnels.height(fid) + .2     # enclose both polylines' simplification/rounding and end overlap
+                height = float(th_ov if th_ov is not None else tunnels.height(fid)) + .2     # enclose both polylines' simplification/rounding and end overlap
                 identity = hashlib.sha1(json.dumps([nodes, w, height], separators=(",", ":")).encode()).hexdigest()[:16]
                 guard = {"id": f"{fid}:{identity}", "r": w / 2 + roadmesh.TUNNEL_SHOULDER + 1.,
                          "h": height, "nodes": nodes}
@@ -16090,7 +16132,9 @@ def _tunnel_chunks(tunnels, cells, exact, terrain_paint=True):
                             for flag in ("no_tube", "tube_only"):
                                 if look.get(flag):
                                     ch[flag] = True
-                            if getattr(tunnels, "height", None) is not None:
+                            if th_ov is not None:
+                                ch["tunnel_h"] = float(th_ov)
+                            elif getattr(tunnels, "height", None) is not None:
                                 ch["tunnel_h"] = tunnels.height(fid)
                             if has_up:
                                 at = lambda p: u0 if np.hypot(*(p - ends[0])) < 0.5 else u1    # noqa: E731
