@@ -19,6 +19,17 @@ Global census snapshot and structural archetype verification across worldwide Ov
 | Tunnels | 1,177,424 | 290,611 | 28 / 92 | 40.02% |
 | **Combined Total** | **8,949,779** | **1,164,947** | **80 / 234** | **32.81%** |
 
+## Global Coverage Tracker
+
+Live census across global Overture shards (`128/128` shards ingested, updated `2026-11-25T02:07:08Z`):
+
+| Category | Cataloged | Verified / Fixed | Archetypes Cleared | Coverage % |
+| --- | ---: | ---: | ---: | ---: |
+| Bridges | 5,838,327 | 1,337,074 | 28 / 91 | 22.90% |
+| Railways | 1,934,028 | 1,588,597 | 33 / 51 | 82.14% |
+| Tunnels | 1,177,424 | 456,109 | 29 / 92 | 38.74% |
+| **Combined Total** | **8,949,779** | **3,381,780** | **90 / 234** | **37.79%** |
+
 ## Before & After
 
 ### Multi-Level & Truss Bridges

@@ -4,19 +4,20 @@
 
 ### Highlights
 - Expand official add-on scope and branding to **BeamNG.Earth - Bridge, Rail & Tunnel Fixes** (`v0.4.0`), adding **`tunnel`** to `Ctrl+Shift+B` spot-report categories (`bridge`, `rail`, `tunnel`, `road`, `other`) while keeping all option keys, state folders, and `beamng_earth_bridge_rail_fixes.py` asset filenames backward-compatible.
-- Ship a **dual-payload `full_solver` architecture** supporting **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` solver mode, `PLANS_FORMAT = 55`) and **v1.10.1-beta.dev.574** (`earthfast 621`, native `server_v2` overlay across `14` solver modules, `PLANS_FORMAT = 78`), while routing intermediate (`dev.567`) and unknown future ABIs safely to `client_and_reporter` (`client_only`) mode.
+- Ship a **dual-payload `full_solver` architecture** supporting **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` solver mode, `PLANS_FORMAT = 55`) and **v1.10.1-beta.dev.574** (`earthfast 621`, native `server_v2` overlay across `14` solver modules, `PLANS_FORMAT = 79`), while routing intermediate (`dev.567`) and unknown future ABIs safely to `client_and_reporter` (`client_only`) mode.
 - Update surgical `roads.lua` patching (`createWalk_railcol`) so both `v1.10.1-beta` and `v1.10.1-beta.dev.574+` (`M.isCliffCollider(q.what)`) layouts patch cleanly and idempotently.
 - Harden symmetric add-on stacking and shared telemetry collector coexistence so **Bridge, Rail & Tunnel Fixes** (`Ctrl+Shift+B`) and **Traffic and AutoDrive fixes** (`Ctrl+Shift+T`) install, run, and restore cleanly side-by-side in either order.
 
 ### Bridges, Ramps & Divided Corridors
 - Smooth tall-abutment head-slope soffits, pair sustained parallel link-to-mainline decks, excavate buried-deck footprints, preserve cross-cell divided carriageway continuity, and trim terrain step-ribbons along split bridge approaches (`grading`, `carriageways`, `roads`, `roadmesh`, `bridgetypes`).
+- Port full width-aware, median, and portal pier-exclusion bounds (`pier_sites`, `pier_portals`, `_piers_clear`, `_portal_columns`, `_road_half`, `_ghalf`) to `server_v2` (`roads.py`, `roadmesh.py`) so overpass support columns stay out of highway travel lanes, and enforce `grading.UNDER_ON = False` default (`BNE_UNDERPASS=on` opt-in).
 
 ### Railways & Crossings
 - Enforce graded railway bridge underpass clearance and motorway sleeper exclusion (`railways`, `railprofile`, `rails`).
 - Suppress phantom steel rails and crossings on ground abandoned railway beds converted into collinear bikeways/trails while preserving all physically present tracks (`heritage`, `osm_rails=yes`, active `osm_electrified`, and tracks running beside street sidewalks).
 
 ### Tunnels, Portals & Multi-Bore Clearance
-- Seal open-mouth portal collars and continuous portal floor decks, cap hillside portal scree skirts below natural ground/headwall lines, punch 24 m open-mouth portal throats across steep terrain cells, and prevent staggered or curved neighboring bores from clipping headwalls, wingwalls, or seam bulkheads into adjacent driving lanes (`portals`, `roadmesh`, `roads`, `tunnellids`).
+- Seal open-mouth portal collars and continuous portal floor decks, cap hillside portal scree skirts below natural ground/headwall lines, punch 24 m open-mouth portal throats across steep terrain cells, suppress overlapping parallel portal wingwalls (`ws_check` + `oth_tun.clear`), dynamically fit mountain portal lintel top caps (`_fit_tmax`), and clamp `.ter` `TER_HOLE == 255` cells before coarse far-field cover meshing (`_far_cover` wrapper) so coarse far tiles never poke into tunnel entrances (`portals`, `roadmesh`, `roads`, `tunnellids`, `patch_server.py`).
 
 ## v0.3.1
 
