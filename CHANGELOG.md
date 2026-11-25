@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.4.1
+
+### Highlights
+- Adds native **Linux (`x86_64`)** support alongside **Windows 10 & 11 (`64-bit`)**: works inside **BeamNG.Earth**'s Add-ons menu (`--run-addon`) and standalone CLI setup across packaged `BeamNG.Earth-*-x86_64.AppImage` builds (via `mksquashfs` repack or zero-dependency extracted AppDir launcher), extracted Linux AppDir/onedir folders, dedicated Linux host client mod archives (`Resources/Client/beamng_earth.zip`), and source checkouts, with automatic native Linux **BeamNG.drive** user-folder discovery (`~/.local/share/BeamNG/BeamNG.drive/current`) and byte-for-byte SHA-256 restoration on uninstall.
+- Salts packaged `CODE_ID` and `REVISIT_ID` cache markers deterministically on install (and restores stock values on uninstall) so patched `.exe` and `.AppImage` builds generate fresh terrain grading and revisit packs on previously visited map areas without manual cache clearing.
+- Fixes a standalone `--self-exe` fallback setup bug where closing open **BeamNG.Earth** instances could terminate the installer's own PyInstaller bootloader parent process before background staging completed, and fixes **Add-ons -> Options** Start validation when `Spot report category` is set to `tunnel`.
+- Verifies automatic forward-compatible `client_and_reporter` (`client_only`) tier routing on **BeamNG.Earth v1.10.1-beta.dev.591**.
+
 ## v0.4.0
 
 ### Highlights

@@ -35,25 +35,22 @@ Keeps elevated bridge decks and lane markings continuous across cross-streets an
 ### Railways, Tunnel Portals & Multi-Bore Clearance
 Preserves physically present heritage, electrified, and active railway tracks while suppressing converted collinear rail-trails across highways; seals open-mouth tunnel portal hoods, caps scree skirts below natural hillside lines, punches deep multi-bore portal throats cleanly, and prevents staggered or curved neighboring bores from clipping into adjacent driving lanes.
 
-## Install - Option 1 (1-Click ZIP)
-
-1. Click the green **Code** button above -> **Download ZIP** (or [download the ZIP directly](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/archive/refs/heads/main.zip)).
-2. Right-click the `.zip` file, click **Extract All...**, and open the extracted folder.
-3. Double-click **`1_Click_Install.bat`**.
-   - It automatically finds **BeamNG.Earth** on your PC and offers to close and restart it for you if it is running.
-
-## Install - Option 2 (Inside BeamNG.Earth)
+## Install - Option 1 (Inside BeamNG.Earth - Windows & Linux)
 
 1. Open **BeamNG.Earth** -> **Add-ons** -> **Add from GitHub**.
 2. Enter `CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes` and click **Install**.
 3. Click **Start** on the add-on card, then close and restart **BeamNG.Earth**.
 
-*(Tip: You can also download `beamng_earth_bridge_rail_fixes.py` from the [Releases](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/releases) tab and double-click it in File Explorer to launch the 1-click setup.)*
+## Install - Option 2 (1-Click Setup - Windows & Linux)
+
+- **Windows:** Download the [repository ZIP](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/archive/refs/heads/main.zip), right-click -> **Extract All...**, and double-click **`1_Click_Install.bat`** (or download `beamng_earth_bridge_rail_fixes.py` from [Releases](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/releases) and double-click it).
+- **Linux (`x86_64`):** Download the [repository ZIP](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/archive/refs/heads/main.zip), extract it, and run **`./1_Click_Install.sh`** (or download `beamng_earth_bridge_rail_fixes.py` from [Releases](https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/releases) and run `python3 beamng_earth_bridge_rail_fixes.py install`).
+- Setup automatically finds **BeamNG.Earth** and your native **BeamNG.drive** user folder, backs up originals with SHA-256 verification, and offers to close and restart **BeamNG.Earth** if it is open.
 
 ## Uninstall
 
-- **From the ZIP folder:** Double-click **`1_Click_Uninstall.bat`** to restore the original **BeamNG.Earth** in one click.
 - **Inside BeamNG.Earth:** Open **Add-ons** -> **Options**, choose **`Restore original app`**, click **Save**, click **Start**, and restart **BeamNG.Earth**.
+- **Standalone:** Double-click **`1_Click_Uninstall.bat`** on Windows, or run **`./1_Click_Uninstall.sh`** (`python3 beamng_earth_bridge_rail_fixes.py uninstall`) on Linux, to restore the original **BeamNG.Earth** byte-for-byte.
 
 ## Report a Bad Spot (`Ctrl+Shift+B`)
 
@@ -67,5 +64,5 @@ Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screensh
 
 ## Requirements
 
-- **Windows 10 or 11** (64-bit).
-- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.574** in full solver mode (`direct` or `server_v2`), with automatic forward-compatible client & reporter fallback for intermediate (`dev.567`) and newer `dev.*` builds (older versions are skipped safely with a clear notice).
+- **Windows 10 or 11** (`64-bit`) or **Linux** (`x86_64`, native **BeamNG.Earth** `AppImage` / source + native Linux **BeamNG.drive**).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.574** in full solver mode (`direct` or `server_v2`), with automatic forward-compatible client & reporter fallback for intermediate (`dev.567`) and newer `dev.*` builds including **v1.10.1-beta.dev.591** (older versions are skipped safely with a clear notice).
