@@ -38,8 +38,10 @@ const ALLOWED_KINDS = new Set([
   "overtake",
   "routing",
 ]);
+const AUTODRIVE_ONLY_KINDS = new Set(["autodrive", "traffic", "overtake", "routing"]);
 const AUTODRIVE_ADDON_IDS = new Set([
   "beamng-earth-autodrive-fixes",
+  "beamng-earth-traffic-and-autod",
   "beamng-earth-traffic-and-autodrive-fixes",
   "beamng-earth-traffic-autodrive-fixes",
 ]);
@@ -791,17 +793,38 @@ function resolveWorkerName(env) {
   return WORKER_NAME_RE.test(candidate) ? candidate : DEFAULT_WORKER_NAME;
 }
 
-function resolveGitHubConfig(env, addonId = "") {
+function isAutodriveReport(report) {
+  if (!report || typeof report !== "object") {
+    return false;
+  }
+  if (typeof report.addonId === "string" && AUTODRIVE_ADDON_IDS.has(report.addonId)) {
+    return true;
+  }
+  if (
+    report.nearest &&
+    typeof report.nearest === "object" &&
+    typeof report.nearest.addonId === "string" &&
+    AUTODRIVE_ADDON_IDS.has(report.nearest.addonId)
+  ) {
+    return true;
+  }
+  if (typeof report.kind === "string" && AUTODRIVE_ONLY_KINDS.has(report.kind)) {
+    return true;
+  }
+  if (report.drivingTelemetry !== undefined && report.drivingTelemetry !== null) {
+    return true;
+  }
+  return false;
+}
+
+function resolveGitHubConfig(env, report = null) {
   const defaultRepo = typeof env?.GITHUB_REPO === "string" ? env.GITHUB_REPO.trim() : "";
   const autodriveRepo =
     typeof env?.AUTODRIVE_GITHUB_REPO === "string" ? env.AUTODRIVE_GITHUB_REPO.trim() : "";
   const defaultValid = REPO_SLUG_RE.test(defaultRepo);
   const autodriveValid = REPO_SLUG_RE.test(autodriveRepo);
-  const useAutodriveRepo =
-    typeof addonId === "string" && AUTODRIVE_ADDON_IDS.has(addonId) && autodriveValid;
-  const repo = useAutodriveRepo ? autodriveRepo : defaultRepo;
-  const fallbackRepo =
-    useAutodriveRepo && defaultValid && defaultRepo !== autodriveRepo ? defaultRepo : "";
+  const forAutodrive = isAutodriveReport(report);
+  const repo = forAutodrive ? autodriveRepo : defaultRepo;
   const token = typeof env?.GITHUB_TOKEN === "string" ? env.GITHUB_TOKEN.trim() : "";
   const branch = resolveBranch(env);
   const workerName = resolveWorkerName(env);
@@ -809,7 +832,7 @@ function resolveGitHubConfig(env, addonId = "") {
   const anyRepoValid = defaultValid || autodriveValid;
   return {
     repo,
-    fallbackRepo,
+    forAutodrive,
     token,
     branch,
     workerName,
@@ -1306,10 +1329,15 @@ export default {
       try {
         const rawBody = await readJsonBodyBounded(request, MAX_BODY_BYTES);
         const { report, screenshot } = validateAndSanitizeReport(rawBody);
-        const ghConfig = resolveGitHubConfig(env, report.addonId || "");
+        const ghConfig = resolveGitHubConfig(env, report);
         if (!ghConfig.repoConfigured) {
           return jsonResponse(
-            { ok: false, error: "Collector GitHub repository is not configured" },
+            {
+              ok: false,
+              error: ghConfig.forAutodrive
+                ? "AutoDrive collector GitHub repository is not configured"
+                : "Collector GitHub repository is not configured",
+            },
             503,
             env
           );
@@ -1331,49 +1359,24 @@ export default {
         };
         const archiveJsonText = `${JSON.stringify(archiveRecord, null, 2)}\n`;
 
-        let activeGhConfig = ghConfig;
-        try {
-          await commitArchiveToGitHub(
-            activeGhConfig,
-            reportPath,
-            archiveJsonText,
-            shotPath,
-            screenshot,
-            createdAt
-          );
-        } catch (archiveErr) {
-          if (
-            archiveErr instanceof UpstreamGitHubError &&
-            (archiveErr.upstreamStatus === 403 || archiveErr.upstreamStatus === 404) &&
-            activeGhConfig.fallbackRepo
-          ) {
-            activeGhConfig = {
-              ...activeGhConfig,
-              repo: activeGhConfig.fallbackRepo,
-              fallbackRepo: "",
-            };
-            await commitArchiveToGitHub(
-              activeGhConfig,
-              reportPath,
-              archiveJsonText,
-              shotPath,
-              screenshot,
-              createdAt
-            );
-          } else {
-            throw archiveErr;
-          }
-        }
+        await commitArchiveToGitHub(
+          ghConfig,
+          reportPath,
+          archiveJsonText,
+          shotPath,
+          screenshot,
+          createdAt
+        );
 
         const issuePayload = formatIssuePayload(
-          activeGhConfig,
+          ghConfig,
           id,
           createdAt,
           report,
           reportPath,
           shotPath
         );
-        const issue = await openGitHubIssue(activeGhConfig, issuePayload);
+        const issue = await openGitHubIssue(ghConfig, issuePayload);
 
         return jsonResponse(
           {
