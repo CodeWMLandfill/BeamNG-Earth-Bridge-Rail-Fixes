@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.4.2
+
+### Highlights
+- Keeps the companion runner resident in a low-CPU parent-watch loop when started from **BeamNG.Earth**'s **Add-ons** menu (`BNGEARTH_PARENT`) so the add-on card stays **`running`** across sessions instead of flipping to `not running` after setup completes, while unpacking into version-isolated `_patch_<version>` work folders and suppressing modal popup dialogs during `--run-addon` autostart.
+- Syncs patched client files (`roads.lua`, `bugreport.lua`, `beamngEarth.json`, `keyboard_beamngEarth.json`, `modScript.lua`) directly into `<user_dir>/mods/unpacked/beamng_earth/` (and `<user_dir>/mods/beamng_earth.zip` when present) on **Add-ons -> Start** with per-folder reversible backups and sibling-addon preservation, so fixes take effect immediately on **BeamNG.Earth v1.10.1-beta.dev.595** (`fast.MIN_VERSION = 627`) and newer `dev.*` builds.
+- Adds cross-addon patch and swap locks, content-based installed detection, receiptless in-memory PYZ/CArchive self-healing (`_brf_orig_<mod>` TOC preservation), and cooperative single-close deferred restaging (`restage_on_current.py`) so **Bridge, Rail & Tunnel Fixes** and **Traffic and AutoDrive fixes** install, update, and uninstall cleanly in a single close cycle with zero receipt or SHA-256 conflicts.
+
 ## v0.4.1
 
 ### Highlights

@@ -65,4 +65,4 @@ Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screensh
 ## Requirements
 
 - **Windows 10 or 11** (`64-bit`) or **Linux** (`x86_64`, native **BeamNG.Earth** `AppImage` / source + native Linux **BeamNG.drive**).
-- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.574** in full solver mode (`direct` or `server_v2`), with automatic forward-compatible client & reporter fallback for intermediate (`dev.567`) and newer `dev.*` builds including **v1.10.1-beta.dev.591** (older versions are skipped safely with a clear notice).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.574** in full solver mode (`direct` or `server_v2`), with automatic forward-compatible client & reporter fallback for intermediate (`dev.567`) and newer `dev.*` builds including **v1.10.1-beta.dev.591** through **v1.10.1-beta.dev.595** (older versions are skipped safely with a clear notice).

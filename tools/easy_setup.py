@@ -606,7 +606,7 @@ def _extract_mod_files_from_target(target):
 
 
 def sync_unpacked_mods_on_install(user_dirs, payload_dir, state_root, apply_fixes=True, enable_reporter=True):
-    """Update <user_dir>/mods/unpacked/beamng_earth and/or <user_dir>/mods/beamng_earth.zip if present."""
+    """Update <user_dir>/mods/unpacked/beamng_earth and/or <user_dir>/mods/beamng_earth.zip preserving sibling add-ons."""
     payload_dir = Path(payload_dir)
     state_root = Path(state_root)
     synced_records = []
@@ -620,8 +620,8 @@ def sync_unpacked_mods_on_install(user_dirs, payload_dir, state_root, apply_fixe
         if not has_unpacked and not has_zip:
             continue
 
-        dir_id = hashlib.sha256(_norm_key(udir).encode("utf-8")).hexdigest()[:12]
-        bdir = state_root / "mod_backups" / dir_id
+        dir_id = hashlib.sha256(_norm_key(mod_root if has_unpacked else udir).encode("utf-8")).hexdigest()[:12]
+        bdir = state_root / "unpacked_mod_backups" / dir_id
         bdir.mkdir(parents=True, exist_ok=True)
         files_meta = []
 
@@ -633,61 +633,63 @@ def sync_unpacked_mods_on_install(user_dirs, payload_dir, state_root, apply_fixe
                     existed = dest.is_file()
                     orig_sha = ""
                     if existed:
-                        bfile.parent.mkdir(parents=True, exist_ok=True)
                         raw = dest.read_bytes()
-                        bfile.write_bytes(raw)
-                        orig_sha = patch_server.sha256_bytes(raw)
+                        if short_rel.endswith("roads.lua") and b"return false, 'not supported'" not in raw:
+                            clean_raw = patch_server.unpatch_roads_lua_bytes(raw)
+                        elif short_rel.endswith("beamngEarth.json"):
+                            clean_raw = patch_server.unpatch_actions_json_bytes(raw)
+                        elif short_rel.endswith("keyboard_beamngEarth.json"):
+                            clean_raw = patch_server.unpatch_keymap_json_bytes(raw)
+                        elif short_rel.endswith("modScript.lua"):
+                            clean_raw = patch_server.unpatch_modscript_bytes(raw)
+                        else:
+                            clean_raw = raw
+                        bfile.parent.mkdir(parents=True, exist_ok=True)
+                        bfile.write_bytes(clean_raw)
+                        orig_sha = patch_server.sha256_bytes(clean_raw)
                     atomic_write_json(
                         bdir / f"{short_rel}.meta.json",
                         {"rel": short_rel, "existed": existed, "originalSha": orig_sha},
                     )
+                elif short_rel.endswith("roads.lua") and dest.is_file():
+                    cur_r = dest.read_bytes()
+                    if not patch_server._roads_lua_has_brf(cur_r) and b"return false, 'not supported'" not in cur_r:
+                        bfile.parent.mkdir(parents=True, exist_ok=True)
+                        bfile.write_bytes(cur_r)
+                        atomic_write_json(
+                            bdir / f"{short_rel}.meta.json",
+                            {"rel": short_rel, "existed": True, "originalSha": patch_server.sha256_bytes(cur_r)},
+                        )
                 meta = read_json_safe(bdir / f"{short_rel}.meta.json", {"rel": short_rel, "existed": False, "originalSha": ""})
                 files_meta.append(meta)
 
-            if apply_fixes:
-                roads_dest = mod_root / "lua/ge/extensions/beamngEarth/roads.lua"
-                roads_dest.parent.mkdir(parents=True, exist_ok=True)
-                fallback_roads = (payload_dir / patch_server.MOD_ROADS_LUA).read_bytes()
-                if roads_dest.is_file():
-                    base_roads = roads_dest.read_bytes()
-                    if b"return false, 'not supported'" in base_roads:
-                        bfile_roads = bdir / "lua/ge/extensions/beamngEarth/roads.lua"
-                        base_roads = bfile_roads.read_bytes() if bfile_roads.is_file() else fallback_roads
-                    roads_dest.write_bytes(
-                        patch_server.patch_roads_lua_bytes(base_roads, fallback_bytes=fallback_roads)
-                    )
-                else:
-                    roads_dest.write_bytes(fallback_roads)
-
-            if enable_reporter:
-                bug_dest = mod_root / "lua/ge/extensions/beamngEarth/bugreport.lua"
-                bug_dest.parent.mkdir(parents=True, exist_ok=True)
-                bug_dest.write_bytes((payload_dir / patch_server.MOD_BUGREPORT_LUA).read_bytes())
-
-                actions_dest = mod_root / "lua/ge/extensions/core/input/actions/beamngEarth.json"
-                if actions_dest.is_file():
-                    actions_dest.write_bytes(patch_server.patch_actions_json_bytes(actions_dest.read_bytes()))
-
-                keymap_dest = mod_root / "settings/inputmaps/keyboard_beamngEarth.json"
-                if keymap_dest.is_file():
-                    keymap_dest.write_bytes(patch_server.patch_keymap_json_bytes(keymap_dest.read_bytes()))
-
-                modscript_dest = mod_root / "scripts/beamng_earth/modScript.lua"
-                if modscript_dest.is_file():
-                    modscript_dest.write_bytes(patch_server.patch_modscript_bytes(modscript_dest.read_bytes()))
+            patch_server._sync_unpacked_user_mod_dir(
+                mod_root,
+                payload_dir,
+                state_root,
+                operation="install",
+                apply_fixes=apply_fixes,
+                enable_reporter=enable_reporter,
+            )
 
         zip_meta = None
         if has_zip and hasattr(patch_server, "patch_mod_zip_bytes"):
             zip_backup = bdir / "beamng_earth.zip.original"
             zip_meta_path = bdir / "beamng_earth.zip.meta.json"
-            if not zip_meta_path.is_file() or not zip_backup.is_file():
-                shutil.copy2(mod_zip, zip_backup)
-                orig_zip_sha = sha256_file(zip_backup)
+            cur_zip_bytes = mod_zip.read_bytes()
+            if (not zip_meta_path.is_file() or not zip_backup.is_file()) and not patch_server._mod_zip_has_sibling(cur_zip_bytes):
+                clean_zip = patch_server.unpatch_mod_zip_bytes(cur_zip_bytes)
+                zip_backup.write_bytes(clean_zip)
+                orig_zip_sha = patch_server.sha256_bytes(clean_zip)
                 atomic_write_json(zip_meta_path, {"originalSha": orig_zip_sha})
             zip_meta = read_json_safe(zip_meta_path, {})
-            pristine_zip_bytes = zip_backup.read_bytes()
+            base_zip_bytes = (
+                cur_zip_bytes
+                if (patch_server._mod_zip_has_sibling(cur_zip_bytes) or not zip_backup.is_file())
+                else zip_backup.read_bytes()
+            )
             patched_zip_bytes = patch_server.patch_mod_zip_bytes(
-                pristine_zip_bytes,
+                base_zip_bytes,
                 payload_dir,
                 apply_fixes=apply_fixes,
                 enable_reporter=enable_reporter,
@@ -711,7 +713,7 @@ def sync_unpacked_mods_on_install(user_dirs, payload_dir, state_root, apply_fixe
 
 
 def restore_unpacked_mods_on_uninstall(restored_target, receipt, discovered_user_dirs):
-    """Remove injected bugreport.lua/roads.lua overrides and restore pristine unpacked or zipped mod files."""
+    """Remove injected bugreport.lua/roads.lua overrides and restore unpacked or zipped mod files preserving siblings."""
     pristine_mod_files = {}
     if restored_target and Path(restored_target).exists():
         try:
@@ -754,43 +756,53 @@ def restore_unpacked_mods_on_uninstall(restored_target, receipt, discovered_user
                 if short_rel.endswith("bugreport.lua"):
                     continue
                 dest = mod_root / short_rel
-                if short_rel in pristine_mod_files:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(pristine_mod_files[short_rel])
+                cur_b = dest.read_bytes() if dest.is_file() else b""
+                has_sib = patch_server._has_sibling_shared_mod_entries(
+                    actions_bytes=cur_b, keymap_bytes=cur_b, modscript_bytes=cur_b
+                )
+                if not has_sib and short_rel in pristine_mod_files and not patch_server._has_sibling_shared_mod_entries(
+                    actions_bytes=pristine_mod_files[short_rel],
+                    keymap_bytes=pristine_mod_files[short_rel],
+                    modscript_bytes=pristine_mod_files[short_rel],
+                ):
+                    if short_rel.endswith("roads.lua"):
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(patch_server.unpatch_roads_lua_bytes(pristine_mod_files[short_rel]))
+                    else:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        dest.write_bytes(pristine_mod_files[short_rel])
                     continue
-                if bdir and (bdir / short_rel).is_file():
+                if not has_sib and bdir and (bdir / short_rel).is_file():
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     dest.write_bytes((bdir / short_rel).read_bytes())
                     continue
-                if short_rel.endswith("beamngEarth.json") and dest.is_file():
-                    doc = read_json_safe(dest, None)
-                    if isinstance(doc, dict) and patch_server.REPORT_ACTION_KEY in doc:
-                        doc.pop(patch_server.REPORT_ACTION_KEY, None)
-                        dest.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+                if short_rel.endswith("roads.lua") and dest.is_file():
+                    dest.write_bytes(patch_server.unpatch_roads_lua_bytes(cur_b))
+                elif short_rel.endswith("beamngEarth.json") and dest.is_file():
+                    dest.write_bytes(patch_server.unpatch_actions_json_bytes(cur_b))
                 elif short_rel.endswith("keyboard_beamngEarth.json") and dest.is_file():
-                    doc = read_json_safe(dest, None)
-                    if isinstance(doc, dict) and isinstance(doc.get("bindings"), list):
-                        doc["bindings"] = [
-                            b for b in doc["bindings"]
-                            if not (isinstance(b, dict) and b.get("action") == patch_server.REPORT_ACTION_KEY)
-                        ]
-                        dest.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+                    dest.write_bytes(patch_server.unpatch_keymap_json_bytes(cur_b))
                 elif short_rel.endswith("modScript.lua") and dest.is_file():
-                    lines = [
-                        ln for ln in dest.read_text(encoding="utf-8-sig").splitlines()
-                        if "beamngEarth_bugreport" not in ln
-                    ]
-                    dest.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+                    dest.write_bytes(patch_server.unpatch_modscript_bytes(cur_b))
 
             cleaned.append(str(mod_root))
 
         mod_zip = udir / "mods" / "beamng_earth.zip"
         zip_backup = (bdir / "beamng_earth.zip.original") if bdir else None
-        if mod_zip.is_file() and zip_backup is not None and zip_backup.is_file():
-            tmp_zip = mod_zip.with_name(f"{mod_zip.name}.{uuid.uuid4().hex}.tmp")
-            shutil.copy2(zip_backup, tmp_zip)
-            os.replace(tmp_zip, mod_zip)
-            cleaned.append(str(mod_zip))
+        if mod_zip.is_file():
+            cur_z = mod_zip.read_bytes()
+            if not patch_server._mod_zip_has_sibling(cur_z) and zip_backup is not None and zip_backup.is_file():
+                tmp_zip = mod_zip.with_name(f"{mod_zip.name}.{uuid.uuid4().hex}.tmp")
+                shutil.copy2(zip_backup, tmp_zip)
+                os.replace(tmp_zip, mod_zip)
+                cleaned.append(str(mod_zip))
+            else:
+                un_z = patch_server.unpatch_mod_zip_bytes(cur_z)
+                if un_z != cur_z:
+                    tmp_zip = mod_zip.with_name(f"{mod_zip.name}.{uuid.uuid4().hex}.tmp")
+                    tmp_zip.write_bytes(un_z)
+                    os.replace(tmp_zip, mod_zip)
+                    cleaned.append(str(mod_zip))
 
     return cleaned
 
@@ -965,19 +977,42 @@ def _prepare_via_target_run_addon(target_exe, config_path, status_path, payload_
     return record
 
 
+def _clean_deferred_env():
+    env = dict(os.environ)
+    if "LD_LIBRARY_PATH_ORIG" in env:
+        orig_ld = env.pop("LD_LIBRARY_PATH_ORIG")
+        if orig_ld:
+            env["LD_LIBRARY_PATH"] = orig_ld
+        else:
+            env.pop("LD_LIBRARY_PATH", None)
+    elif getattr(sys, "frozen", False):
+        env.pop("LD_LIBRARY_PATH", None)
+    for k in list(env):
+        if k.startswith(("_PYI_", "_MEIPASS")) or k in (
+            "PYTHONHOME",
+            "PYTHONPATH",
+            "TCL_LIBRARY",
+            "TK_LIBRARY",
+            "BNGEARTH_PARENT",
+        ):
+            env.pop(k, None)
+    return env
+
+
 def _start_deferred_swap(status_path, helper_ps1):
+    safe_cwd = tempfile.gettempdir()
+    env = _clean_deferred_env()
     if os.name != "nt":
         posix_helper = Path(helper_ps1).parent / "deferred_swap.py"
-        py_bin = shutil.which("python3") or shutil.which("python") or sys.executable
-        env = dict(os.environ)
-        if "LD_LIBRARY_PATH_ORIG" in env:
-            orig_ld = env.pop("LD_LIBRARY_PATH_ORIG")
-            if orig_ld:
-                env["LD_LIBRARY_PATH"] = orig_ld
-            else:
-                env.pop("LD_LIBRARY_PATH", None)
+        py_bin = (
+            shutil.which("python3.12", path=env.get("PATH"))
+            or shutil.which("python3", path=env.get("PATH"))
+            or shutil.which("python", path=env.get("PATH"))
+            or sys.executable
+        )
         subprocess.Popen(
             [py_bin, "-B", str(posix_helper), "--receipt", str(status_path)],
+            cwd=safe_cwd,
             env=env,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
@@ -991,8 +1026,14 @@ def _start_deferred_swap(status_path, helper_ps1):
         str(status_path).replace("'", "''"),
     )
     encoded = __import__("base64").b64encode(command.encode("utf-16le")).decode("ascii")
-    subprocess.Popen(
+    tramp = subprocess.Popen(
         [
+            os.environ.get("COMSPEC") or "cmd.exe",
+            "/d",
+            "/c",
+            "start",
+            "",
+            "/b",
             "powershell.exe",
             "-NoProfile",
             "-NonInteractive",
@@ -1003,11 +1044,17 @@ def _start_deferred_swap(status_path, helper_ps1):
             "-EncodedCommand",
             encoded,
         ],
+        cwd=safe_cwd,
+        env=env,
         creationflags=0x08000000 | 0x00000200,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
+    try:
+        tramp.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        pass
 
 
 def _cleanup_after_restore(target, mode, state_root):
@@ -1135,7 +1182,7 @@ def perform_install(
         if self_exe:
             record.update(
                 standalone=True,
-                companionPid=os.getpid(),
+                companionPid=0,
                 notify=bool(notify_on_defer),
                 skipReadyNotice=True,
                 relaunchAfterSwap=bool(relaunch_after),
@@ -1255,7 +1302,7 @@ def perform_uninstall(
             cleaned_mods = restore_unpacked_mods_on_uninstall(None, receipt, discovered_udirs)
             record.update(
                 standalone=True,
-                companionPid=os.getpid(),
+                companionPid=0,
                 notify=bool(notify_on_defer),
                 skipReadyNotice=True,
                 cleanupOnRestore=True,
@@ -1284,10 +1331,12 @@ def perform_uninstall(
             ) from last_err
 
     mode = record.get("mode", "exe" if target.is_file() else "source")
-    if mode in ("exe", "appimage", "elf") and record.get("originalSha"):
-        actual_sha = sha256_file(target)
-        if actual_sha != record["originalSha"]:
+    if mode in ("exe", "appimage", "elf"):
+        expected_after_sha = record.get("replacementSha") or record.get("originalSha")
+        if expected_after_sha and sha256_file(target) != expected_after_sha:
             raise patch_server.PatchError("Restored executable checksum mismatch; backup kept for safety.")
+        if patch_server.inspect_target(target).get("patched"):
+            raise patch_server.PatchError("Executable still contains Bridge & Rail patch; backup kept for safety.")
 
     cleaned_mods = restore_unpacked_mods_on_uninstall(target, receipt, discovered_udirs)
     _cleanup_after_restore(target, mode, state_root)
