@@ -8294,18 +8294,88 @@ PIER_SPAN_PER_M = 0.6
 PIER_SPAN_MAX = 60.0
 PIER_MIN_CLEAR = 1.5    # m from the ground up to a pier's top (under the girders): lower, the deck rests on the ground
 PIER_ROAD_M = 7.0       # m a pier keeps from the centre line of a road under the deck (its half width + room)
+PIER_EDGE_CLEAR_M = 1.5  # m from the pavement edge to the nearest face of a pier, when the road's half width is known
 PIER_CHANNEL_CLEAR = 15.0   # no pier in water whose run wants this much clearance (water_clear): a ship channel
 PIER_IN_WATER_M = 8.0   # m a pier in water reaches under its surface
 
 
+def _pier_line_clearance(half):
+    """m from a ground road's centre line to a standard wall pier test point. Unknown width: PIER_ROAD_M. Known half
+    width: the pavement edge, the wall's half thickness and PIER_EDGE_CLEAR_M."""
+    if half is None:
+        return PIER_ROAD_M
+    try:
+        rh = float(half)
+    except (TypeError, ValueError):
+        return PIER_ROAD_M
+    if not np.isfinite(rh) or rh < 0.0:
+        return PIER_ROAD_M
+    import roadmesh
+    return rh + roadmesh.PIER_T / 2.0 + PIER_EDGE_CLEAR_M
+
+
+def _pier_raw_half(half):
+    if half is None:
+        import roadmesh
+        return max(PIER_ROAD_M - roadmesh.PIER_T / 2.0 - PIER_EDGE_CLEAR_M, 3.5)
+    try:
+        rh = float(half)
+    except (TypeError, ValueError):
+        import roadmesh
+        return max(PIER_ROAD_M - roadmesh.PIER_T / 2.0 - PIER_EDGE_CLEAR_M, 3.5)
+    if not np.isfinite(rh) or rh < 0.0:
+        import roadmesh
+        return max(PIER_ROAD_M - roadmesh.PIER_T / 2.0 - PIER_EDGE_CLEAR_M, 3.5)
+    return rh
+
+
+def _pier_road_tables(road_lines, road_halves, return_halves=False):
+    """(A, B, radius per segment[, raw_half per segment]) of the roads under a deck."""
+    lines = list(road_lines or ())
+    halves = None if road_halves is None else list(road_halves)
+    segs, rads, raws = [], [], []
+    for i, item in enumerate(lines):
+        half, ln = None, item
+        if isinstance(item, tuple) and len(item) == 2 and np.ndim(item[0]) == 2:
+            ln, half = item
+        if halves is not None and i < len(halves) and halves[i] is not None:
+            half = halves[i]
+        ln = np.asarray(ln, np.float64)
+        if ln.ndim != 2 or len(ln) < 2:
+            continue
+        segs.append(ln[:, :2])
+        rads.append(np.full(len(ln) - 1, _pier_line_clearance(half)))
+        if return_halves:
+            raws.append(np.full(len(ln) - 1, _pier_raw_half(half)))
+    if not segs:
+        if return_halves:
+            return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0), np.zeros(0)
+        return np.zeros((0, 2)), np.zeros((0, 2)), np.zeros(0)
+    A = np.concatenate([ln[:-1] for ln in segs])
+    B = np.concatenate([ln[1:] for ln in segs])
+    R = np.concatenate(rads)
+    return (A, B, R, np.concatenate(raws)) if return_halves else (A, B, R)
+
+
+def _min_pavement_clearance(pts, A, B, raw_h):
+    """Minimum distance (m) from pts (m, 2) to the nearest ground-road pavement edge (dist - half)."""
+    if len(pts) == 0 or len(A) == 0:
+        return float("inf")
+    pts = np.asarray(pts, np.float64).reshape(-1, 2)
+    ab = B - A
+    ab2 = np.maximum((ab * ab).sum(axis=1), 1e-12)
+    qv = pts[:, None, :] - A[None, :, :]
+    t = np.clip((qv * ab[None, :, :]).sum(axis=2) / ab2[None, :], 0.0, 1.0)
+    proj = A[None, :, :] + t[..., None] * ab[None, :, :]
+    d = dnp.hypot(proj[..., 0] - pts[:, None, 0], proj[..., 1] - pts[:, None, 1]) - raw_h[None, :]
+    return float(d.min())
+
+
 def pier_sites(xy, z, width, ground_fn, road_lines=(), wet_fn=None, depth=None, road_halves=None):
-    """The piers under a bridge deck (xy (k, 2), deck top z (k,), width m): [(x, y, ux, uy, z_top, z_bottom, width)],
-    (ux, uy) along the deck, z_top under its girders (roadmesh.DECK_DEPTH + GIRDER_D), z_bottom in the ground (or
-    PIER_IN_WATER_M under water); evenly spaced inside the part (its ends are abutments or joints) at PIER_SPAN_M,
-    longer under a higher deck; none where the deck is within PIER_MIN_CLEAR of the ground, moved along up to 40 % of
-    a span off a road under it (PIER_ROAD_M) or left out; none in a ship channel. The official maps' bridges stand
-    on piers (Italy's tapered walls, East Coast's) where ours floated (the user, 2026-10-17: "Bridges need a lot of
-    work in general"). Pure given ground_fn(xy) -> heights, wet_fn(xy) -> bool."""
+    """The piers under a bridge deck (xy (k, 2), deck top z (k,), width m): [(x, y, ux, uy, z_top, z_bottom, width, ...)].
+    Places full tapered wall/bent piers in clear zones and wide gores, slim hammerhead/bent median piers in narrow
+    divided medians without touching any travel lane, and straddle portal bents over wide undivided corridors when
+    headroom permits, subdividing any remaining excessive unsupported span."""
     import fast
     import roadmesh
     xy = np.asarray(xy, np.float64)
@@ -8320,54 +8390,282 @@ def pier_sites(xy, z, width, ground_fn, road_lines=(), wet_fn=None, depth=None, 
     if n < 2:
         return []
     under = DECK_FULL_DEPTH if depth is None else float(depth)
-    segs = [np.asarray(ln, np.float64) for ln in road_lines if len(ln) >= 2]
-    A = np.concatenate([ln[:-1] for ln in segs]) if segs else np.zeros((0, 2))
-    B = np.concatenate([ln[1:] for ln in segs]) if segs else np.zeros((0, 2))
+    A, B, rad, raw_h = _pier_road_tables(road_lines, road_halves, return_halves=True)
     wet_runs = None
     if wet_fn is not None:
         w = np.asarray(wet_fn(xy), bool)
         wet_runs = (w, s)
-    out = []
     pw = float(np.clip(0.7 * width, 2.5, 14.0))
+    span_w = max(pw, float(width) + 2.0 * roadmesh.PARAPET_W)
+    n_foot = max(5, (int(dmath.ceil(span_w / 1.0)) + 1) | 1)
+    offs_f = np.linspace(-0.5 * span_w, 0.5 * span_w, n_foot)
+    rad_face = np.maximum(rad - 0.5 * roadmesh.PIER_T, 0.0) if len(A) else rad
+
+    def _pose_and_elev(sc):
+        p = np.array([dnp.interp(sc, s, xy[:, 0]), dnp.interp(sc, s, xy[:, 1])])
+        j = min(int(np.searchsorted(s, sc)), len(s) - 1)
+        t = xy[j] - xy[max(j - 1, 0)]
+        t = t / max(float(dnp.hypot(*t)), 1e-9)
+        nrm = np.array([-t[1], t[0]])
+        zt = float(dnp.interp(sc, s, z)) - under
+        g = float(ground_fn(p[None])[0])
+        if not np.isfinite(g) or zt - g < PIER_MIN_CLEAR:
+            return None
+        zb = g - roadmesh.FOOTING_M
+        if wet_runs is not None:
+            w, ss = wet_runs
+            k = int(np.argmin(np.abs(ss - sc)))
+            if w[k]:
+                a = k
+                while a > 0 and w[a - 1]:
+                    a -= 1
+                b = k
+                while b + 1 < len(w) and w[b + 1]:
+                    b += 1
+                if water_clear(ss[b] - ss[a]) >= PIER_CHANNEL_CLEAR and a < k < b:
+                    return None
+                zb = g - PIER_IN_WATER_M
+        return p, t, nrm, zt, zb, g
+
+    def _try_full(sc):
+        pe = _pose_and_elev(sc)
+        if pe is None:
+            return None
+        p, t, nrm, zt, zb, _g = pe
+        foot = p[None] + offs_f[:, None] * nrm[None]
+        g_foot = np.asarray(ground_fn(foot), np.float64).reshape(-1)
+        if not len(g_foot) or not np.isfinite(g_foot).all() or zt - float(np.max(g_foot)) < PIER_MIN_CLEAR:
+            return None
+        zb = min(zb, float(np.min(g_foot)) - roadmesh.FOOTING_M)
+        if len(A):
+            fast.require(0, "points_near_segments")
+            if np.asarray(fast._ef.points_near_segments(foot, A, B, rad)).any():
+                return None
+            h_pier = max(zt - float(np.min(g_foot)), 0.0)
+            u_ext = max(0.5 * roadmesh.PIER_T + 0.30, 0.5 * roadmesh.PIER_T + roadmesh.PIER_TAPER * h_pier)
+            foot_faces = np.vstack([foot - u_ext * t[None], foot + u_ext * t[None]])
+            if np.asarray(fast._ef.points_near_segments(foot_faces, A, B, rad_face)).any():
+                return None
+            grow = roadmesh.PIER_TAPER * max(zt - roadmesh.PIER_CAP_H - zb, 0.0)
+            ht_b = roadmesh.PIER_T / 2.0 + 0.5 * grow
+            hn_b = (float(width) / 2.0 - 2.0 + roadmesh.PIER_COLUMN / 2.0) if width > roadmesh.PIER_BENT_W else (0.5 * pw + grow)
+            corners = np.array([p + t * (a * ht_b) + nrm * (b * hn_b)
+                                for a in (-1.0, 0.0, 1.0) for b in (-1.0, -0.5, 0.0, 0.5, 1.0)])
+            if _min_pavement_clearance(corners, A, B, raw_h) < 0.35:
+                return None
+        return (float(p[0]), float(p[1]), float(t[0]), float(t[1]), zt, zb, float(width))
+
+    def _try_median(sc):
+        pe = _pose_and_elev(sc)
+        if pe is None or not len(A):
+            return None
+        p, t, nrm, zt, zb, _g = pe
+        c_clr = _min_pavement_clearance(p[None], A, B, raw_h)
+        if c_clr < 0.42:
+            return None
+        ht = float(np.clip(c_clr - 0.22, 0.26, roadmesh.PIER_T / 2.0))
+        shapes = []
+        if width > roadmesh.PIER_BENT_W:
+            lat = min(float(width) / 2.0 - 2.0, 3.5)
+            shapes.append((min(roadmesh.PIER_COLUMN / 2.0, 0.70), (-lat, lat)))
+        for hn in (min(0.25 * float(width), 1.35), 0.90, 0.55, ht):
+            shapes.append((float(hn), (0.0,)))
+        for hn, offs in shapes:
+            pts = np.array([p + nrm * (lat + b * hn) + t * (a * ht)
+                            for lat in offs for a in (-1.0, 0.0, 1.0) for b in (-1.0, -0.5, 0.0, 0.5, 1.0)])
+            if _min_pavement_clearance(pts, A, B, raw_h) >= 0.18:
+                return (float(p[0]), float(p[1]), float(t[0]), float(t[1]), zt, zb, float(width),
+                        None, ("median", ht, hn, offs))
+        return None
+
+    def _try_portal(sc):
+        pe = _pose_and_elev(sc)
+        if pe is None or not len(A):
+            return None
+        p, t, nrm, zt, zb, g = pe
+        if zt - g < 6.10:
+            return None
+        gap = roadmesh.PIER_COLUMN / 2.0 + 1.15
+        col_clear = gap + roadmesh.PIER_COLUMN / 2.0
+        col_r = roadmesh.PIER_COLUMN / 2.0 + 0.40
+        cap_half = max(float(width) / 2.0 + roadmesh.PARAPET_W, pw / 2.0)
+        cands = []
+        for m in range(len(A)):
+            seg = np.array([A[m], B[m]], np.float64)
+            hw = float(raw_h[m])
+            v_res = _deck_portal_v_span(seg, p, t, nrm, hw, col_r, return_segs=True)
+            if v_res[0] is not None:
+                cands.append((v_res[0], v_res[1], v_res[2]))
+        hits = [c for c in cands if c[0] < cap_half + col_r and c[1] > -(cap_half + col_r)]
+        if not hits:
+            return None
+        lo = min(c[0] for c in hits)
+        hi = max(c[1] for c in hits)
+        changed = True
+        while changed:
+            changed = False
+            for clo, chi, _segs in cands:
+                if clo < lo and chi > lo - (gap + col_clear):
+                    lo = min(lo, clo)
+                    changed = True
+                if chi > hi and clo < hi + (gap + col_clear):
+                    hi = max(hi, chi)
+                    changed = True
+        hw_portal = 0.5 * (hi - lo)
+        if hw_portal > PORTAL_MAX_HALF_M:
+            return None
+        off_lat = 0.5 * (lo + hi)
+        used_cands = [c for c in cands if c[0] <= hi and c[1] >= lo]
+        if len(used_cands) >= 2 or abs(off_lat) > 1.0:
+            if any(
+                sv_lo < hi and sv_hi > lo and cos_u < PORTAL_MIN_COS_SKEW
+                for _clo, _chi, segs in used_cands
+                for sv_lo, sv_hi, cos_u in segs
+            ):
+                return None
+        left_c, right_c = off_lat - (hw_portal + gap), off_lat + (hw_portal + gap)
+        hc = roadmesh.PIER_COLUMN / 2.0
+        col_pts = np.array([p + nrm * (lat + b * hc) + t * (a * hc)
+                            for lat in (left_c, right_c) for a in (-1.0, 0.0, 1.0) for b in (-1.0, 0.0, 1.0)])
+        if _min_pavement_clearance(col_pts, A, B, raw_h) < 0.35:
+            return None
+        col_centres = np.array([p + nrm * left_c, p + nrm * right_c])
+        g_cols = np.asarray(ground_fn(col_centres), np.float64)
+        if not np.isfinite(g_cols).all():
+            return None
+        g_road = max(g, float(g_cols.max()))
+        if zt < g_road + 6.10:
+            return None
+        zb_p = min(zb, float(g_cols.min()) - roadmesh.FOOTING_M)
+        return (float(p[0]), float(p[1]), float(t[0]), float(t[1]), zt, zb_p, float(width),
+                None, ("portal", g_road, off_lat, hw_portal))
+
+    def _pocket_peaks(grid, ref_s):
+        """Clear-pocket peaks (c_clr >= 0.42 m) on grid, centered in each pocket and ordered near ref_s."""
+        pts_g = np.c_[dnp.interp(grid, s, xy[:, 0]), dnp.interp(grid, s, xy[:, 1])]
+        clrs = np.array([_min_pavement_clearance(pts_g[k:k + 1], A, B, raw_h) for k in range(len(grid))], np.float64)
+        ok = clrs >= 0.42
+        if not ok.any():
+            return []
+        peaks = []
+        k = 0
+        while k < len(grid):
+            if not ok[k]:
+                k += 1
+                continue
+            j = k
+            while j + 1 < len(grid) and ok[j + 1]:
+                j += 1
+            sub_c = clrs[k:j + 1]
+            top = float(sub_c.max())
+            band = np.flatnonzero(sub_c >= top - 0.05) + k
+            best_idx = int(band[len(band) // 2])
+            peaks.append(float(grid[best_idx]))
+            for idx_extra in range(k, j + 1):
+                if idx_extra != best_idx:
+                    peaks.append(float(grid[idx_extra]))
+            k = j + 1
+        is_peak = set()
+        k = 0
+        while k < len(grid):
+            if not ok[k]:
+                k += 1
+                continue
+            j = k
+            while j + 1 < len(grid) and ok[j + 1]:
+                j += 1
+            sub_c = clrs[k:j + 1]
+            band = np.flatnonzero(sub_c >= float(sub_c.max()) - 0.05) + k
+            is_peak.add(float(grid[int(band[len(band) // 2])]))
+            k = j + 1
+        return sorted(peaks, key=lambda sc_v: (0 if sc_v in is_peak else 1, abs(sc_v - ref_s)))
+
+    placed_s, out = [], []
+    min_sep = 0.42 * span
     for i in range(1, n):
-        placed = None
+        target_s = L * i / n
+        placed, chosen_s = None, None
         for off in (0.0, 0.25, -0.25, 0.4, -0.4):
-            sc = L * i / n + off * span
+            sc = target_s + off * span
             if sc < 0.5 * span or sc > L - 0.5 * span:
                 continue
-            p = np.array([dnp.interp(sc, s, xy[:, 0]), dnp.interp(sc, s, xy[:, 1])])
-            j = min(int(np.searchsorted(s, sc)), len(s) - 1)
-            t = xy[j] - xy[max(j - 1, 0)]
-            t = t / max(float(dnp.hypot(*t)), 1e-9)
-            nrm = np.array([-t[1], t[0]])
-            foot = np.array([p + nrm * pw / 2, p - nrm * pw / 2, p])
-            if len(A):
-                fast.require(0, "points_near_segments")
-                hit = fast._ef.points_near_segments(foot, A, B, np.full(len(A), PIER_ROAD_M))
-                if np.asarray(hit).any():
-                    continue
-            zt = float(dnp.interp(sc, s, z)) - under
-            g = float(ground_fn(p[None])[0])
-            if zt - g < PIER_MIN_CLEAR:
+            if placed_s and sc - placed_s[-1] < min_sep:
                 continue
-            zb = g - roadmesh.FOOTING_M
-            if wet_runs is not None:
-                w, ss = wet_runs
-                k = int(np.argmin(np.abs(ss - sc)))
-                if w[k]:
-                    a = k
-                    while a > 0 and w[a - 1]:
-                        a -= 1
-                    b = k
-                    while b + 1 < len(w) and w[b + 1]:
-                        b += 1
-                    if water_clear(ss[b] - ss[a]) >= PIER_CHANNEL_CLEAR and a < k < b:
-                        continue
-                    zb = g - PIER_IN_WATER_M
-            placed = (float(p[0]), float(p[1]), float(t[0]), float(t[1]), zt, zb, float(width))
-            break
+            placed = _try_full(sc)
+            if placed is not None:
+                chosen_s = sc
+                break
+        if placed is None and len(A):
+            lo_s = max(0.28 * span, L * (i - 0.48) / n, (placed_s[-1] + min_sep) if placed_s else 0.0)
+            hi_s = min(L - 0.28 * span, L * (i + 0.48) / n)
+            if hi_s >= lo_s:
+                grid = np.arange(lo_s, hi_s + 0.25, 0.5)
+                by_dist = sorted(grid.tolist(), key=lambda v: abs(v - target_s))
+                for sc in by_dist:
+                    placed = _try_full(sc)
+                    if placed is not None:
+                        chosen_s = sc
+                        break
+                if placed is None:
+                    for sc in _pocket_peaks(grid, target_s):
+                        placed = _try_median(sc)
+                        if placed is not None:
+                            chosen_s = sc
+                            break
+                if placed is None:
+                    for sc in by_dist[::2]:
+                        placed = _try_portal(sc)
+                        if placed is not None:
+                            chosen_s = sc
+                            break
         if placed is not None:
+            placed_s.append(float(chosen_s))
             out.append(placed)
+
+    if len(A):
+        max_span = max(1.10 * (L / n), 1.18 * span, PIER_SPAN_M)
+        min_sub_sep = max(0.42 * span, 14.0)
+        for _pass in range(2):
+            added = False
+            knots = [0.0] + placed_s + [L]
+            for m in range(len(knots) - 1):
+                s_a, s_b = knots[m], knots[m + 1]
+                gap_s = s_b - s_a
+                if gap_s <= max_span:
+                    continue
+                lo_s = max(s_a + 0.28 * gap_s, s_a + min_sub_sep)
+                hi_s = min(s_b - 0.28 * gap_s, s_b - min_sub_sep)
+                if hi_s < lo_s:
+                    continue
+                mid_s = 0.5 * (s_a + s_b)
+                grid = np.arange(lo_s, hi_s + 0.1, 0.5)
+                by_dist = sorted(grid.tolist(), key=lambda v: abs(v - mid_s))
+                ins, ins_s = None, None
+                for sc in by_dist:
+                    ins = _try_full(sc)
+                    if ins is not None:
+                        ins_s = sc
+                        break
+                if ins is None:
+                    for sc in _pocket_peaks(grid, mid_s):
+                        ins = _try_median(sc)
+                        if ins is not None:
+                            ins_s = sc
+                            break
+                if ins is None and gap_s > max(1.30 * span, 42.0):
+                    for sc in by_dist:
+                        ins = _try_portal(sc)
+                        if ins is not None:
+                            ins_s = sc
+                            break
+                if ins is not None:
+                    idx_ins = int(np.searchsorted(placed_s, ins_s))
+                    placed_s.insert(idx_ins, float(ins_s))
+                    out.insert(idx_ins, ins)
+                    added = True
+                    break
+            if not added:
+                break
     return out
 
 
@@ -8412,6 +8710,267 @@ def _covered_by_higher(xy, half, level, key, pool):
         t = np.clip((q * d[None]).sum(2) / l2[None], 0.0, 1.0)
         dist = dnp.hypot(*(q - t[..., None] * d[None]).transpose(2, 0, 1)).min(1)
         out |= dist <= reach
+    return out
+
+
+def _as_deck_records(decks):
+    """[(centre line (k, 2), z (k,), width)] from (xy, z, width) or a roadmesh ribbon pair."""
+    out = []
+    for item in decks or ():
+        if isinstance(item, tuple) and len(item) == 2 and isinstance(item[0], tuple):
+            ribbon, _chunk = item
+            if len(ribbon) < 6 or ribbon[5] is None:
+                continue
+            left, right, z = np.asarray(ribbon[0], np.float64), np.asarray(ribbon[1], np.float64), ribbon[5]
+            mid = (left + right) / 2.0
+            hw = float(np.median(dnp.hypot(*(left - right).T))) / 2.0
+            if len(mid) >= 2:
+                out.append((mid[:, :2], np.asarray(z, np.float64), hw * 2.0))
+            continue
+        if isinstance(item, tuple) and len(item) >= 3 and not isinstance(item[0], tuple):
+            xy, z, w = np.asarray(item[0], np.float64), np.asarray(item[1], np.float64), float(item[2])
+            if xy.ndim == 2 and len(xy) >= 2 and len(z) == len(xy) and w > 0.0:
+                out.append((xy[:, :2], z, w))
+    return out
+
+
+PORTAL_MAX_SPAN_M = 26.0
+PORTAL_MAX_HALF_M = 0.5 * PORTAL_MAX_SPAN_M
+PORTAL_MAX_SKEW_DEG = 25.0
+PORTAL_MIN_COS_SKEW = dmath.cos(dmath.radians(PORTAL_MAX_SKEW_DEG))
+
+
+def _deck_portal_v_span(xy, q, t_dir, nrm, hw, col_r, return_segs=False):
+    """Lateral interval (v_lo, v_hi) along `nrm` where segments of `xy` within |u| <= hw + col_r block columns."""
+    rel = xy - q
+    u = rel @ t_dir
+    v = rel @ nrm
+    lim = float(hw + col_r)
+    v_lo, v_hi = np.inf, -np.inf
+    segs = []
+    for m in range(len(xy) - 1):
+        u0, u1 = float(u[m]), float(u[m + 1])
+        v0, v1 = float(v[m]), float(v[m + 1])
+        if max(u0, u1) < -lim or min(u0, u1) > lim:
+            continue
+        du = u1 - u0
+        if abs(du) <= 1e-9:
+            t0, t1 = 0.0, 1.0
+        else:
+            ta, tb = (-lim - u0) / du, (lim - u0) / du
+            t0, t1 = max(0.0, min(ta, tb)), min(1.0, max(ta, tb))
+            if t0 > t1:
+                continue
+        va, vb = v0 + t0 * (v1 - v0), v0 + t1 * (v1 - v0)
+        seg_len = dmath.hypot(du, v1 - v0)
+        cos_u = abs(du) / seg_len if seg_len > 1e-9 else 1.0
+        pad_v = float(hw) + (0.05 if cos_u < 0.99 else 0.0)
+        sv_lo = min(va, vb) - pad_v
+        sv_hi = max(va, vb) + pad_v
+        v_lo = min(v_lo, sv_lo)
+        v_hi = max(v_hi, sv_hi)
+        if return_segs:
+            segs.append((sv_lo, sv_hi, cos_u))
+    if v_lo > v_hi:
+        return (None, ()) if return_segs else None
+    return (v_lo, v_hi, segs) if return_segs else (v_lo, v_hi)
+
+
+def _rect_seg_dists(xy, cc, t_dir, nrm, ht, hn):
+    """Per segment of xy: (min Euclidean distance to OBB (cc, t_dir, nrm, ht, hn), closest parameter t in [0, 1])."""
+    rel = xy - cc
+    u = rel @ t_dir
+    v = rel @ nrm
+    u0, v0 = u[:-1], v[:-1]
+    u1, v1 = u[1:], v[1:]
+    du, dv = u1 - u0, v1 - v0
+    L2 = np.maximum(du * du + dv * dv, 1e-18)
+    t_cands = [np.zeros_like(u0), np.ones_like(u0)]
+    for sign in (-1.0, 1.0):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            tu = np.where(np.abs(du) > 1e-12, (sign * ht - u0) / du, 0.0)
+            tv = np.where(np.abs(dv) > 1e-12, (sign * hn - v0) / dv, 0.0)
+        t_cands.append(np.clip(tu, 0.0, 1.0))
+        t_cands.append(np.clip(tv, 0.0, 1.0))
+    for su in (-1.0, 1.0):
+        for sv in (-1.0, 1.0):
+            tc = ((su * ht - u0) * du + (sv * hn - v0) * dv) / L2
+            t_cands.append(np.clip(tc, 0.0, 1.0))
+    inv_u = np.where(np.abs(du) > 1e-12, 1.0 / np.where(np.abs(du) > 1e-12, du, 1.0), 0.0)
+    inv_v = np.where(np.abs(dv) > 1e-12, 1.0 / np.where(np.abs(dv) > 1e-12, dv, 1.0), 0.0)
+    ua = np.where(np.abs(du) > 1e-12, np.minimum((-ht - u0) * inv_u, (ht - u0) * inv_u),
+                  np.where(np.abs(u0) <= ht, -np.inf, np.inf))
+    ub = np.where(np.abs(du) > 1e-12, np.maximum((-ht - u0) * inv_u, (ht - u0) * inv_u),
+                  np.where(np.abs(u0) <= ht, np.inf, -np.inf))
+    va = np.where(np.abs(dv) > 1e-12, np.minimum((-hn - v0) * inv_v, (hn - v0) * inv_v),
+                  np.where(np.abs(v0) <= hn, -np.inf, np.inf))
+    vb = np.where(np.abs(dv) > 1e-12, np.maximum((-hn - v0) * inv_v, (hn - v0) * inv_v),
+                  np.where(np.abs(v0) <= hn, np.inf, -np.inf))
+    ta = np.maximum(0.0, np.maximum(ua, va))
+    tb = np.minimum(1.0, np.minimum(ub, vb))
+    t_mid = 0.5 * (np.clip(ta, 0.0, 1.0) + np.clip(tb, 0.0, 1.0))
+    t_cands.append(np.where(ta <= tb, t_mid, 0.5))
+    ts = np.stack(t_cands, axis=0)
+    ut = u0[None] + ts * du[None]
+    vt = v0[None] + ts * dv[None]
+    ds = dnp.hypot(np.maximum(np.abs(ut) - ht, 0.0), np.maximum(np.abs(vt) - hn, 0.0))
+    best = np.argmin(ds, axis=0)
+    idx = np.arange(len(u0))
+    return ds[best, idx], ts[best, idx]
+
+
+def _pier_obb_hits_recs(t_dir, nrm, zt, boxes, recs):
+    """True when any pier component OBB (cc, ht, hn, z0, z1, clear_pad) intrudes into a lower roadway in recs."""
+    z_cap = float(zt)
+    for r_xy, r_z, r_w in recs:
+        r_hw = 0.5 * float(r_w)
+        r_lo, r_hi = r_xy.min(0), r_xy.max(0)
+        z0s, z1s = r_z[:-1], r_z[1:]
+        for cc, ht, hn, bz0, bz1, pad in boxes:
+            lim = r_hw + float(pad)
+            rad_b = lim + float(ht) + float(hn)
+            if (cc[0] < r_lo[0] - rad_b or cc[0] > r_hi[0] + rad_b
+                    or cc[1] < r_lo[1] - rad_b or cc[1] > r_hi[1] + rad_b):
+                continue
+            dists, tb = _rect_seg_dists(r_xy, cc, t_dir, nrm, float(ht), float(hn))
+            hit = dists < lim
+            if not hit.any():
+                continue
+            rzz = z0s + tb * (z1s - z0s)
+            v_hit = (rzz < z_cap) & (rzz <= float(bz1) + 0.50) & (float(bz0) < rzz + MIN_BRIDGE_HEADROOM_M)
+            if (hit & v_hit).any():
+                return True
+    return False
+
+
+def pier_portals(piers, decks):
+    """Tag an upper pier that would stand through a lower carriageway with ('portal', z_road, mid_v, hw_portal)."""
+    import roadmesh
+    recs = _as_deck_records(decks)
+    if not piers or not recs:
+        return list(piers)
+    gap = roadmesh.PIER_COLUMN / 2.0 + 1.15
+    col_clear = gap + roadmesh.PIER_COLUMN / 2.0
+    col_r = max(0.5 * roadmesh.PIER_COLUMN, 0.5 * roadmesh.PIER_T) + 0.35
+    out = []
+    for p in piers:
+        tag_kind = p[8][0] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
+        prior_portal = (p[8] if len(p) > 8 and isinstance(p[8], tuple) and len(p[8]) >= 4 and p[8][0] == "portal"
+                        else None)
+        x, y, ux, uy, zt, zb, width = p[:7]
+        thick = float(p[7]) if len(p) > 7 and p[7] is not None else None
+        q = np.array([float(x), float(y)], np.float64)
+        t_dir = np.array([float(ux), float(uy)], np.float64)
+        nrm = np.array([-float(uy), float(ux)], np.float64)
+        if tag_kind == "median":
+            med_ht, med_hn = float(p[8][1]), float(p[8][2])
+            med_offs = p[8][3] if len(p[8]) > 3 else (0.0,)
+            cap_half = (max(abs(float(o)) for o in med_offs) if med_offs else 0.0) + med_hn
+            pier_t = med_ht
+        else:
+            cap_half = max(float(width) / 2.0 + roadmesh.PARAPET_W,
+                           float(np.clip(0.7 * float(width), 2.5, 14.0)) / 2.0)
+            pier_t = max(roadmesh.PIER_T, 0.5 * thick if thick is not None else 0.0)
+        reach = cap_half + pier_t
+        cands = []
+        if prior_portal is not None:
+            _pk, pz0, poff0, phw0 = prior_portal[:4]
+            cands.append((0.0, float(pz0), float(poff0) - float(phw0), float(poff0) + float(phw0), ()))
+        for xy, z, w in recs:
+            a, ab = xy[:-1], np.diff(xy, axis=0)
+            L2 = np.maximum((ab * ab).sum(1), 1e-12)
+            t = np.clip(((q - a) * ab).sum(1) / L2, 0.0, 1.0)
+            near = a + t[:, None] * ab
+            dist = dnp.hypot(*(near - q).T)
+            k = int(np.argmin(dist))
+            hw = float(w) / 2.0
+            zz = float(z[k] + t[k] * (z[min(k + 1, len(z) - 1)] - z[k]))
+            if not (zz < float(zt) and float(zb) < zz + MIN_BRIDGE_HEADROOM_M):
+                continue
+            if tag_kind == "median" and zz >= float(zt) - roadmesh.PIER_CAP_H and dist[k] >= hw + float(width) / 2.0 + 0.25:
+                continue
+            if abs(float((near[k] - q) @ t_dir)) > hw + pier_t + 2.0 and dist[k] >= hw + reach:
+                continue
+            v_res = _deck_portal_v_span(xy, q, t_dir, nrm, hw, max(col_r, pier_t), return_segs=True)
+            if v_res[0] is not None:
+                cands.append((float(dist[k]), zz, v_res[0], v_res[1], v_res[2]))
+            else:
+                off = float((near[k] - q) @ nrm)
+                lk = dmath.hypot(float(ab[k, 0]), float(ab[k, 1]))
+                cos_k = abs(float((ab[k] / lk) @ t_dir)) if lk > 1e-9 else 1.0
+                cands.append((float(dist[k]), zz, off - hw, off + hw, [(off - hw, off + hw, cos_k)]))
+        hits = [c for c in cands if c[2] < cap_half and c[3] > -cap_half]
+        if not hits:
+            if thick is not None:
+                shaft_boxes = [(q, 0.5 * thick, 0.5 * float(width), float(zb), float(zt), 0.30)]
+            else:
+                z_cap0 = float(zt) - roadmesh.PIER_CAP_H
+                shaft_boxes = [(q, 0.5 * roadmesh.PIER_T + 0.30, cap_half, z_cap0, float(zt), 0.50)]
+                if float(width) > roadmesh.PIER_BENT_W:
+                    nc = max(2, int(round(float(width) / 9.0)))
+                    for off_c in np.linspace(-(0.5 * float(width) - 2.0), 0.5 * float(width) - 2.0, nc):
+                        shaft_boxes.append((
+                            q + nrm * float(off_c),
+                            0.5 * roadmesh.PIER_COLUMN,
+                            0.5 * roadmesh.PIER_COLUMN,
+                            float(zb),
+                            z_cap0,
+                            0.50,
+                        ))
+                else:
+                    wall = float(np.clip(0.7 * float(width), 2.5, 14.0)) * 0.5
+                    taper = roadmesh.PIER_TAPER * max(float(zt) - float(zb), 0.0)
+                    shaft_boxes.append((q, 0.5 * roadmesh.PIER_T + taper, wall, float(zb), z_cap0, 0.50))
+            if _pier_obb_hits_recs(t_dir, nrm, zt, shaft_boxes, recs):
+                continue
+            out.append(tuple(p))
+            continue
+        lo = min(c[2] for c in hits)
+        hi = max(c[3] for c in hits)
+        z_road = max(c[1] for c in hits)
+        changed = True
+        while changed:
+            changed = False
+            for _d, zz, clo, chi, _segs in cands:
+                if clo < lo and chi > lo - (gap + col_clear):
+                    lo = min(lo, clo)
+                    z_road = max(z_road, zz)
+                    changed = True
+                if chi > hi and clo < hi + (gap + col_clear):
+                    hi = max(hi, chi)
+                    z_road = max(z_road, zz)
+                    changed = True
+        mid_v = 0.5 * (lo + hi)
+        hw_portal = 0.5 * (hi - lo)
+        if hw_portal > PORTAL_MAX_HALF_M:
+            continue
+        used_cands = [c for c in cands if c[2] <= hi and c[3] >= lo]
+        if len(used_cands) >= 2 or abs(mid_v) > 1.0:
+            skew_bad = False
+            for _d, _zz, _clo, _chi, segs in used_cands:
+                if any(sv_lo < hi and sv_hi > lo and cos_u < PORTAL_MIN_COS_SKEW for sv_lo, sv_hi, cos_u in segs):
+                    skew_bad = True
+                    break
+            if skew_bad:
+                continue
+        left_c = min(mid_v - (hw_portal + gap), -cap_half + 0.5 * roadmesh.PIER_COLUMN)
+        right_c = max(mid_v + (hw_portal + gap), cap_half - 0.5 * roadmesh.PIER_COLUMN)
+        if max(-left_c, right_c) > max(2.0 * cap_half, cap_half + 2.5):
+            continue
+        col_boxes = [
+            (q + nrm * float(c_lat), 0.5 * roadmesh.PIER_COLUMN, 0.5 * roadmesh.PIER_COLUMN,
+             float(zb), float(zt), 1.0)
+            for c_lat in (left_c, right_c)
+        ]
+        if _pier_obb_hits_recs(t_dir, nrm, zt, col_boxes, recs):
+            continue
+        if prior_portal is not None and abs(z_road - float(prior_portal[1])) <= 1e-6 and (
+                abs(mid_v - float(prior_portal[2])) <= 1e-6 and abs(hw_portal - float(prior_portal[3])) <= 1e-6):
+            out.append(p)
+            continue
+        tag = ("portal", z_road, mid_v, hw_portal)
+        head = tuple(p[:8]) if len(p) > 7 else tuple(p[:7]) + (None,)
+        out.append(head + (tag,) + tuple(p[9:]))
     return out
 
 
@@ -8554,9 +9113,13 @@ class BridgeProfiles:
             old = pool.get(k)
             if old is None or v[4] > old[4]:
                 pool[k] = v
+        ghalf = self.__dict__.get("_ghalf")
+        rhalf = self.__dict__.setdefault("_road_half", {})
         for k, lines in roads_:
             if k not in ground:
                 ground[k] = lines
+            if ghalf is not None and k in ghalf:
+                rhalf[k] = ghalf[k]
         if ROAD_SIGNED_ON and self.READS_LIMITS:
             # (with the cell's ground roads, so a chain reads the limits of exactly the cells it loaded, whichever
             # other cells this process's threads had loaded before: _limits_near)
@@ -8659,6 +9222,7 @@ class BridgeProfiles:
                             rings = got
                         lines += mapgeom.enu_rings(feats, self.frame, rings)
                         roads_.append(((fid, "g"), lines))
+                        self.__dict__.setdefault("_ghalf", {})[(fid, "g")] = float(rs[i].width) / 2.0
                         self.__dict__.setdefault("_gcls", {})[(fid, "g")] = rs[i].cls     # (LEVEL_SPACING)
                     elif _rail_drawn(feats, i):
                         # a railway on the ground: the decks over it keep their headroom too (GitHub #324: a road bridge
@@ -9843,16 +10407,101 @@ class BridgeProfiles:
             for k in mine:
                 of[k] = ck
 
+    PIER_CELL_MARGIN_M = 30.0
+
+    def _bbox_ground_roads(self, xy, pad=PIER_CELL_MARGIN_M, include_rail=False):
+        """Ground roads (and optionally ground rails) in z=14 cells within pad m of xy:
+        [(gk, [line (k, 2)], half_width_or_None)], deduplicated across cells."""
+        pts = np.asarray(xy, np.float64).reshape(-1, 2)
+        if len(pts) == 0 or not np.isfinite(pts).all() or self.cell_fn is None:
+            return []
+        lo = pts.min(0) - float(pad)
+        hi = pts.max(0) + float(pad)
+        corners = np.array([[lo[0], lo[1]], [hi[0], lo[1]], [hi[0], hi[1]], [lo[0], hi[1]]])
+        la, lon, _ = self.frame.enu_to_geodetic(corners[:, 0], corners[:, 1], np.zeros(4))
+        cells = mapcells.cells_for_bbox(float(np.min(la)), float(np.min(lon)),
+                                        float(np.max(la)), float(np.max(lon)))
+        cache = self.__dict__.get("cell_entries")
+        ghalf = self.__dict__.setdefault("_ghalf", {})
+        by_key = {}
+        for key in cells:
+            got = cache.get(str(key)) if cache is not None else None
+            if got is not None and all(gk in ghalf for gk, _lns in got[1] if gk[1] == "g"):
+                entries = [(gk, lns, ghalf.get(gk)) for gk, lns in got[1]]
+            else:
+                feats = self.cell_fn(key)
+                if feats is None or len(feats) == 0:
+                    continue
+                entries = []
+                rs = road_specs(feats)
+                for i in range(len(feats)):
+                    fid = str(feats.ids[i])
+                    sp = rs[i]
+                    if sp is None:
+                        hc = home_copy(feats, i)
+                        if hc is not None:
+                            sp = road_specs(hc[0])[hc[1]]
+                    if sp is not None:
+                        half_w = float(sp.width) / 2.0
+                        ghalf[(fid, "g")] = half_w
+                        lines = [np.stack(mapgeom.enu_xy(feats, self.frame, ring), axis=1)
+                                 for ring in ground_parts(feats, i)]
+                        if lines:
+                            entries.append(((fid, "g"), lines, half_w))
+                    elif include_rail and _rail_drawn(feats, i):
+                        import railways
+                        lines = [np.stack(mapgeom.enu_xy(feats, self.frame, ring), axis=1)
+                                 for kind, rings in railways._pieces(feats, i) if kind == "ground" for ring in rings]
+                        if lines:
+                            entries.append(((fid, "r"), lines, None))
+            for gk, lines, half in entries:
+                if gk[1] != "g" and not (include_rail and gk[1] == "r"):
+                    continue
+                npts = sum(len(ln) for ln in lines)
+                old = by_key.get(gk)
+                if old is None or npts > old[2]:
+                    by_key[gk] = (lines, half, npts)
+        return [(gk, lines, half) for gk, (lines, half, _) in by_key.items()]
+
     def _precommit(self, k, part, ground=None):
         """Before part k (spec, xy, z, lon) is published, outside the lock: what its commit reads (its piers:
         pier_sites samples the ground under them; TunnelProfiles: nothing). Handed to _commit."""
         spec, xy, z, _lon = part
-        # (its ground roads and railways: the chain's ground also holds its cells' height limits, ("lim", cell), which
-        # are no lines: pier_sites raised on them and the bridge lost every pier, the Bowker Overpass 2026-11-14)
-        lines = [ln for gk, v in (ground or {}).items() if gk[1] in ("g", "r") for ln in v]
+        xy_arr = np.asarray(xy, np.float64)[:, :2]
+        z_arr = np.asarray(z, np.float64)
+        rhalf = self.__dict__.get("_road_half", {})
+        by_key = {gk: (v, rhalf.get(gk)) for gk, v in (ground or {}).items() if gk[1] in ("g", "t", "w", "r")}
+        for gk, rlines, half in self._bbox_ground_roads(xy_arr, pad=self.PIER_CELL_MARGIN_M, include_rail=True):
+            if gk not in by_key:
+                by_key[gk] = (rlines, half)
+        lines, halves = [], []
+        for v, half in by_key.values():
+            for ln in v:
+                lines.append(ln)
+                halves.append(half)
+        if len(xy_arr) >= 2 and len(z_arr):
+            pad_d = self.PIER_CELL_MARGIN_M
+            lo_xy, hi_xy = xy_arr.min(0) - pad_d, xy_arr.max(0) + pad_d
+            z_hi_max = float(np.max(z_arr))
+            with self.lock:
+                done_snap = list(self.done.items())
+            for ok, (osp, oxy, oz, _olon) in done_snap:
+                if ok == k:
+                    continue
+                oxy2 = np.asarray(oxy, np.float64)[:, :2]
+                oz_arr = np.asarray(oz, np.float64)
+                if len(oxy2) < 2 or not len(oz_arr):
+                    continue
+                if (oxy2.max(0) < lo_xy).any() or (oxy2.min(0) > hi_xy).any():
+                    continue
+                if z_hi_max - float(np.min(oz_arr)) >= 2.0:
+                    ow = float(getattr(osp, "width", 0.0) or 0.0)
+                    lines.append(oxy2)
+                    halves.append(0.5 * ow if ow > 0.0 else None)
         try:
-            return pier_sites(np.asarray(xy, np.float64), np.asarray(z, np.float64), spec.width,
-                              self._ground, lines, self._wet_at, self.__dict__.get("depth", {}).get(k))
+            return pier_sites(np.asarray(xy, np.float64), z_arr, spec.width,
+                              self._ground, lines, self._wet_at, self.__dict__.get("depth", {}).get(k),
+                              road_halves=halves)
         except Exception as ex:             # no piers rather than no bridge
             log.debug("piers of %s: %s: %s", k, type(ex).__name__, ex)
             return []
@@ -9869,20 +10518,9 @@ class BridgeProfiles:
         return np.asarray(self.wet(la, lo), np.float64) > 0.5
 
     def _roads_near(self, xy):
-        """The ground road lines (k, 2) of the map cells around the points xy (n, 2) (an anchor pier's site)."""
-        la, lo, _ = self.frame.enu_to_geodetic(np.asarray(xy)[:, 0], np.asarray(xy)[:, 1], 0.0)
-        out = []
-        for key in {mapcells.cell_of(float(a), float(b)) for a, b in zip(la, lo)}:
-            feats = self.cell_fn(key)
-            if feats is None or len(feats) == 0:
-                continue
-            rs = road_specs(feats)
-            for i in range(len(feats)):
-                if rs[i] is not None:
-                    for ring in ground_parts(feats, i):
-                        e, n = mapgeom.enu_xy(feats, self.frame, ring)
-                        out.append(np.stack([e, n], axis=1))
-        return out
+        """Ground roads around xy (n, 2): [(line (k, 2), half width m)] for an anchor pier's site."""
+        return [(ln, half) for _, rlines, half in self._bbox_ground_roads(xy, pad=self.PIER_CELL_MARGIN_M)
+                for ln in rlines]
 
     def _structure(self, chain, infra_out=None):
         """The truss beams of a solved chain [(xy, z, width)] and the piers under its ends (bridgetypes); ([], []) for a

@@ -164,6 +164,7 @@ def fit(roads, tunnels, cells, chunks, parts):
             sides = []
             wing_ok = []
             ws = np.asarray(WING_S, np.float64)
+            ws_check = (-2.0, 0.0) + tuple(WING_S)
             for sg in (1.0, -1.0):          # how far the headwall reaches before another road or parallel bore
                 reach = FACE_SIDE
                 blocked_by_tun = False
@@ -176,8 +177,10 @@ def fit(roads, tunnels, cells, chunks, parts):
                 sides.append(reach)
                 ok = (reach >= FACE_SIDE - 1e-9) and not blocked_by_tun
                 if ok:
-                    lp = [p + ul * sg * (hw + reach + 0.5) + out * s for s in ws]
+                    lp = [p + ul * sg * (hw + reach + 0.5) + out * s for s in ws_check]
                     ok = all(oth.clear(q, None, ROAD_GAP) for q in lp)
+                if ok and not oth_tun.clear(p + ul * sg * (hw + FACE_SIDE + 2.5), None, 1.0):
+                    ok = False
                 wing_ok.append(ok)
             fx = np.array([-(hw + v) for v in FACE_X[::-1]] + [-0.5 * hw, 0.0, 0.5 * hw] + [hw + v for v in FACE_X])
             look = None
@@ -286,17 +289,33 @@ def parapet(fitd, low=False):
     return LOOKS[_look(fitd, low)][4]
 
 
+def _fit_tmax(fitd, th, lk):
+    """Upper lintel headroom over crown for mountain/cut-and-cover portals when steep terrain holes sit higher."""
+    tmax = float(lk[6])
+    if fitd is None or fitd.get("cap") or int(fitd.get("st", 0)) not in (0, 1, 2):
+        return tmax
+    fx = fitd.get("fx") or ()
+    fg = fitd.get("fg") or ()
+    if len(fx) and len(fx) == len(fg):
+        fmax = max(float(v) for v in fg)
+        if fmax > th + tmax:
+            tmax = max(tmax, min(fmax - th + 0.5, 4.0))
+    return tmax
+
+
 def crown_top(fitd, th, low=False):
     """The headwall's top over the floor at the opening's middle (earthfast.portal's headwall_top there)."""
     lk = LOOKS[_look(fitd, low)]
     fg, tmin, _short = capped(fitd, th, low)
     g = float(dnp.interp(0.0, fitd["fx"], fg))
-    return min(max(g + lk[4], th + tmin), th + lk[6])
+    return min(max(g + lk[4], th + tmin), th + _fit_tmax(fitd, th, lk))
 
 
-def prm(st, th, hw, side_l, side_r, uv_m):
+def prm(st, th, hw, side_l, side_r, uv_m, fitd=None):
     """earthfast.portal's Prm for look st."""
-    co, rake, ct, wt, par, tmin, tmax, foot, emin, wgt, flare, wlow = LOOKS[st]
+    lk = LOOKS[st]
+    co, rake, ct, wt, par, tmin, tmax, foot, emin, wgt, flare, wlow = lk
+    tmax = _fit_tmax(fitd, th, lk)
     side_l, side_r = min(side_l, LOOK_SIDE[st]), min(side_r, LOOK_SIDE[st])
     return np.array([th, hw, co, rake, ct, wt, par, side_l, tmin, tmax, foot, emin, wgt, flare, wlow, uv_m, side_r,
                      COVER_SIDE + 0.1], np.float64)
@@ -320,7 +339,7 @@ def structure(fitd, p, ul, out, sec, th, hw, uv_m, walls_near=(False, False), lo
     ws = np.asarray(fitd["ws"], np.float64) + sb
     wl = np.asarray(fitd["wl"], np.float64) if fitd.get("wl") is not None and not walls_near[0] else none
     wr = np.asarray(fitd["wr"], np.float64) if fitd.get("wr") is not None and not walls_near[1] else none
-    pr = prm(st, th, hw, float(fitd["sl"]), float(fitd["sr"]), uv_m)
+    pr = prm(st, th, hw, float(fitd["sl"]), float(fitd["sr"]), uv_m, fitd=fitd if not low else None)
     fg, pr[8], _short = capped(fitd, th, low)       # (a crossing road's cap: BNE_TUNNEL_ROAD_OVER)
     pr[2] += sb
     pr = np.r_[pr, sb]          # (inner_from: the tube's own walls are the hood's inside up to the mouth)

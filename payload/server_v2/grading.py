@@ -484,7 +484,7 @@ CHAIN_LOOK_M = 10.0         # m along each part its direction at the node is tak
 # deck's height (its abutments' ground, interpolated) minus UNDER_CLEAR_M, falling back at UNDER_GRADE. Lidar terrain
 # removes bridges and interpolates across the gap, at about the deck's height: the road under ran 0.7-2.5 m under the
 # girders (A28 near Zwolle, I-84 over NE 181st Ave in Portland, I-395 in Springfield VA, 2026-10-22). Never raises.
-UNDER_ON = os.environ.get("BNE_UNDERPASS", "on") != "off"
+UNDER_ON = os.environ.get("BNE_UNDERPASS", "off") == "on"
 # Rounded junction corners (roadcorners.py, from PR #363): the fan of asphalt between a curbless corner's arc and its
 # roads' old square corner graded at the roads' heights (Grader._make_cell)
 CORNERS_ON = os.environ.get("BNE_GRADE_CORNERS", "on") != "off"

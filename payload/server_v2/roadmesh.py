@@ -2246,6 +2246,7 @@ MEDIAN_JOIN_M = 6.0     # m: two decks' edges closer than this (a divided road's
                         # dark gap stood in a divided road's median over a canal, Port St. Lucie, 2026-10-23)
 FOOTING_M = 2.0         # m a pier reaches into the ground
 PIER_T = 1.8            # m: a wall pier's thickness along the deck (at its top; FOOTING tapers wider)
+PIER_SHAFT_T = 1.3      # m: drawn pier wall thickness along the deck (slender inside PIER_T envelope)
 PIER_TAPER = 0.012      # its width grows this much per m down (each side)
 PIER_CAP_H = 1.2        # m of pier cap under the girders, as wide as the deck
 PIER_BENT_W = 16.0      # a deck wider than this stands on columns (a bent) rather than one wall
@@ -2563,7 +2564,12 @@ def deck(chunks, origin, piers=(), context=(), beams=(), ground=(), parapets=Non
     if tops:                # (the tops of a deck's pieces closed together: their shared end rows weld, no wall between)
         P, T, UV, M = _slabs_from_tops(P, T, UV, M, tops, side)
         nv = sum(len(a) for a in P)
-    for p in _piers_clear(piers, rb):
+    gc_lines = _ground_carriageways(list(chunks) + list(ground)) if (piers or len(beams)) else ()
+    portal_ctx = list(rb) + list(cr_all) + gc_lines if piers else ()
+    if piers:
+        import roads as _roads
+        piers = _roads.pier_portals(piers, portal_ctx)
+    for p in _piers_clear(piers, rb, portal_ctx):
         _pier(p, origin, P, T, UV, M, side)
         nv = sum(len(a) for a in P)
     for pad in pads:                # (junction pads on bridges: roads.deck_pads; their rim's railings)
@@ -2748,27 +2754,129 @@ def _pad(ring, centre, origin, P, T, UV, M, top, side, field=None):
     M.append(np.full(2 * k, side))
 
 
-def _piers_clear(piers, rb):
-    """The piers that cross no other deck under their top: a pier of the Queensboro Bridge's upper roadway stood on
-    the ground through the lower one, across its lanes (the user, 2026-10-17: "objects blocking the bridge road")."""
-    if not piers or not rb:
+def _portal_columns(p):
+    """Return (z_road, left_c, right_c, cap_bot) for a valid portal-tagged pier, or False if it fails bounds."""
+    portal = p[8] if len(p) > 8 and isinstance(p[8], tuple) and p[8] and p[8][0] == "portal" else None
+    if portal is None:
+        return None
+    zt, width = float(p[4]), float(p[6])
+    z_road, off, hw = float(portal[1]), float(portal[2]), float(portal[3])
+    if zt < z_road + 4.85:
+        return False
+    cap_w = width / 2 + PARAPET_W
+    gap = PIER_COLUMN / 2 + 1.15
+    left_c = min(off - (hw + gap), -cap_w + PIER_COLUMN / 2)
+    right_c = max(off + (hw + gap), cap_w - PIER_COLUMN / 2)
+    if max(-left_c, right_c) > max(2.0 * cap_w, cap_w + 2.5):
+        return False
+    cap_bot = (min(max(zt - PIER_CAP_H, z_road + 6.05), zt - 0.10) if zt >= z_road + 6.10
+               else min(max(zt - 0.55, z_road + 4.55), zt - 0.10))
+    return z_road, left_c, right_c, cap_bot
+
+
+def _seg_nearest_z(pts, mid, z):
+    """Per query point in `pts` (m, 2): (min segment distance, interpolated polyline z) on `(mid, z)`."""
+    a, b = mid[:-1, :2], mid[1:, :2]
+    ab = b - a
+    l2 = np.maximum((ab * ab).sum(1), 1e-12)
+    f = np.clip(((pts[:, None] - a[None]) * ab[None]).sum(2) / l2[None], 0.0, 1.0)
+    proj = a[None] + f[..., None] * ab[None]
+    d = dnp.hypot(*(pts[:, None] - proj).transpose(2, 0, 1))
+    best = d.argmin(1)
+    idx = np.arange(len(pts))
+    return d[idx, best], z[best] + f[idx, best] * (z[best + 1] - z[best])
+
+
+def _pier_hits_poly(pts, reach_r, z_lo, z_hi, poly_lines, pad_deck=0.0):
+    """True when any sample point in `pts` (m, 2) comes within `hw + pad + reach_r` and `[z_lo, z_hi]` of any polyline."""
+    if not len(pts) or not poly_lines:
+        return False
+    p_lo, p_hi = pts.min(0) - (reach_r + pad_deck), pts.max(0) + (reach_r + pad_deck)
+    for mid, hw, z, m_lo, m_hi, is_deck in poly_lines:
+        ew = hw + (pad_deck if is_deck else 0.0)
+        if p_hi[0] < m_lo[0] - ew or p_lo[0] > m_hi[0] + ew or p_hi[1] < m_lo[1] - ew or p_lo[1] > m_hi[1] + ew:
+            continue
+        d, z_at = _seg_nearest_z(pts, mid, z)
+        if ((d < ew + reach_r) & (z_at >= z_lo) & (z_at <= z_hi)).any():
+            return True
+    return False
+
+
+def _piers_clear(piers, rb, context=None):
+    """The piers that cross no other deck or ground carriageway within their shaft or cap volume."""
+    if not piers:
+        return []
+    src = context if context is not None else rb
+    if not rb and not src:
         return list(piers)
-    lines = [(((l + r) / 2), float(np.median(dnp.hypot(*(l - r).T))) / 2 + PARAPET_W, z) for (l, r, v, m, layer, z), c in rb
-             if not c.get("tunnel")]
+    col_lines = []
+    seen = set()
+    for items in (rb, src):
+        for (l, r, _v, _m, _layer, z), c in items:
+            if c.get("tunnel"):
+                continue
+            mid = (l + r) / 2
+            if len(mid) < 2:
+                continue
+            key = id(c) if isinstance(c, dict) else (len(mid), float(mid[0, 0]), float(mid[-1, 0]))
+            if key in seen:
+                continue
+            seen.add(key)
+            hw = float(np.median(dnp.hypot(*(l - r).T))) / 2
+            col_lines.append((mid, hw, np.asarray(z, np.float64), mid[:, :2].min(0), mid[:, :2].max(0), bool(c.get("deck"))))
     out = []
     for p in piers:
+        tag = p[8][0] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
         x, y, ux, uy, zt, zb, width = p[:7]
-        q = np.array([x, y])
-        reach = float(np.clip(0.7 * width, 2.5, 14.0)) / 2 + PIER_T
-        hit = False
-        for mid, hw, z in lines:
-            d = dnp.hypot(*(mid - q).T)
-            k = int(np.argmin(d))
-            if d[k] < hw + reach and z[k] < zt - 1.0:       # a deck below the pier's top, across its footprint
-                hit = True
-                break
-        if not hit:
+        thick = p[7] if len(p) > 7 else None
+        c_xy = np.array([x, y], np.float64)
+        nrm = np.array([-uy, ux], np.float64)
+        pinfo = _portal_columns(p)
+        if pinfo is False:
+            continue
+        if pinfo is not None:
+            _zr, left_c, right_c, cap_bot = pinfo
+            cols = np.vstack([c_xy + nrm * left_c, c_xy + nrm * right_c])
+            if _pier_hits_poly(cols, PIER_COLUMN / 2 + 1.0, zb - 0.5, cap_bot + 0.5, col_lines):
+                continue
+            ncap = max(3, int(math.ceil((right_c - left_c) / 2.0)) + 1)
+            cap_pts = c_xy[None] + nrm[None] * np.linspace(left_c, right_c, ncap)[:, None]
+            if _pier_hits_poly(cap_pts, PIER_T / 2 + 0.5, cap_bot - 0.3, zt + 0.50, col_lines):
+                continue
             out.append(p)
+            continue
+        if tag == "median":
+            offs = p[8][3] if len(p[8]) > 3 else (0.0,)
+            m_pts = c_xy[None] + nrm[None] * np.asarray(offs if offs else (0.0,), np.float64)[:, None]
+            m_rad = max(float(p[8][1]), float(p[8][2])) + 0.30
+            if _pier_hits_poly(m_pts, m_rad, zb - 0.5, zt + 0.50, col_lines):
+                continue
+            out.append(p)
+            continue
+        if thick is not None:
+            n_w = max(3, int(math.ceil(width / 2.0)) + 1)
+            pts = c_xy[None] + nrm[None] * np.linspace(-width / 2, width / 2, n_w)[:, None]
+            if _pier_hits_poly(pts, float(thick) / 2 + 0.3, zb - 0.5, zt + 0.50, col_lines):
+                continue
+            out.append(p)
+            continue
+        cap_w = width / 2 + PARAPET_W
+        ncap = max(3, int(math.ceil((2.0 * cap_w) / 2.0)) + 1)
+        cap_pts = c_xy[None] + nrm[None] * np.linspace(-cap_w, cap_w, ncap)[:, None]
+        if _pier_hits_poly(cap_pts, PIER_T / 2 + 0.5, zt - PIER_CAP_H - 0.3, zt + 0.50, col_lines):
+            continue
+        if width > PIER_BENT_W:
+            nc = max(2, int(round(width / 9.0)))
+            shaft_pts = c_xy[None] + nrm[None] * np.linspace(-(width / 2 - 2.0), width / 2 - 2.0, nc)[:, None]
+            reach_r = PIER_COLUMN / 2 + 0.5
+        else:
+            wall = float(np.clip(0.7 * width, 2.5, 14.0)) / 2
+            nw = max(3, int(math.ceil((2.0 * wall) / 2.0)) + 1)
+            shaft_pts = c_xy[None] + nrm[None] * np.linspace(-wall, wall, nw)[:, None]
+            reach_r = PIER_T / 2 + 0.5
+        if _pier_hits_poly(shaft_pts, reach_r, zb - 0.5, zt - PIER_CAP_H + 0.3, col_lines):
+            continue
+        out.append(p)
     return out
 
 
@@ -3308,24 +3416,43 @@ def _pier(p, origin, P, T, UV, M, mat):
     wider than PIER_BENT_W a bent: square columns under a cap beam."""
     x, y, ux, uy, zt, zb, width = p[:7]
     thick = p[7] if len(p) > 7 else None        # a truss's anchor pier: one solid wall this thick, the truss's width
+    tag = p[8] if len(p) > 8 and isinstance(p[8], tuple) and p[8] else None
+    median = tag if tag is not None and tag[0] == "median" else None
+    pinfo = _portal_columns(p)
+    if pinfo is False:
+        return
     t = np.array([ux, uy])
     nrm = np.array([-uy, ux])
     c = np.array([x, y])
     boxes = []                                  # (centre, half along t, half across, z0, z1, widen per m down)
-    cap_w = width / 2 + PARAPET_W
-    if thick is not None:
+    cap_w = max(width / 2 - 0.15, 1.5)
+    if pinfo is not None:
+        _z_road, left_c, right_c, cap_bot = pinfo
+        mid_lat = 0.5 * (left_c + right_c)
+        boxes.append((c + nrm * mid_lat, PIER_SHAFT_T / 2 + 0.15, 0.5 * (right_c - left_c) + PIER_COLUMN / 2, cap_bot, zt, 0.0))
+        for lat in (left_c, right_c):
+            boxes.append((c + nrm * lat, PIER_COLUMN / 2, PIER_COLUMN / 2, zb, cap_bot, 0.0))
+    elif median is not None:
+        ht, hn = float(median[1]), float(median[2])
+        offs = median[3] if len(median) > 3 else (0.0,)
+        cap_h = PIER_CAP_H if zt - zb >= 3.0 else min(PIER_CAP_H, 0.35 * max(zt - zb, 0.2))
+        cap_bot = zt - cap_h
+        boxes.append((c, max(ht + 0.15, PIER_SHAFT_T / 2 + 0.15), cap_w, cap_bot, zt, 0.0))
+        for lat in offs:
+            boxes.append((c + nrm * float(lat), ht, hn, zb, cap_bot, 0.0))
+    elif thick is not None:
         boxes.append((c, thick / 2, width / 2, zb, zt, PIER_TAPER))
     else:
-        boxes.append((c, PIER_T / 2 + 0.3, cap_w, zt - PIER_CAP_H, zt, 0.0))
-    if thick is not None:
+        boxes.append((c, PIER_SHAFT_T / 2 + 0.15, cap_w, zt - PIER_CAP_H, zt, 0.0))
+    if pinfo is not None or median is not None or thick is not None:
         pass
     elif width > PIER_BENT_W:
         nc = max(2, int(round(width / 9.0)))
-        for off in np.linspace(-(width / 2 - 2.0), width / 2 - 2.0, nc):
+        for off in np.linspace(-(width / 2 - 1.8), width / 2 - 1.8, nc):
             boxes.append((c + nrm * off, PIER_COLUMN / 2, PIER_COLUMN / 2, zb, zt - PIER_CAP_H, 0.0))
     else:
-        wall = float(np.clip(0.7 * width, 2.5, 14.0)) / 2
-        boxes.append((c, PIER_T / 2, wall, zb, zt - PIER_CAP_H, PIER_TAPER))
+        wall = float(np.clip(0.42 * width, 1.4, 5.5)) / 2
+        boxes.append((c, PIER_SHAFT_T / 2, wall, zb, zt - PIER_CAP_H, PIER_TAPER))
     for cc, ht, hn, z0, z1, taper in boxes:
         grow = taper * max(z1 - z0, 0.0)
         top = [cc + t * a * ht + nrm * b * hn for a, b in ((-1, -1), (1, -1), (1, 1), (-1, 1))]
@@ -3935,6 +4062,7 @@ def _portal_hill_skirt(P, T, UV, M, nv, fitd, p0, ul, outv, th, hw, face_mat, fa
     st = portals._look(fitd, False)
     lk = portals.LOOKS[st]
     ct, wt, par, tmin, tmax, _foot, emin = (float(lk[k]) for k in (2, 3, 4, 5, 6, 7, 8))
+    tmax = portals._fit_tmax(fitd, th, lk)
     max_fg = float(np.nanmax(fg))
     rz = np.asarray(fitd.get("rz") or (), np.float64)
     rz0 = max(float(rz[0]), 0.0) if len(rz) and np.isfinite(rz[0]) else 0.0
@@ -3955,7 +4083,7 @@ def _portal_hill_skirt(P, T, UV, M, nv, fitd, p0, ul, outv, th, hw, face_mat, fa
     need = (th + tmin) * (1.0 - f_sh) + emin * f_sh
     h_hw = np.clip(np.maximum(gx + par, need), emin, th + tmax)
     # 1. Upper headwall brow + welded PORTAL_COLLAR coping lip flush on top of headwall_top
-    h_brow = np.maximum(h_hw + 0.12, np.minimum(gx + 0.45, th + 3.8))
+    h_brow = np.maximum(h_hw + 0.12, np.minimum(gx + 0.45, th + max(tmax + 0.25, 4.2)))
     nk = len(xs)
 
     def _wpt(x_arr, s_in, h_arr):
