@@ -1,0 +1,87 @@
+{
+  "schemaVersion": 1,
+  "id": "20261125T031831Z-339963ab",
+  "createdAt": "2026-11-25T03:18:31.317Z",
+  "lat": 0,
+  "lon": 0,
+  "kind": "autodrive",
+  "addonId": "beamng-earth-autodrive-fixes",
+  "summary": "In-game autodrive report @ 0.00000, 0.00000",
+  "note": "[Automated E2E Smoke Test - Safe to Close]",
+  "earthVersion": "0.1.0-e2e-smoke",
+  "addonVersion": "0.1.0",
+  "headingDeg": 0,
+  "altM": 0,
+  "speedMs": 0,
+  "anchorId": "e2e_smoke_0_0",
+  "camera": {
+    "pos": [
+      0,
+      0,
+      10
+    ],
+    "forward": [
+      0,
+      1,
+      0
+    ]
+  },
+  "nearest": {
+    "drivingTelemetry": {
+      "autodrive": {
+        "active": true,
+        "mode": "cruise",
+        "remainingM": 100,
+        "nilWps": 0
+      },
+      "roadEdge": {
+        "oneway": false,
+        "lanes": "2",
+        "halfM": 3.5,
+        "latOffM": 0,
+        "limitMs": 13.89
+      }
+    },
+    "addonId": "beamng-earth-autodrive-fixes"
+  },
+  "drivingTelemetry": {
+    "autodrive": {
+      "active": true,
+      "mode": "cruise",
+      "remainingM": 100,
+      "nilWps": 0
+    },
+    "roadEdge": {
+      "oneway": false,
+      "lanes": "2",
+      "halfM": 3.5,
+      "latOffM": 0,
+      "limitMs": 13.89
+    },
+    "tune": {
+      "speedMph": 35,
+      "mode": "legal",
+      "aggression": 0.3,
+      "pass": true,
+      "awareness": 0.8,
+      "avoidHighways": false
+    },
+    "overtake": {
+      "passes": 0,
+      "active": false,
+      "blocked": false,
+      "targetLane": 1,
+      "retries": 0
+    },
+    "nearbyTraffic": [
+      {
+        "aheadM": 25,
+        "sideM": 0,
+        "speedMs": 10,
+        "state": "follow",
+        "alpha": 1
+      }
+    ]
+  },
+  "screenshotPath": "screenshots/2026-11-25/20261125T031831Z-339963ab.jpg"
+}
