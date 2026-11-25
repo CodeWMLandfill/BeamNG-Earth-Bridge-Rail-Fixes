@@ -4,24 +4,9 @@ Fixes broken bridges, ramps, piers, divided highways, railway crossings, tunnel 
 
 > **Work in Progress - Accelerated by Community Reports:** This add-on **does not fix every bridge, railway, and tunnel in the game**. Because **BeamNG.Earth** generates roads, bridges, railways, and tunnels across the entire world, this project is an active work in progress that is **accelerated by community bug reporting**. When you run into a broken bridge, overpass, railway crossing, or tunnel portal, press **`Ctrl+Shift+B`** while driving to report it so that structural pattern can be fixed in future updates.
 
-## Global Feature & Archetype Completion Metrics
+## Global Coverage Snapshot
 
-Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-24T11:49:00Z`):
-
-- **Global Shard Coverage:** `128 / 128` shards (`100.0%`) - **8,949,779** structures categorized worldwide
-- **Archetype Elimination Progress:** `80 / 234` structural archetypes cleared (`1,771,578` structures eliminated by archetype, `1,164,947` directly verified clean)
-- **Overall Feature Completion:** `2,936,525 / 8,949,779` (`32.81%`)
-
-| Category | Categorized | Verified Clean | Archetypes Cleared | Completion % |
-| --- | ---: | ---: | ---: | ---: |
-| Bridges | 5,838,327 | 481,764 | 21 / 91 | 17.88% |
-| Railways | 1,934,028 | 392,572 | 31 / 51 | 73.49% |
-| Tunnels | 1,177,424 | 290,611 | 28 / 92 | 40.02% |
-| **Combined Total** | **8,949,779** | **1,164,947** | **80 / 234** | **32.81%** |
-
-## Global Coverage Tracker
-
-Live census across global Overture shards (`128/128` shards ingested, updated `2026-11-25T02:07:08Z`):
+Census snapshot as of `v0.4.0` across `128 / 128` global map shards (`2026-11-25`):
 
 | Category | Cataloged | Verified / Fixed | Archetypes Cleared | Coverage % |
 | --- | ---: | ---: | ---: | ---: |
