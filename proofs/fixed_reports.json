@@ -4,6 +4,11 @@
     "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/2",
     "kind": "bridge"
   },
+  "3": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/3",
+    "kind": "bridge"
+  },
   "4": {
     "fixedIn": "0.2.0",
     "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/4",
@@ -19,9 +24,69 @@
     "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/6",
     "kind": "bridge"
   },
+  "7": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/7",
+    "kind": "bridge"
+  },
+  "8": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/8",
+    "kind": "bridge"
+  },
   "10": {
     "fixedIn": "0.2.0",
     "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/10",
+    "kind": "bridge"
+  },
+  "11": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/11",
+    "kind": "bridge"
+  },
+  "15": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/15",
+    "kind": "bridge"
+  },
+  "17": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/17",
+    "kind": "bridge"
+  },
+  "41": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/41",
+    "kind": "bridge"
+  },
+  "42": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/42",
+    "kind": "bridge"
+  },
+  "55": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/55",
+    "kind": "bridge"
+  },
+  "56": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/56",
+    "kind": "bridge"
+  },
+  "57": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/57",
+    "kind": "bridge"
+  },
+  "71": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/71",
+    "kind": "bridge"
+  },
+  "73": {
+    "fixedIn": "0.4.0",
+    "issueUrl": "https://github.com/CodeWMLandfill/BeamNG-Earth-Bridge-Rail-Fixes/issues/73",
     "kind": "bridge"
   }
 }
