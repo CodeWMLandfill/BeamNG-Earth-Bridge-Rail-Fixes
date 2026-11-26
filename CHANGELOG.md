@@ -1,5 +1,18 @@
 # Changelog
 
+## v0.5.0
+
+### Highlights
+- Extends `server_v2` `full_solver` compatibility across **BeamNG.Earth v1.10.1-beta.dev.574** through **v1.10.1-beta.dev.617** (`earthfast` `621..640`, `PLANS_FORMAT = 80`), expanding the overlay to `17` deterministic solver modules (`buildings`, `gradesep`, and `l0roads` included, plus `roads.clear_placements` and `railprofile.clear_memory` budget-shed support) while preserving `direct` `full_solver` mode on **v1.9.1-beta.dev.424..v1.10.1-beta** and automatic `client_and_reporter` fallback on intermediate (`dev.567`) and future builds.
+- Enforces strict cross-platform floating-point determinism across all solver modules (`dnp` / `dmath`, zero platform BLAS operators) and strict Worker repo-isolation routing so sibling add-on reports never misroute.
+
+### Bridges, Ramps, Barriers, Markings & Streetscape
+- Tightens dense twin-carriageway elevation coupling, enforces underpass headroom and under-span soffit-to-ground clearance clamps, pins bridge deck ends abutting mountain tunnel portals to solved portal elevations, and trims false at-grade cross-street constraints near ground-pinned abutments (`grading`, `gradesep`, `roads`).
+- Uses actual widened and walked deck half-widths for merge pad rims, masks pad-rim jersey barriers and gore parapets covered by adjacent decks, sidewalks, or ground carriageways, adds `8.0 m` feathered abutment approach aprons, carries cumulative lane-dash phase across ground-to-bridge transitions, meshes continuous `0.5 m` grade-following concrete noise barriers, drapes roadside furniture cleanly, and omits house stoops or porches that intrude into road clearance (`buildings`, `fences`, `furniture`, `roadmesh`, `roads`).
+
+### Tunnels & Multi-Bore Portals
+- Eliminates curved and short-bore portal cap self-intersections, clamps steep-grade hillside scree back-curtains out of climbing bores, trims underground L-joint and Y-fork tube overlaps, clips parallel/subsea cover walls and retaining walls cleanly to effective `wall_lr` spans, shares ceiling headroom across adjacent walkway and host bores, removes duplicate inverted ceiling faces on low linings, and preserves outer cliff terrain holes (`portals`, `roadmesh`, `roads`, `tunnellids`).
+
 ## v0.4.2
 
 ### Highlights

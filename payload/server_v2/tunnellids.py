@@ -29,8 +29,9 @@ import dnp
 # Enabled by default (can still be turned off via BNE_TUNNEL_LIDS=off/0/false).
 ON = os.environ.get("BNE_TUNNEL_LIDS", "on").lower() in ("1", "on", "true")
 
-CREST_MIN_STEP_M = 0.15  # m: continue walking sloped trench banks past TUNNEL_OPEN_COVER while climbing
+CREST_MIN_STEP_M = 0.04  # m: continue walking gentle sloped trench banks (>= 2%) past TUNNEL_OPEN_COVER
 CREST_WALK_M = 24.0      # m: max distance beyond TUNNEL_OPEN_COVER to walk up to the bank crest
+LID_ARCH_CLEAR_M = 3.40  # m: minimum low-arch headroom below TUNNEL_SOIL_M under a restored lid
 
 LID_FLOOR_M = 1.0       # m: the road on top's DEM this near the tunnel's floor at the crossing: in the trench
 LID_REACH_M = 60.0      # m along the road on top, either side of the crossing, where it must climb out of the trench
@@ -154,10 +155,18 @@ def lids_of(tunnels, roads, z_at):
 
     tunnels: [(xy (k, 2), half width)] of the tunnel parts; roads: [(xy (k, 2), half width)] of the ground parts of
     the roads for motor traffic; z_at(xy) -> the raw DEM's heights. Pure (given z_at)."""
-    from roads import SECTION_MIN_M, TUNNEL_OPEN_COVER, TUNNEL_ROAD_CLEAR_M, TUNNEL_ROAD_MIN_SIN, tunnel_sections
+    from roads import (
+        SECTION_MIN_M,
+        TUNNEL_OPEN_COVER,
+        TUNNEL_ROAD_CLEAR_M,
+        TUNNEL_ROAD_MIN_SIN,
+        TUNNEL_SOIL_M,
+        tunnel_sections,
+    )
     from grading import TUNNEL_KEEP_M
     if not tunnels or not roads:
         return []
+    lid_min_clear = max(float(TUNNEL_OPEN_COVER), float(TUNNEL_SOIL_M) + LID_ARCH_CLEAR_M)
     road_boxes = [(R, rhw, R.min(axis=0), R.max(axis=0)) for R, rhw in roads if len(R) >= 2]
     if not road_boxes:
         return []
@@ -207,9 +216,18 @@ def lids_of(tunnels, roads, z_at):
             xy = np.r_[pa[::-1], pb[1:]]
             t = np.r_[-(np.arange(len(pa)) * LID_STEP_M)[::-1], np.arange(1, len(pb)) * LID_STEP_M]
             z = za + (zb - za) * (t + da) / max(da + db, 1e-9)
+            z_cross = za + (zb - za) * da / max(da + db, 1e-9)
+            need_lift = max(0.0, (f + lid_min_clear) - z_cross)
+            if need_lift > 1e-6:
+                span_side = np.where(t < 0.0, np.maximum(da - thw, 2.0), np.maximum(db - thw, 2.0))
+                w_cam = np.clip(1.0 - np.maximum(0.0, np.abs(t) - thw) / span_side, 0.0, 1.0)
+                w_cam[0] = 0.0
+                w_cam[-1] = 0.0
+                z = z + need_lift * w_cam
+                z_cross = z_cross + need_lift
             hw = max(rhw + TUNNEL_ROAD_CLEAR_M, 0.5 * SECTION_MIN_M + 1.0)
             out.append((xy, z, hw))
-            lids.append((s_t, za + (zb - za) * da / max(da + db, 1e-9)))
+            lids.append((s_t, z_cross))
         lids.sort()
         for (s1, z1), (s2, z2) in zip(lids, lids[1:]):
             if not 0.0 < s2 - s1 <= LID_JOIN_M:
@@ -231,7 +249,7 @@ def lids_of(tunnels, roads, z_at):
             fm = float(dnp.interp(0.5 * (s1 + s2), sT, floor))
             if min(banks) < fm + TUNNEL_OPEN_COVER:
                 continue
-            zj = min(min(banks), z1, z2)
+            zj = max(min(min(banks), z1, z2), fm + lid_min_clear)
             out.append((seg, np.full(len(seg), zj), thw + TUNNEL_KEEP_M))
     return out
 

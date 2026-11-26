@@ -9,10 +9,12 @@ origin at its forward end) and its concrete noise blocker (s_concrete_noiseblock
 origin at one end). A panel is kept when its centre is in the tile, so a line split across tiles is not
 drawn twice.
 """
+from collections import OrderedDict
 import json
 import logging
 import math
 import os
+import threading
 
 import numpy as np
 import dmath
@@ -23,6 +25,68 @@ import mapgeom
 from guardrails import DECK_AUTO_SNAP_TOLERANCE_M, DECK_WIDE_REACH_M, _deck_level_hint, _surface_info
 
 log = logging.getLogger("earthd.fences")
+
+_NOISE_LOCK = threading.Lock()
+_MESHED_NOISE = OrderedDict()
+_PENDING_BRIDGE_NOISE = OrderedDict()
+_NOISE_CACHE_MAX = 256
+
+
+def _box_key(box):
+    return tuple(round(float(v), 2) for v in box)
+
+
+def _origin_key(xy):
+    return (round(float(xy[0]), 2), round(float(xy[1]), 2))
+
+
+def _record_meshed_noise(frame, box, fids, replace=False):
+    key = (id(frame), _box_key(box))
+    with _NOISE_LOCK:
+        if replace or key not in _MESHED_NOISE:
+            _MESHED_NOISE[key] = set(fids)
+        else:
+            _MESHED_NOISE[key].update(fids)
+        _MESHED_NOISE.move_to_end(key)
+        while len(_MESHED_NOISE) > _NOISE_CACHE_MAX:
+            _MESHED_NOISE.popitem(last=False)
+
+
+def _get_meshed_noise(frame, box):
+    key = (id(frame), _box_key(box))
+    with _NOISE_LOCK:
+        got = _MESHED_NOISE.get(key)
+        return set(got) if got else set()
+
+
+def _stash_pending_bridge_noise(box, payload):
+    key = _origin_key(box[:2])
+    with _NOISE_LOCK:
+        _PENDING_BRIDGE_NOISE[key] = payload
+        _PENDING_BRIDGE_NOISE.move_to_end(key)
+        while len(_PENDING_BRIDGE_NOISE) > _NOISE_CACHE_MAX:
+            _PENDING_BRIDGE_NOISE.popitem(last=False)
+
+
+def take_bridge_noise_walls(origin, chunks):
+    """Resolve bridge-tagged noise walls deferred from stone_walls() against tile deck chunks."""
+    if not NOISE_ON or not chunks:
+        return []
+    key = _origin_key(origin)
+    with _NOISE_LOCK:
+        payload = _PENDING_BRIDGE_NOISE.pop(key, None)
+    if payload is None:
+        return []
+    frame, infra_fn, box, elev, roads = payload
+    road_decks = [{"n": c["n"], "w": c["w"]} for c in chunks if c.get("deck") and not c.get("tunnel")]
+    if not road_decks:
+        return []
+    meshed = set()
+    nw = noise_walls(frame, infra_fn, box, elev, decks=road_decks, roads=roads,
+                     only_bridge=True, meshed_out=meshed)
+    if meshed:
+        _record_meshed_noise(frame, box, meshed, replace=False)
+    return nw
 
 G_CHAIN, G_WALL = "chainlink", "noisewall"
 G_HEDGE = "fr_hedge"           # (PR #505: French hedges, the stock shrub)
@@ -833,7 +897,7 @@ def _apply_deck_continuity(groups_vals, mid, tang, z, wide, ground, decks, roads
 
 
 def rows(frame, infra_fn, box, elev, decks=(), roads=(), french=False, carriageways=None,
-         include_noisewalls=True):
+         include_noisewalls=None):
     """Forest rows [group, x, y, z, yaw, scale, height, rank] of the chain-link fences and noise walls whose
     centre is inside box (x0, y0, x1, y1). Pass include_noisewalls=False when continuous noise_walls() is built
     into roadmesh.tunnel instead."""
@@ -843,8 +907,12 @@ def rows(frame, infra_fn, box, elev, decks=(), roads=(), french=False, carriagew
         roads = carriageways
     fr_rows, fr_taken = french_rows(frame, infra_fn, box, elev, roads) if french else ([], set())
     x0, y0, x1, y1 = map(float, box)
-    allowed = (G_CHAIN, G_WALL) if include_noisewalls else (G_CHAIN,)
+    meshed_noise = _get_meshed_noise(frame, box) if include_noisewalls is None else set()
+    allow_walls = True if include_noisewalls is None else bool(include_noisewalls)
+    allowed = (G_CHAIN, G_WALL) if allow_walls else (G_CHAIN,)
     items, outlines = _collect_wall_features(frame, infra_fn, box, bool(decks), allowed, seen_init=fr_taken)
+    if meshed_noise:
+        items = [it for it in items if not (it[0] == G_WALL and it[1] in meshed_noise)]
     pending = []
     for group, fid, hint, parts_enu in items:
         length = CHAIN_LEN if group == G_CHAIN else WALL_LEN
@@ -920,14 +988,14 @@ def rows(frame, infra_fn, box, elev, decks=(), roads=(), french=False, carriagew
                 edge[edge] = _in_outlines(outlines, mid[edge])
             surf, on = np.where(edge, wide, surf), on | edge
         z = np.where(on, surf, z)
-        if walls.any():
-            z = np.where(near, pz, z)
         groups = {}
         for i, p in enumerate(pending):
             if p[6] is None:
                 groups.setdefault((p[7], p[8]), []).append(i)
         tang = np.array([[p[10], p[11]] for p in pending], np.float64)
         _apply_deck_continuity(list(groups.values()), mid, tang, z, wide, ground, decks, roads)
+    if walls.any():
+        z = np.where(near, pz, z)
     chain_on = [i for i, p in enumerate(pending) if p[0] == G_CHAIN and p[9]]
     if chain_on and roads and CHAIN_OFF_ROAD_ON:
         cxy = np.array([[pending[i][4], pending[i][5]] for i in chain_on], np.float64)
@@ -1153,7 +1221,8 @@ def _wall_runs_from_mask(base, toward, top, foot, valid, box):
     return out
 
 
-def noise_walls(frame, infra_fn, box, elev, decks=(), roads=(), carriageways=None):
+def noise_walls(frame, infra_fn, box, elev, decks=(), roads=(), carriageways=None,
+                only_bridge=None, meshed_out=None, bridge_seen_out=None):
     """Mapped noise barriers in box (x0, y0, x1, y1) as continuous grade-following retaining_walls dicts
     for roadmesh.tunnel's concrete: smoothed over short baffle jogs, snapped onto adjacent carriageways,
     carried cleanly onto bridges, cut across ground roads, and split seamlessly at tile borders."""
@@ -1161,8 +1230,16 @@ def noise_walls(frame, infra_fn, box, elev, decks=(), roads=(), carriageways=Non
         return []
     if carriageways is not None and not roads:
         roads = carriageways
-    has_decks = bool(decks)
+    has_decks = bool(decks) or (only_bridge is not None)
     items, outlines = _collect_wall_features(frame, infra_fn, box, has_decks, (G_WALL,))
+    if not items:
+        return []
+    if bridge_seen_out is not None and any(it[2] is True for it in items):
+        bridge_seen_out.append(True)
+    if only_bridge is False:
+        items = [it for it in items if it[2] is not True]
+    elif only_bridge is True:
+        items = [it for it in items if it[2] is True]
     if not items:
         return []
     fits, deck_fits = _fit_inputs(roads, decks)
@@ -1213,6 +1290,7 @@ def noise_walls(frame, infra_fn, box, elev, decks=(), roads=(), carriageways=Non
         bla, blo, _ = frame.enu_to_geodetic(base[:, 0], base[:, 1], np.zeros(n))
         _, _, z = frame.geodetic_to_enu(bla, blo, np.asarray(elev(bla, blo), np.float64))
         z = np.asarray(z, np.float64)
+        on = np.zeros(n, bool)
         if decks:
             surf, ground_s, wide = _surface_info(frame, xy, elev, decks, [hint] * n)
             on = np.abs(surf - ground_s) > 1e-6
@@ -1222,6 +1300,8 @@ def noise_walls(frame, infra_fn, box, elev, decks=(), roads=(), carriageways=Non
                     edge[edge] = inside[edge]
                 surf, on = np.where(edge, wide, surf), on | edge
             z = np.where(on, surf, z)
+        if only_bridge is True and not on.any():
+            continue
         if near.any():
             z = np.where(near, pz, z)
         if decks and hint is None:
@@ -1230,23 +1310,25 @@ def noise_walls(frame, infra_fn, box, elev, decks=(), roads=(), carriageways=Non
         if roads:
             back = base - toward * NOISE_THICK_M
             valid &= ~(_on_road(base, z, roads) | _on_road(back, z, roads))
+        if meshed_out is not None:
+            meshed_out.add(fid)
         out.extend(_wall_runs_from_mask(base, toward, z + WALL_H, z - NOISE_FOOT_M, valid, box))
     return out
 
 
-def stone_walls(frame, infra_fn, box, elev, roads=()):
-    """The mapped stone walls in box (x0, y0, x1, y1) as roads.retaining_walls' wall dicts (base, top, foot, toward,
-    thick, back_top, parapet), for roadmesh.tunnel's stone: each mapped line's pieces whose segments' middles are in
-    the box (a wall split across tiles meets at the edge, not drawn twice), cut where a ground road (roads: build_tile's
-    roads_out, (fid, spec, pts, ...)) runs. elev(lat, lon) -> the ground's height."""
-    if infra_fn is None or not STONE_ON:
+def stone_walls(frame, infra_fn, box, elev, roads=(), decks=()):
+    """The mapped stone walls and continuous noise barriers in box (x0, y0, x1, y1) as retaining_walls'
+    wall dicts (base, top, foot, toward, thick, back_top, parapet), for roadmesh.tunnel: each mapped line's
+    pieces whose segments' middles are in the box (a wall split across tiles meets at the edge, not drawn twice),
+    cut where a ground road (roads: build_tile's roads_out, (fid, spec, pts, ...)) runs."""
+    if infra_fn is None or (not STONE_ON and not NOISE_ON):
         return []
     x0, y0, x1, y1 = map(float, box)
     keys = _infra_cells(frame, box)
     if not keys:
         return []
     runs, seen = [], set()
-    for key in keys:
+    for key in (keys if STONE_ON else ()):
         try:
             feats = infra_fn(key)
         except Exception as ex:
@@ -1298,23 +1380,37 @@ def stone_walls(frame, infra_fn, box, elev, roads=()):
                         k += 1
                     runs.append((xy[j:k + 1], h))
                     j = k
-    if not runs:
-        return []
-    allxy = np.concatenate([r for r, _h in runs])
-    lat, lon, _ = frame.enu_to_geodetic(allxy[:, 0], allxy[:, 1], np.zeros(len(allxy)))
-    _, _, z = frame.geodetic_to_enu(lat, lon, np.asarray(elev(lat, lon), np.float64))
-    z = np.asarray(z, np.float64)
-    out, k = [], 0
-    for xy, h in runs:
-        zz = z[k:k + len(xy)]
-        k += len(xy)
-        d = np.gradient(xy, axis=0)
-        d /= np.maximum(dnp.hypot(*d.T), 1e-9)[:, None]
-        nl = np.column_stack((-d[:, 1], d[:, 0]))
-        top = zz + h
-        out.append({"base": xy + nl * (STONE_THICK_M / 2), "toward": nl, "top": top, "back_top": top.copy(),
-                    "foot": zz - STONE_FOOT_M, "thick": np.full(len(xy), STONE_THICK_M), "parapet": True,
-                    "concrete": False, "mountain": False, "rock": False})
+    out = []
+    if runs:
+        allxy = np.concatenate([r for r, _h in runs])
+        lat, lon, _ = frame.enu_to_geodetic(allxy[:, 0], allxy[:, 1], np.zeros(len(allxy)))
+        _, _, z = frame.geodetic_to_enu(lat, lon, np.asarray(elev(lat, lon), np.float64))
+        z = np.asarray(z, np.float64)
+        k = 0
+        for xy, h in runs:
+            zz = z[k:k + len(xy)]
+            k += len(xy)
+            d = np.gradient(xy, axis=0)
+            d /= np.maximum(dnp.hypot(*d.T), 1e-9)[:, None]
+            nl = np.column_stack((-d[:, 1], d[:, 0]))
+            top = zz + h
+            out.append({"base": xy + nl * (STONE_THICK_M / 2), "toward": nl, "top": top, "back_top": top.copy(),
+                        "foot": zz - STONE_FOOT_M, "thick": np.full(len(xy), STONE_THICK_M), "parapet": True,
+                        "concrete": False, "mountain": False, "rock": False})
+    if NOISE_ON:
+        meshed = set()
+        if decks:
+            nw = noise_walls(frame, infra_fn, box, elev, decks=decks, roads=roads, meshed_out=meshed)
+            _record_meshed_noise(frame, box, meshed, replace=True)
+            out.extend(nw)
+        else:
+            has_bridge = []
+            nw = noise_walls(frame, infra_fn, box, elev, decks=(), roads=roads,
+                             only_bridge=False, meshed_out=meshed, bridge_seen_out=has_bridge)
+            _record_meshed_noise(frame, box, meshed, replace=True)
+            if has_bridge:
+                _stash_pending_bridge_noise(box, (frame, infra_fn, tuple(map(float, box)), elev, tuple(roads)))
+            out.extend(nw)
     return out
 
 

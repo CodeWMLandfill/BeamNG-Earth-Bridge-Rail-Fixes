@@ -5,7 +5,7 @@ local M = {}
 
 M.LEVEL_ID = 'beamng_earth'
 M.ADDON_ID = 'beamng-earth-bridge-rail-fixes'
-M.ADDON_VERSION = '0.4.2'
+M.ADDON_VERSION = '0.5.0'
 M.DIR = 'beamngEarth/bridge_rail_reports/'
 M.POLL_TIMEOUT_S = 22
 M.FIX_NOTIFY_SETTLE_S = 3.0

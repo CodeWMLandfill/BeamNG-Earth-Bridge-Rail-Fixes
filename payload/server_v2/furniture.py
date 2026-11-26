@@ -1231,6 +1231,9 @@ DECK_SIDE_M = 1.0          # m beside a deck's edge that still counts as under i
 DECK_WIRE_M = 1.5          # m a wire stays below a deck over it
 DECK_THROUGH_PAD_M = 1.0   # m below a deck's structure that still counts as cutting it
 DECK_THROUGH_ABOVE_M = 6.0 # m above a deck surface that still counts as cutting it
+PROP_FLOAT_MAX_M = 0.45    # m above graded ground allowed without bridge deck support
+PROP_BURY_MAX_M = 0.75     # m ground may exceed road height before cut-bank prop is omitted
+DECK_SUPPORT_Z_M = 1.0     # m vertical band around deck surface counting as deck-supported
 
 
 def _normalize_decks_ex(decks):
@@ -1549,6 +1552,80 @@ def _on_walk(x, y, z, walk_entries, clear_m=0.45, skip_fid=None, z_band=2.5):
     return False
 
 
+def _deck_support_entries(decks):
+    """Precompute segment arrays for strict horizontal-interior deck support queries."""
+    out = []
+    for pts, half, _depth, _explicit in _normalize_decks_ex(decks):
+        if len(pts) < 2:
+            continue
+        h_arr = np.asarray(half, np.float64)
+        if h_arr.ndim == 0:
+            hs = np.broadcast_to(h_arr, (len(pts) - 1,)).copy()
+        elif len(h_arr) == len(pts):
+            hs = np.maximum(h_arr[:-1], h_arr[1:])
+        else:
+            hs = np.broadcast_to(h_arr, (len(pts) - 1,)).copy()
+        max_h = float(np.max(hs))
+        if max_h <= 0.0:
+            continue
+        seg = pts[1:, :2] - pts[:-1, :2]
+        out.append((max_h, hs, pts, pts[:-1, :2], seg, np.maximum((seg * seg).sum(1), 1e-12),
+                    pts[:, :2].min(0), pts[:, :2].max(0)))
+    return out
+
+
+def _on_deck_support(xs, ys, zs, deck_entries, z_tol=DECK_SUPPORT_Z_M):
+    """(n,) bool: True where (x, y, z) sits strictly inside a bridge deck width near its surface."""
+    n = len(xs)
+    out = np.zeros(n, bool)
+    if not n or not deck_entries:
+        return out
+    px = np.asarray(xs, np.float64)
+    py = np.asarray(ys, np.float64)
+    pz = np.asarray(zs, np.float64)
+    for max_h, hs, pts, a, seg, l2, lo, hi in deck_entries:
+        m = ~out & (px >= lo[0] - max_h) & (px <= hi[0] + max_h) & (py >= lo[1] - max_h) & (py <= hi[1] + max_h)
+        if not m.any():
+            continue
+        idx = np.flatnonzero(m)
+        dx = px[idx, None] - a[None, :, 0]
+        dy = py[idx, None] - a[None, :, 1]
+        t = np.clip((dx * seg[None, :, 0] + dy * seg[None, :, 1]) / l2[None, :], 0.0, 1.0)
+        cx = a[None, :, 0] + t * seg[None, :, 0]
+        cy = a[None, :, 1] + t * seg[None, :, 1]
+        d2 = dnp.sq(px[idx, None] - cx) + dnp.sq(py[idx, None] - cy)
+        row = np.arange(len(idx))
+        k = np.argmin(d2, axis=1)
+        zd = pts[k, 2] + t[row, k] * (pts[k + 1, 2] - pts[k, 2])
+        ok = (d2[row, k] <= dnp.sq(hs[k])) & (np.abs(pz[idx] - zd) <= z_tol)
+        if ok.any():
+            out[idx[ok]] = True
+    return out
+
+
+def _sample_ground(ground, xs, ys):
+    """Sample vectorized ground(x, y) into a 1D float64 array of length len(xs)."""
+    return np.asarray(ground(np.asarray(xs, np.float64), np.asarray(ys, np.float64)), np.float64).reshape(len(xs))
+
+
+def _support_for(xs, ys, zs, ground, deck_entries, snap_ground=False):
+    """Return (keep_mask, target_z) verifying ground or bridge deck support for candidate prop spots."""
+    xs_a = np.asarray(xs, np.float64)
+    ys_a = np.asarray(ys, np.float64)
+    zs_a = np.asarray(zs, np.float64)
+    if ground is None or not len(xs_a):
+        return np.ones(len(xs_a), bool), zs_a
+    gz = _sample_ground(ground, xs_a, ys_a)
+    on_dk = _on_deck_support(xs_a, ys_a, zs_a, deck_entries) if deck_entries else np.zeros(len(xs_a), bool)
+    on_gr = np.isfinite(gz) & ((zs_a - gz) <= PROP_FLOAT_MAX_M) & ((gz - zs_a) <= PROP_BURY_MAX_M)
+    keep = on_dk | on_gr
+    if snap_ground:
+        z_out = np.where(on_dk | ~np.isfinite(gz), zs_a, gz)
+    else:
+        z_out = zs_a
+    return keep, z_out
+
+
 def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=False, decks=(),
           signals=None, buried=0.0, region=None, lighting=None, country=None, priority=None, ground=None,
           clearance=None, development=None, pole_profile=None, pole_frame=None,
@@ -1604,6 +1681,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
     def on_bed(q):              # is q on (or by) an obstacle's ground?
         return bed is not None and not bed.clear(np.array([q[0], q[1]]), None, CLEAR_OTHER_M)
     walk_entries = _walk_entries(walks)
+    support_decks = _deck_support_entries(decks)
     rows = []
     lit = set()
     for wk in walks:
@@ -1638,8 +1716,15 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             return _h01(fid, side, k, group, "development") < weight
 
         def put(group, spacing, phase, curb_off, height, yaw_fn, clear=END_CLEAR_M, optional=False):
-            for p, out, s_line in _stations(run, line, spacing, phase, clear, side):
-                q = p[:2] - out * (w / 2 - curb_off)
+            st = _stations(run, line, spacing, phase, clear, side)
+            if not st:
+                return
+            qs = np.array([p[:2] - out * (w / 2 - curb_off) for p, out, _ in st], np.float64)
+            pzs = np.array([float(p[2]) for p, _, _ in st], np.float64)
+            sup, _ = _support_for(qs[:, 0], qs[:, 1], pzs, ground, support_decks)
+            for (p, out, s_line), q, ok in zip(st, qs, sup.tolist()):
+                if not ok:
+                    continue
                 if _owns(box, q[0], q[1]) and not on_bed(q):
                     if optional:
                         k = int(round((s_line - phase) / spacing))
@@ -1660,9 +1745,15 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                 lit.add(fid)
                 run_poles = []
                 ph = _h01(fid, "tphase") * TOWN_POLE_SPACING
-                for p, out, _ in _stations(run, line, TOWN_POLE_SPACING, ph, END_CLEAR_M, side):
-                    q = p[:2] - out * (w / 2 - 0.6)
-                    if on_bed(q) or _on_walk(q[0], q[1], float(p[2]), walk_entries, clear_m=0.15, skip_fid=fid):
+                st_poles = _stations(run, line, TOWN_POLE_SPACING, ph, END_CLEAR_M, side)
+                if st_poles:
+                    qs_p = np.array([p[:2] - out * (w / 2 - 0.6) for p, out, _ in st_poles], np.float64)
+                    pzs_p = np.array([float(p[2]) for p, _, _ in st_poles], np.float64)
+                    sup_p, _ = _support_for(qs_p[:, 0], qs_p[:, 1], pzs_p, ground, support_decks)
+                else:
+                    qs_p, sup_p = (), ()
+                for (p, out, _), q, ok in zip(st_poles, qs_p, sup_p.tolist() if len(st_poles) else ()):
+                    if not ok or on_bed(q) or _on_walk(q[0], q[1], float(p[2]), walk_entries, clear_m=0.15, skip_fid=fid):
                         if wires is not None and len(run_poles) > 1:
                             wires.extend(_own_spans(run_poles, box))
                         run_poles = []
@@ -1702,18 +1793,24 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
             # street trees in pits along the curb (the photos' dense streets have rows of them; the canopy
             # model has few there): small broadleaves, both sides, clear of the junctions
             tph = _h01(fid, side, "tph") * STREET_TREE_SPACING
-            for p, out, s_line in _stations(run, line, STREET_TREE_SPACING, tph, END_CLEAR_M + 4.0, side):
-                q = p[:2] - out * (w / 2 - STREET_TREE_CURB_M)
-                if _owns(box, q[0], q[1]) and not on_bed(q):
-                    # (each tree's size, turn and rank keyed on its station along the road, not on where the anchor's
-                    # frame puts it: the same tree from every anchor, geotiles 2026-10-29)
-                    k = int(round((s_line - tph) / STREET_TREE_SPACING))
-                    if not decorated(G_STREET_TREE, p, out, k):
+            st_trees = _stations(run, line, STREET_TREE_SPACING, tph, END_CLEAR_M + 4.0, side)
+            if st_trees:
+                qs_t = np.array([p[:2] - out * (w / 2 - STREET_TREE_CURB_M) for p, out, _ in st_trees], np.float64)
+                pzs_t = np.array([float(p[2]) for p, _, _ in st_trees], np.float64)
+                sup_t, _ = _support_for(qs_t[:, 0], qs_t[:, 1], pzs_t, ground, support_decks)
+                for (p, out, s_line), q, ok in zip(st_trees, qs_t, sup_t.tolist()):
+                    if not ok:
                         continue
-                    h = 6.5 + 3.5 * _h01(fid, side, k, "th")
-                    rows.append([G_STREET_TREE, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2] + curb_h), 2),
-                                 round(_h01(fid, side, k, "ty") * 360.0, 1), 1.0, round(h, 1),
-                                 round(_h01(fid, side, k, "tr"), 3)])
+                    if _owns(box, q[0], q[1]) and not on_bed(q):
+                        # (each tree's size, turn and rank keyed on its station along the road, not on where the anchor's
+                        # frame puts it: the same tree from every anchor, geotiles 2026-10-29)
+                        k = int(round((s_line - tph) / STREET_TREE_SPACING))
+                        if not decorated(G_STREET_TREE, p, out, k):
+                            continue
+                        h = 6.5 + 3.5 * _h01(fid, side, k, "th")
+                        rows.append([G_STREET_TREE, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2] + curb_h), 2),
+                                     round(_h01(fid, side, k, "ty") * 360.0, 1), 1.0, round(h, 1),
+                                     round(_h01(fid, side, k, "tr"), 3)])
         if development is not None or spec.urban:
             # fire hydrants at the curb (US practice ~90-150 m apart), alternating sides
             put(G_HYDRANT, HYDRANT_SPACING, _h01(fid, "hyd") * HYDRANT_SPACING + (HYDRANT_SPACING / 2 if side < 0 else 0),
@@ -1760,12 +1857,15 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
         if not len(s):
             continue
         P, D = _at(line, s)
+        edge_off = spec.width / 2 + (POLE_OFF_M if poles else LAMP_EDGE_M)
+        N = np.column_stack([-D[:, 1], D[:, 0]]) * side
+        Q = P[:, :2] + N * edge_off
+        sup_r, z_r = _support_for(Q[:, 0], Q[:, 1], P[:, 2], ground, support_decks, snap_ground=True)
         run = []
-        for k, (p, d) in enumerate(zip(P, D)):
-            n = np.array([-d[1], d[0]]) * side
-            q = p[:2] + n * (spec.width / 2 + (POLE_OFF_M if poles else LAMP_EDGE_M))
+        for k, (p, d, q, ok, pz) in enumerate(zip(P, D, Q, sup_r.tolist(), z_r.tolist())):
+            n = N[k]
             inside = _owns(box, q[0], q[1])
-            if on_bed(q) or (poles and _on_walk(q[0], q[1], float(p[2]), walk_entries, clear_m=0.45)):
+            if not ok or on_bed(q) or (poles and _on_walk(q[0], q[1], float(pz), walk_entries, clear_m=0.45)):
                 if len(run) > 1 and wires is not None:
                     wires.extend(_own_spans(run, box))
                 run = []
@@ -1775,15 +1875,15 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                     h = (HIGHWAY_LAMP_H["na" if _na(region) else None] if highway and not spec.link
                          else LAMP_H[G_LAMP])
                     group = G_LAMP
-                    if town and spec.cls in {"residential", "tertiary", "unclassified", "living_street"} and _h01(fid, "lantern") < .7 and kit_at(*q, p[2]):
+                    if town and spec.cls in {"residential", "tertiary", "unclassified", "living_street"} and _h01(fid, "lantern") < .7 and kit_at(*q, pz):
                         group, h = "fr_lantern", 5.4
-                    rows.append([group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
+                    rows.append([group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(pz), 2),
                                  round(_yaw(-n[0], -n[1]), 1), 1.0, h, 0.0])
                 continue
             # the cross-arm (local x) across the road, the wires (local y) along it
             yaw = _yaw(n[0], n[1])
-            pole_style = pole_at(fid, float(q[0]), float(q[1]), float(p[2]))
-            pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(p[2]), 2),
+            pole_style = pole_at(fid, float(q[0]), float(q[1]), float(pz))
+            pole = [pole_style.group, round(float(q[0]), 2), round(float(q[1]), 2), round(float(pz), 2),
                     round(yaw, 1), 1.0, pole_style.height, 0.0]
             if not clearance.clear(pole) or clearance.in_gore(pole[1], pole[2], pole[3]):
                 if len(run) > 1 and wires is not None:
@@ -1791,7 +1891,7 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
                 run = []
                 continue
             lamp = ([G_POLELAMP, round(float(q[0]), 2), round(float(q[1]), 2),
-                     round(float(p[2]) + POLE_LAMP_Z, 2), round(yaw, 1), 1.0, 1.1, 0.0]
+                     round(float(pz) + POLE_LAMP_Z, 2), round(yaw, 1), 1.0, 1.1, 0.0]
                     if drawn and pole_lamp(spec.cls, k, region) else None)
             run.append((pole[1], pole[2], pole[3], pole[4], pole_style, lamp))
             if inside:
@@ -1831,6 +1931,17 @@ def place(roads, walks, box, curb_h=0.15, wires=None, town=False, left_hand=Fals
     localized = set(citylamps.GROUPS)
     rows = [r for r in rows if r[0] not in localized or _post_clear(r)]
     rows.extend(r for r in mapped_rows if _post_clear(r))
+    if ground is not None and rows:
+        base_z = np.array([float(r[3]) - POLE_LAMP_Z if r[0] == G_POLELAMP else float(r[3]) for r in rows], np.float64)
+        sup_all, _ = _support_for(
+            np.array([float(r[1]) for r in rows], np.float64),
+            np.array([float(r[2]) for r in rows], np.float64),
+            base_z,
+            ground,
+            support_decks,
+        )
+        if not sup_all.all():
+            rows = [r for r, ok in zip(rows, sup_all.tolist()) if ok]
     rows = under_decks(rows, list(decks), wires)
     lenses = under_decks(lamp_lenses(rows), list(decks))
     rows = [r[:8] if len(r) == 9 else r for r in rows]     # (a mapped lamp's colour: its lens's, not the row's)

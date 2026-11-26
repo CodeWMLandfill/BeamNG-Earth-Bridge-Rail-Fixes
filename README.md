@@ -4,16 +4,20 @@ Fixes broken bridges, ramps, piers, divided highways, railway crossings, tunnel 
 
 > **Work in Progress - Accelerated by Community Reports:** This add-on **does not fix every bridge, railway, and tunnel in the game**. Because **BeamNG.Earth** generates roads, bridges, railways, and tunnels across the entire world, this project is an active work in progress that is **accelerated by community bug reporting**. When you run into a broken bridge, overpass, railway crossing, or tunnel portal, press **`Ctrl+Shift+B`** while driving to report it so that structural pattern can be fixed in future updates.
 
-## Global Coverage Snapshot
+## Global Feature & Archetype Completion Metrics
 
-Census snapshot as of `v0.4.0` across `128 / 128` global map shards (`2026-11-25`):
+Global census snapshot and structural archetype verification across worldwide Overture Maps shards (`128 / 128` shards categorized, `100.0%`, snapshot at `2026-11-26T23:40:25Z`):
 
-| Category | Cataloged | Verified / Fixed | Archetypes Cleared | Coverage % |
+- **Global Shard Coverage:** `128 / 128` shards (`100.0%`) - **8,949,780** structures categorized worldwide
+- **Archetype Elimination Progress:** `210 / 2,615` structural archetypes cleared (`0` structures eliminated by archetype, `970,400` directly verified clean)
+- **Overall Feature Completion:** `970,400 / 8,949,780` (`10.84%`)
+
+| Category | Categorized | Verified Clean | Archetypes Cleared | Completion % |
 | --- | ---: | ---: | ---: | ---: |
-| Bridges | 5,838,327 | 1,337,074 | 28 / 91 | 22.90% |
-| Railways | 1,934,028 | 1,588,597 | 33 / 51 | 82.14% |
-| Tunnels | 1,177,424 | 456,109 | 29 / 92 | 38.74% |
-| **Combined Total** | **8,949,779** | **3,381,780** | **90 / 234** | **37.79%** |
+| Bridges | 5,838,328 | 388,793 | 60 / 1,244 | 6.66% |
+| Railways | 1,934,028 | 333,597 | 81 / 392 | 17.25% |
+| Tunnels | 1,177,424 | 248,010 | 69 / 979 | 21.06% |
+| **Combined Total** | **8,949,780** | **970,400** | **210 / 2,615** | **10.84%** |
 
 ## Before & After
 
@@ -65,4 +69,4 @@ Press **`Ctrl+Shift+B`** anytime while driving to silently send a quick screensh
 ## Requirements
 
 - **Windows 10 or 11** (`64-bit`) or **Linux** (`x86_64`, native **BeamNG.Earth** `AppImage` / source + native Linux **BeamNG.drive**).
-- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** and **v1.10.1-beta.dev.574** in full solver mode (`direct` or `server_v2`), with automatic forward-compatible client & reporter fallback for intermediate (`dev.567`) and newer `dev.*` builds including **v1.10.1-beta.dev.591** through **v1.10.1-beta.dev.595** (older versions are skipped safely with a clear notice).
+- **BeamNG.Earth v1.9.1-beta.dev.424** through **v1.10.1-beta** (`direct` full solver mode) and **v1.10.1-beta.dev.574** through **v1.10.1-beta.dev.617** (`server_v2` full solver mode across 17 deterministic solver modules), with automatic forward-compatible client & reporter fallback for intermediate (`dev.567`) and newer `dev.*` builds (older versions are skipped safely with a clear notice).

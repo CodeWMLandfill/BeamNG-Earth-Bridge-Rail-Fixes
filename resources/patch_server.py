@@ -30,13 +30,13 @@ import uuid
 import zipfile
 import zlib
 
-VERSION = "0.4.2"
-MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_4_2"
+VERSION = "0.5.0"
+MARKER = "EARTH_BRIDGE_RAIL_FIXES_0_5_0"
 MARKER_PREFIX = "EARTH_BRIDGE_RAIL_FIXES_"
 TAG = "earthBridgeRailFixes"
 MAX_SOLVER_FAST_VERSION = 305
 MIN_V2_SOLVER_FAST_VERSION = 621
-MAX_V2_SOLVER_FAST_VERSION = 621
+MAX_V2_SOLVER_FAST_VERSION = 640
 TIER_FULL_SOLVER = "full_solver"
 TIER_CLIENT_AND_REPORTER = "client_and_reporter"
 SOLVER_MODE_DIRECT = "direct"
@@ -61,11 +61,14 @@ SIBLING_ORIG_PREFIXES = (
 V2_ORIG_SENTINEL = "_brf_orig_roads"
 V2_FULL_OVERLAY_MODULES = (
     "bridgetypes",
+    "buildings",
     "carriageways",
     "fences",
     "furniture",
+    "gradesep",
     "grading",
     "guardrails",
+    "l0roads",
     "plancache",
     "portals",
     "railprofile",

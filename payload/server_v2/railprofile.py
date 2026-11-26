@@ -405,3 +405,8 @@ def beds(frame, akey, load, ground, rails):
             z[have] = num[have] / den[have]
         out.append(z)
     return out
+
+def clear_memory():
+    with _NODES_LOCK:
+        _NODES.clear()
+        _NODES_PTS[0] = 0
